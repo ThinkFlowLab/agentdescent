@@ -815,3 +815,57 @@ def test_an_ambiguous_folded_name_stays_unknown():
     finally:
         algorithms._REGISTRY.pop("_Probe_Case")
         algorithms._REGISTRY.pop("_probe-case")
+
+
+def test_ace_and_dgm_reparse_keeps_user_text_after_the_block():
+    """User prose after the playbook / ## Capabilities survives reparse (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+    from agentdescent.algorithms.dgm import CAPABILITIES_HEADER, HarnessStrategy
+
+    prose = "Solve carefully.\n"
+    tail = "## Notes\nAlways cite the 10-K page.\n"
+
+    pb = ACEPlaybook(seed=prose)
+    st = {**pb.initial(), **pb.to_diff(pb.initial(),
+                                       "revenue :: tag deferred revenue",
+                                       "w0", 1, "a").ops}
+    edited = pb.render(st) + "\n" + tail
+    pb2 = ACEPlaybook(seed=edited)
+    assert pb2.seed == prose
+    assert len(pb2.initial()) == 1
+    assert pb2.render(pb2.initial()) == edited  # unchanged run is a noop
+    st2 = {**pb2.initial(), **pb2.to_diff(pb2.initial(), "debt :: notes are LTD",
+                                          "w1", 1, "a").ops}
+    out = pb2.render(st2)
+    assert out.count("# Playbook (ACE)") == 1
+    assert "notes are LTD" in out and out.endswith(tail)
+    pb3 = ACEPlaybook(seed=out)
+    assert len(pb3.initial()) == 2 and pb3.render(st2).endswith(tail)
+
+    hs = HarnessStrategy(seed=prose)
+    st = {**hs.initial(), **hs.to_diff(hs.initial(), "use chain of thought",
+                                       "w0", 1, "a").ops}
+    edited = hs.render(st) + "\nKeep answers short.\n"
+    hs2 = HarnessStrategy(seed=edited)
+    assert hs2.seed == prose
+    assert hs2.initial()["capabilities"] == "use chain of thought"
+    assert hs2.render(hs2.initial()) == edited
+    st2 = {**hs2.initial(), **hs2.to_diff(hs2.initial(), "check units",
+                                          "w1", 1, "a").ops}
+    out = hs2.render(st2)
+    assert out.count(CAPABILITIES_HEADER) == 1
+    assert "check units" in out and out.endswith("Keep answers short.\n")
+
+
+def test_ace_multiline_lesson_round_trips():
+    """A multi-line lesson keeps its continuation lines through reparse (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(),
+                                       "revenue :: first line\nsecond line",
+                                       "w0", 1, "a").ops}
+    applied = pb.render(st)
+    pb2 = ACEPlaybook(seed=applied)
+    assert pb2.initial() == st
+    assert pb2.render(st) == applied

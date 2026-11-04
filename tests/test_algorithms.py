@@ -869,3 +869,16 @@ def test_ace_multiline_lesson_round_trips():
     pb2 = ACEPlaybook(seed=applied)
     assert pb2.initial() == st
     assert pb2.render(st) == applied
+
+
+def test_ace_reparse_keeps_an_indented_tail_block_out_of_lessons():
+    """An indented user block after a blank line is tail, not a lesson (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(), "general :: one", "w0", 1, "a").ops}
+    edited = pb.render(st) + "\n    code example\n"
+    pb2 = ACEPlaybook(seed=edited)
+    assert pb2.initial() == st
+    st2 = {**st, **pb2.to_diff(st, "general :: two different", "w1", 1, "a").ops}
+    assert pb2.render(st2).endswith("\n\n    code example\n")

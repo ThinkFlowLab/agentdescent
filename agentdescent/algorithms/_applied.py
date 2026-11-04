@@ -32,12 +32,15 @@ def _find_header(seed: str, header: str) -> Optional[int]:
 
 
 def split_applied_block(seed: str, header: str,
-                        is_item: Callable[[str], bool]) -> Optional[AppliedBlock]:
+                        is_item: Callable[[str], bool],
+                        is_continuation: Optional[Callable[[str], bool]] = None,
+                        ) -> Optional[AppliedBlock]:
     """Locate a trailing ``header`` block in ``seed``.
 
     The block body runs from the header through the *last* line accepted by
     ``is_item``; blank lines and ``## `` sub-headings may sit between items.
-    Everything after the last item (including a ``## `` heading the user added
+    ``is_continuation`` lines count as items only directly after an item (a
+    wrapped multi-line entry). Everything after the last item (including a ``## `` heading the user added
     with prose under it) is returned as ``tail``. Returns ``None`` when there
     is no header, or the header is followed by prose rather than items (a
     mid-text mention).
@@ -54,7 +57,8 @@ def split_applied_block(seed: str, header: str,
     last_item = -1
     for idx, line in enumerate(raw):
         text = line.rstrip("\n")
-        if is_item(text):
+        if is_item(text) or (is_continuation is not None and last_item == idx - 1
+                             and last_item >= 0 and is_continuation(text)):
             last_item = idx
         elif not text.strip() or text.startswith("## "):
             continue

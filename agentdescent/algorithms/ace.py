@@ -44,8 +44,11 @@ _CONT = "    "  # continuation indent for multi-line lessons
 
 def _is_playbook_item(line: str) -> bool:
     s = line.lstrip()
-    return (s.startswith("- [") or s.startswith(_EMPTY_MARKER)
-            or (line.startswith(_CONT) and bool(line.strip())))
+    return s.startswith("- [") or s.startswith(_EMPTY_MARKER)
+
+
+def _is_lesson_continuation(line: str) -> bool:
+    return line.startswith(_CONT) and bool(line.strip())
 
 
 def _split_applied_playbook(seed: str, title: str) -> Tuple[str, Dict[str, str], str]:
@@ -58,7 +61,8 @@ def _split_applied_playbook(seed: str, title: str) -> Tuple[str, Dict[str, str],
     after the playbook so a re-render keeps it (#743). Multi-line lessons are
     rendered with an indented continuation and rejoined here.
     """
-    block = split_applied_block(seed, title, _is_playbook_item)
+    block = split_applied_block(seed, title, _is_playbook_item,
+                                _is_lesson_continuation)
     if block is None:
         return seed, {}, ""
     entries: List[List[str]] = []  # [bid, section, text]

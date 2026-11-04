@@ -34,16 +34,19 @@ def _find_header(seed: str, header: str) -> Optional[int]:
 def split_applied_block(seed: str, header: str,
                         is_item: Callable[[str], bool],
                         is_continuation: Optional[Callable[[str], bool]] = None,
+                        is_subheading: Optional[Callable[[str], bool]] = None,
                         ) -> Optional[AppliedBlock]:
     """Locate a trailing ``header`` block in ``seed``.
 
-    The block body runs from the header through the *last* line accepted by
-    ``is_item``; blank lines and ``## `` sub-headings may sit between items.
-    ``is_continuation`` lines count as items only directly after an item (a
-    wrapped multi-line entry). Everything after the last item (including a ``## `` heading the user added
-    with prose under it) is returned as ``tail``. Returns ``None`` when there
-    is no header, or the header is followed by prose rather than items (a
-    mid-text mention).
+    A rendered block is contiguous, so the body is the run of lines directly
+    under ``header`` that are items (``is_item``), wrapped item lines
+    (``is_continuation``, only right after an item; whitespace-only ones count
+    only when a non-blank continuation follows), or sub-headings
+    (``is_subheading``, only when the next line is an item). The first line
+    that is none of these -- a blank line, user prose, a user ``## `` heading
+    with its own bullets -- starts ``tail``. Returns ``None`` when there is no
+    header, or the header is followed by prose rather than items (a mid-text
+    mention).
     """
     if not seed or not header:
         return None
@@ -54,14 +57,18 @@ def split_applied_block(seed: str, header: str,
     if after.startswith("\n"):
         after = after[1:]
     raw = after.splitlines(keepends=True)
+    texts = [ln.rstrip("\n") for ln in raw]
     last_item = -1
-    for idx, line in enumerate(raw):
-        text = line.rstrip("\n")
-        if is_item(text) or (is_continuation is not None and last_item == idx - 1
-                             and last_item >= 0 and is_continuation(text)):
-            last_item = idx
-        elif not text.strip() or text.startswith("## "):
-            continue
+    in_item = False
+    for idx, text in enumerate(texts):
+        if is_item(text):
+            last_item, in_item = idx, True
+        elif in_item and is_continuation is not None and is_continuation(text):
+            if text.strip():
+                last_item = idx
+        elif (is_subheading is not None and is_subheading(text)
+              and idx + 1 < len(texts) and is_item(texts[idx + 1])):
+            in_item = False
         else:
             break
     if last_item < 0 and after.strip():
@@ -69,9 +76,7 @@ def split_applied_block(seed: str, header: str,
     prose = seed[:start]
     if prose.endswith("\n\n"):
         prose = prose[:-1]
-    lines = [ln.rstrip("\n") for ln in raw[:last_item + 1]]
-    tail = "".join(raw[last_item + 1:])
-    return AppliedBlock(prose, lines, tail)
+    return AppliedBlock(prose, texts[:last_item + 1], "".join(raw[last_item + 1:]))
 
 
 def append_tail(body: str, tail: str) -> str:

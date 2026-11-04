@@ -882,3 +882,42 @@ def test_ace_reparse_keeps_an_indented_tail_block_out_of_lessons():
     assert pb2.initial() == st
     st2 = {**st, **pb2.to_diff(st, "general :: two different", "w1", 1, "a").ops}
     assert pb2.render(st2).endswith("\n\n    code example\n")
+
+
+def test_ace_and_dgm_reparse_keeps_bulleted_user_sections_as_tail():
+    """A user ## section with bullets after the block stays user text (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+    from agentdescent.algorithms.dgm import HarnessStrategy
+
+    hs = HarnessStrategy(seed="Solve.\n")
+    st = {**hs.initial(), **hs.to_diff(hs.initial(), "use cot", "w", 1, "a").ops}
+    notes = "## Notes\n- cite the 10-K page\n"
+    hs2 = HarnessStrategy(seed=hs.render(st) + "\n" + notes)
+    assert hs2.initial() == {"capabilities": "use cot"}
+    st2 = {**hs2.initial(), **hs2.to_diff(hs2.initial(), "check units", "w", 1, "a").ops}
+    out = hs2.render(st2)
+    assert out.endswith("\n\n" + notes) and "- check units\n- use cot\n" in out
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(), "rev :: a", "w", 1, "a").ops}
+    todo = "## Todo\n- [x] verified\n"
+    for sep in ("\n", ""):
+        pb2 = ACEPlaybook(seed=pb.render(st) + sep + todo)
+        assert pb2.initial() == st
+        st2 = {**st, **pb2.to_diff(st, "x :: y", "w", 1, "a").ops}
+        assert pb2.render(st2).endswith("\n\n" + todo)
+
+
+def test_ace_lesson_with_blank_line_round_trips():
+    """A lesson containing a blank line is not split into tail (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(), "rev :: a\n\nc", "w", 1, "a").ops}
+    applied = pb.render(st)
+    pb2 = ACEPlaybook(seed=applied)
+    assert pb2.initial() == st
+    st2 = {**st, **pb2.to_diff(st, "x :: y", "w", 1, "a").ops}
+    out = pb2.render(st2)
+    assert ACEPlaybook(seed=out).initial() == st2
+    assert out.rstrip("\n").endswith("y")

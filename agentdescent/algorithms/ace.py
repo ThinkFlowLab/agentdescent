@@ -42,13 +42,19 @@ _EMPTY_MARKER = "(empty -- no lessons yet)"
 _CONT = "    "  # continuation indent for multi-line lessons
 
 
+_BULLET = re.compile(r"  - \[(r[0-9a-f]+)\] ?(.*)$")  # as _render_playbook writes
+
+
 def _is_playbook_item(line: str) -> bool:
-    s = line.lstrip()
-    return s.startswith("- [") or s.startswith(_EMPTY_MARKER)
+    return bool(_BULLET.match(line)) or line.strip() == _EMPTY_MARKER
 
 
 def _is_lesson_continuation(line: str) -> bool:
-    return line.startswith(_CONT) and bool(line.strip())
+    return line.startswith(_CONT)
+
+
+def _is_section(line: str) -> bool:
+    return line.startswith("## ")
 
 
 def _split_applied_playbook(seed: str, title: str) -> Tuple[str, Dict[str, str], str]:
@@ -62,7 +68,7 @@ def _split_applied_playbook(seed: str, title: str) -> Tuple[str, Dict[str, str],
     rendered with an indented continuation and rejoined here.
     """
     block = split_applied_block(seed, title, _is_playbook_item,
-                                _is_lesson_continuation)
+                                _is_lesson_continuation, _is_section)
     if block is None:
         return seed, {}, ""
     entries: List[List[str]] = []  # [bid, section, text]
@@ -71,10 +77,10 @@ def _split_applied_playbook(seed: str, title: str) -> Tuple[str, Dict[str, str],
         if line.startswith("## "):
             section = line[3:].strip() or "general"
             continue
-        m = re.match(r"\s*-\s*\[([^\]]+)\]\s*(.*)$", line)
+        m = _BULLET.match(line)
         if m:
-            entries.append([m.group(1).strip(), section, m.group(2).strip()])
-        elif line.startswith(_CONT) and line.strip() and entries:
+            entries.append([m.group(1), section, m.group(2).strip()])
+        elif line.startswith(_CONT) and entries:
             entries[-1][2] += "\n" + line[len(_CONT):]
     state = {bid: f"{sec} :: {text}" for bid, sec, text in entries if bid and text}
     return block.prose, state, block.tail

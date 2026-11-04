@@ -63,11 +63,11 @@ def _split_applied_capabilities(seed: str) -> Tuple[str, str, str]:
     (#741), and any user text after the list so a re-render keeps it (#743).
     """
     block = split_applied_block(seed, CAPABILITIES_HEADER,
-                                lambda line: line.lstrip().startswith("- "))
+                                lambda line: line.startswith("- "))
     if block is None:
         return seed, "", ""
     caps = [ln.strip()[2:].strip() for ln in block.lines
-            if ln.lstrip().startswith("- ")]
+            if ln.startswith("- ")]
     return block.prose, ",".join(sorted({c for c in caps if c})), block.tail
 
 

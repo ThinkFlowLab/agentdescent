@@ -553,6 +553,39 @@ def _record_prompt(prompt):
     return "NOPE"
 
 
+def test_dgm_make_propose_includes_expected_answers_when_available():
+    from agentdescent.algorithms.dgm import make_propose
+
+    seen = []
+
+    def complete(prompt):
+        seen.append(prompt)
+        return "format dates with dots"
+
+    propose = make_propose(complete)
+
+    class Task:
+        prompt = "Date: June 8, 2004"
+        meta = {"gold": "08.06.2004"}
+
+    assert propose("seed", Task(), "06/08/2004", 0.0) == "format dates with dots"
+    assert "Expected answer(s):\n08.06.2004\n" in seen[-1]
+
+    class MultiAnswerTask:
+        prompt = "Date: June 8, 2004"
+        meta = {"answers": ["08.06.2004", "08.06.04"]}
+
+    propose("seed", MultiAnswerTask(), "06/08/2004", 0.0)
+    assert "08.06.2004\n08.06.04" in seen[-1]
+
+    class NoAnswerTask:
+        prompt = "q"
+        meta = {}
+
+    propose("seed", NoAnswerTask(), "wrong", 0.0)
+    assert "Expected answer(s):" not in seen[-1]
+
+
 
 def test_ace_and_dgm_reparse_an_applied_artifact_without_duplicating_headers():
     """Second evolve on an applied target keeps one header and prior items (#741)."""

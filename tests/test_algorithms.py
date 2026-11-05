@@ -554,6 +554,8 @@ def _record_prompt(prompt):
 
 
 def test_dgm_make_propose_includes_expected_answers_when_available():
+    from types import SimpleNamespace
+
     from agentdescent.algorithms.dgm import make_propose
 
     seen = []
@@ -564,25 +566,32 @@ def test_dgm_make_propose_includes_expected_answers_when_available():
 
     propose = make_propose(complete)
 
-    class Task:
-        prompt = "Date: June 8, 2004"
-        meta = {"gold": "08.06.2004"}
+    successful_task = SimpleNamespace(prompt="already solved", meta={"gold": "answer"})
+    assert propose("seed", successful_task, "answer", 0.8) is None
+    assert seen == []
 
-    assert propose("seed", Task(), "06/08/2004", 0.0) == "format dates with dots"
+    task = SimpleNamespace(prompt="Date: June 8, 2004",
+                           meta={"gold": "08.06.2004"})
+
+    assert propose("seed", task, "06/08/2004", 0.0) == "format dates with dots"
     assert "Expected answer(s):\n08.06.2004\n" in seen[-1]
 
-    class MultiAnswerTask:
-        prompt = "Date: June 8, 2004"
-        meta = {"answers": ["08.06.2004", "08.06.04"]}
+    multi_answer_task = SimpleNamespace(
+        prompt="Date: June 8, 2004",
+        meta={"answers": ["08.06.2004", "08.06.04"]},
+    )
 
-    propose("seed", MultiAnswerTask(), "06/08/2004", 0.0)
+    propose("seed", multi_answer_task, "06/08/2004", 0.0)
     assert "08.06.2004\n08.06.04" in seen[-1]
 
-    class NoAnswerTask:
-        prompt = "q"
-        meta = {}
+    no_answer_task = SimpleNamespace(prompt="q", meta={})
 
-    propose("seed", NoAnswerTask(), "wrong", 0.0)
+    propose("seed", no_answer_task, "wrong", 0.0)
+    assert "Expected answer(s):" not in seen[-1]
+
+    null_gold_task = SimpleNamespace(prompt="q", meta={"gold": None})
+
+    propose("seed", null_gold_task, "wrong", 0.0)
     assert "Expected answer(s):" not in seen[-1]
 
 

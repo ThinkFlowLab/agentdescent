@@ -149,7 +149,8 @@ def make_propose(complete: Completion, *, threshold: float = 0.8):
         if answers:
             gold = "\n".join(str(answer) for answer in answers)
         else:
-            gold = str(task.meta.get("gold", ""))
+            gold_value = task.meta.get("gold", "")
+            gold = "" if gold_value is None else str(gold_value)
         gold_block = f"Expected answer(s):\n{gold}\n" if gold else ""
         return complete(_PROPOSE_TMPL.format(
             capabilities=rendered or "(none)",

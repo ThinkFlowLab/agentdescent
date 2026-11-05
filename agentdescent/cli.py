@@ -719,6 +719,39 @@ _WORKSPACE_REFS = ("claude_code", "codex", "dsh", "opencode", "cli_agent")
 _PLAIN_REFS = ("openai_compatible", "host_model", "claude", "echo")
 
 
+def init_agent_unknown(ref: str) -> Optional[str]:
+    """Why ``--agent ref`` can never resolve, or None (#745).
+
+    ``plan`` would refuse a name that is neither a built-in agent short ref nor
+    ``module:attribute``; say so before a spec is written, list only the agent
+    refs (not the policy classes ``SHORT_REFS`` also holds), and point a host
+    name such as ``claude-code`` at its ref spelling.
+    """
+    agents = _WORKSPACE_REFS + _PLAIN_REFS
+    if ref in agents or ":" in ref:
+        return None
+    msg = (f"--agent {ref}: not a known agent; use one of {', '.join(agents)} "
+           "or a custom 'module:attribute'")
+    guess = ref.strip().lower().replace("-", "_")
+    if guess in agents:
+        return msg + f" (did you mean `--agent {guess}`?)"
+    # An `install` host name or alias (#752): point it at its worker ref, or
+    # say plainly that the host has none.
+    from .integrations import HOST_CLI, canonical_host
+
+    host = canonical_host(ref)
+    if host in HOST_CLI:
+        worker = host.replace("-", "_")
+        if worker in agents:
+            msg += f" (did you mean `--agent {worker}`? `{ref}` is the install host name)"
+        else:
+            msg += (f"; `{ref}` is an install host with no worker CLI, so pick a "
+                    "worker that runs on its computer (`agentdescent doctor` lists "
+                    "them), e.g. `--agent openai_compatible --model M --key-env K`, "
+                    "or omit --agent for the default")
+    return msg
+
+
 def init_agent_mismatch(kind: str, ref: str) -> Optional[str]:
     """Why ``plan`` would refuse agent ``ref`` for ``kind``, or None (#456).
 
@@ -863,6 +896,10 @@ def write_starter_spec(
     if workers is not None:
         spec["evolve"]["n_workers"] = workers
     if agent_explicit:
+        why = init_agent_unknown(agent)
+        if why:
+            # Refuse before writing, as for a kind mismatch: `plan` cannot resolve it.
+            raise ValueError(why)
         why = init_agent_mismatch(spec["kind"], agent)
         if why:
             # Refuse before writing: `plan` would reject this spec anyway, and a
@@ -2783,8 +2820,13 @@ def algorithms_run_payload(
     except (SpecError, ValueError) as e:
         err = _algorithms_run_missing_data_hint(str(e), cases=cases)
         # `spec` kept for compatibility; `spec_path` matches the plan shape.
+        # init's notes/warnings (the .bak-N of an overwritten spec, #725) are
+        # kept here too: a failed plan is the usual reason to re-run (#749).
         return {"ok": False, "error": err, "spec": out, "spec_path": out,
-                "next": retry_line, "_stage": "plan", "_report": report}
+                "next": retry_line,
+                "warnings": [t for k, t in report if k == "warning"],
+                "notes": [t for k, t in report if k == "note"],
+                "_stage": "plan", "_report": report}
     ok = bool(payload.get("ok", True))
     obj = dict(payload)
     obj["spec_path"] = out
@@ -2826,9 +2868,14 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
         return 2
     out = obj["spec_path"]
     if stage == "plan":
-        # The spec is already on disk: say so before the error (#688).
+        # The spec is already on disk: say so before the error (#688), and
+        # keep init's notes/warnings, e.g. where an overwritten spec went (#749).
         for kind_tag, text in report:
-            if kind_tag == "wrote":
+            if kind_tag == "warning":
+                print(f"warning: {text}")
+            elif kind_tag == "note":
+                print(f"note: {text}")
+            else:
                 print(text)
         print(f"error: {obj['error']}", file=sys.stderr)
         print(f"next: fix {out}, then {obj['next']}")
@@ -3132,9 +3179,12 @@ def cmd_ops(a: argparse.Namespace) -> int:
                 runs_db=a.runs_db, tenant=a.tenant, workspace=a.workspace,
                 min_acceptance=a.min_acceptance,
                 max_cost_per_accepted=a.max_cost_per_accepted,
-                out=a.out, prometheus=a.prometheus)
+                out=a.out, prometheus=a.prometheus, history=a.history)
+        elif action == "history":
+            payload = surface.ops_history(
+                history=a.history, tenant=a.tenant, workspace=a.workspace)
         else:
-            raise SurfaceError("ops needs plan or publish")
+            raise SurfaceError("ops needs plan, publish or history")
     except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
         return _surface_error(a, error)
     if a.json:
@@ -3147,6 +3197,15 @@ def cmd_ops(a: argparse.Namespace) -> int:
             print("next:")
             for step in payload["next"]:
                 print(f"  {step}")
+        elif action == "history":
+            print(f"history: {payload['history']}  publishes: {payload['publishes']}")
+            print(f"decisions: {payload['decisions']}  "
+                  f"accepted: {payload['accepted']}  calls: {payload['calls']}  "
+                  f"alerts: {payload['alerts']}")
+            if payload["last"] is not None:
+                print(f"last: {payload['last_recorded_at'] or '-'}")
+            if payload["skipped"]:
+                print(f"skipped bad lines: {payload['skipped']}")
         else:
             print(f"published: {payload['published']}")
             if "metrics" in payload:
@@ -3162,6 +3221,8 @@ def cmd_ops(a: argparse.Namespace) -> int:
                 print(f"report: {payload['out']}")
             if payload.get("prometheus"):
                 print(f"prometheus: {payload['prometheus']}")
+            if payload.get("history"):
+                print(f"history: {payload['history']}")
     return 0
 
 
@@ -3351,8 +3412,15 @@ def cmd_governed_harness(a: argparse.Namespace) -> int:
             payload = surface.governed_plan(a.spec)
         elif action == "run":
             payload = surface.governed_run(a.spec, out=a.out)
+        elif action == "approvals":
+            payload = surface.approvals_list(a.store, status=a.status)
+        elif action in ("approve", "reject"):
+            payload = surface.approvals_decide(
+                a.store, a.key, approve=action == "approve", note=a.note)
         else:
-            raise SurfaceError("governed-harness needs init, plan or run")
+            raise SurfaceError(
+                "governed-harness needs init, plan, run, approvals, approve "
+                "or reject")
     except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
         return _surface_error(a, error)
     if a.json:
@@ -3371,6 +3439,18 @@ def cmd_governed_harness(a: argparse.Namespace) -> int:
             print("next:")
             for step in payload["next"]:
                 print(f"  {step}")
+        elif action == "approvals":
+            counts = payload["counts"]
+            print(f"store: {payload['store']}  status: {payload['status']}  "
+                  f"pending: {counts['pending']}")
+            for approval in payload["approvals"]:
+                print(f"{approval['key']}  {approval['status']}  "
+                      f"{approval['artifact_id']}  {approval['reason']}")
+            if not payload["approvals"]:
+                print("no matching approval requests")
+        elif action in ("approve", "reject"):
+            approval = payload["approval"]
+            print(f"{approval['key']}  {approval['status']}")
         else:
             report = payload["report"]
             print(f"promoted: {payload['promoted']}  verdict: {report['verdict']}")
@@ -3386,32 +3466,64 @@ def cmd_release(a: argparse.Namespace) -> int:
     """``agentdescent release`` -- evidence-gated, signed release receipt."""
     from .release_surface import (
         ReleaseSurfaceError, load_rules, release_payload, release_text,
-        resolve_secret,
+        resolve_secret, verify_release,
     )
 
+    verb = getattr(a, "release_cmd", None)
     try:
-        rules = load_rules(
-            a.rules, min_effect=a.min_effect, max_risk=a.max_risk)
-        secret = resolve_secret(
-            secret_env=a.secret_env, secret_file=a.secret_file)
-        metadata = None
-        if a.metadata is not None:
-            try:
-                metadata = json.loads(a.metadata)
-            except ValueError as error:
+        if verb == "verify":
+            if not a.receipt:
                 raise ReleaseSurfaceError(
-                    f"--metadata is not valid JSON: {error}") from None
-            if not isinstance(metadata, dict):
-                raise ReleaseSurfaceError("--metadata must be a JSON object")
-        payload = release_payload(
-            a.before, a.after, artifact_id=a.artifact_id,
-            artifact_hash=a.artifact_hash, key_id=a.key_id, secret=secret,
-            rules=rules, lineage=a.lineage, parents=a.parents,
-            contaminated=a.contamination, approved=a.approval, risk=a.risk,
-            min_effect=a.min_effect, alpha=a.alpha, seed=a.seed,
-            proxy_gains=a.proxy_gains, oracle_gains=a.oracle_gains,
-            issuer=a.issuer, run_id=a.run_id, kind=a.kind,
-            metadata=metadata, out=a.out)
+                    "release verify needs --receipt PATH")
+            ignored = [
+                flag for flag, value in (
+                    ("--before", a.before), ("--after", a.after),
+                    ("--artifact-id", a.artifact_id),
+                    ("--artifact-hash", a.artifact_hash), ("--out", a.out))
+                if value
+            ]
+            if ignored:
+                raise ReleaseSurfaceError(
+                    "release verify does not take " + ", ".join(ignored)
+                    + "; use the release command to create a receipt")
+            payload = verify_release(
+                a.receipt, key_id=a.key_id, secret_env=a.secret_env,
+                secret_file=a.secret_file, lineage=a.lineage)
+        else:
+            missing = [
+                flag for flag, value in (
+                    ("--before", a.before), ("--after", a.after),
+                    ("--artifact-id", a.artifact_id),
+                    ("--artifact-hash", a.artifact_hash),
+                    ("--key-id", a.key_id))
+                if not value
+            ]
+            if missing:
+                raise ReleaseSurfaceError(
+                    "release needs " + ", ".join(missing)
+                    + " (or pass `release verify --receipt ...`)")
+            rules = load_rules(
+                a.rules, min_effect=a.min_effect, max_risk=a.max_risk)
+            secret = resolve_secret(
+                secret_env=a.secret_env, secret_file=a.secret_file)
+            metadata = None
+            if a.metadata is not None:
+                try:
+                    metadata = json.loads(a.metadata)
+                except ValueError as error:
+                    raise ReleaseSurfaceError(
+                        f"--metadata is not valid JSON: {error}") from None
+                if not isinstance(metadata, dict):
+                    raise ReleaseSurfaceError("--metadata must be a JSON object")
+            payload = release_payload(
+                a.before, a.after, artifact_id=a.artifact_id,
+                artifact_hash=a.artifact_hash, key_id=a.key_id, secret=secret,
+                rules=rules, lineage=a.lineage, parents=a.parents,
+                contaminated=a.contamination, approved=a.approval, risk=a.risk,
+                min_effect=a.min_effect, alpha=a.alpha, seed=a.seed,
+                proxy_gains=a.proxy_gains, oracle_gains=a.oracle_gains,
+                issuer=a.issuer, run_id=a.run_id, kind=a.kind,
+                metadata=metadata, out=a.out)
     except (ReleaseSurfaceError, OSError, ValueError) as error:
         if getattr(a, "json", False):
             _out({"ok": False, "error": str(error)}, as_json=True)
@@ -3420,9 +3532,15 @@ def cmd_release(a: argparse.Namespace) -> int:
         return 2
     if a.json:
         _out(payload, as_json=True)
+    elif verb == "verify":
+        print(f"valid: {'yes' if payload['valid'] else 'no'}")
+        print(f"reason: {payload['reason']}")
+        print(f"artifact: {payload['artifact_id']}")
+        print(f"manifest: {payload['manifest_hash']}")
     else:
         print(release_text(payload))
-    return 0 if payload["released"] else 1
+    return 0 if (payload["valid"] if verb == "verify"
+                 else payload["released"]) else 1
 
 
 def safety_payload(archive: Optional[str] = None, *,
@@ -4105,15 +4223,21 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser(
         "release",
         help="gate paired evidence and sign an accepted release receipt")
-    s.add_argument("--before", required=True, metavar="PATH",
+    s.add_argument(
+        "release_cmd", nargs="?", choices=("verify",), default=None,
+        metavar="{verify}",
+        help="verify a signed receipt instead of creating one")
+    s.add_argument("--receipt", metavar="PATH",
+                   help="release receipt JSON to verify (release verify)")
+    s.add_argument("--before", metavar="PATH",
                    help="JSON object of task -> incumbent score, or '-' for stdin")
-    s.add_argument("--after", required=True, metavar="PATH",
+    s.add_argument("--after", metavar="PATH",
                    help="JSON object of task -> candidate score, or '-' for stdin")
-    s.add_argument("--artifact-id", required=True, dest="artifact_id",
+    s.add_argument("--artifact-id", dest="artifact_id",
                    help="the released artifact id")
-    s.add_argument("--artifact-hash", required=True, dest="artifact_hash",
+    s.add_argument("--artifact-hash", dest="artifact_hash",
                    help="content hash of the artifact (also the manifest identity)")
-    s.add_argument("--key-id", required=True, dest="key_id",
+    s.add_argument("--key-id", dest="key_id",
                    help="signing key id written into the manifest")
     s.add_argument("--secret-env", dest="secret_env", default=None,
                    help="environment variable holding the HMAC secret "
@@ -4223,6 +4347,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="alert above this calls/accepted value")
     sp.add_argument("--out", help="write the full JSON report here")
     sp.add_argument("--prometheus", help="write Prometheus text here")
+    sp.add_argument("--history", help="append this publish to a JSONL history")
+    sp.set_defaults(fn=cmd_ops)
+    sp = ops_sub.add_parser(
+        "history", help="summarise the JSONL history of past publishes")
+    sp.add_argument("--history", required=True, help="JSONL history to read")
+    sp.add_argument("--tenant", default=None)
+    sp.add_argument("--workspace", default=None)
     sp.set_defaults(fn=cmd_ops)
 
     s = sub.add_parser(
@@ -4329,6 +4460,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp = governed_sub.add_parser("run", help="run the governed change")
     sp.add_argument("--spec", required=True, help="governed-harness JSON spec")
     sp.add_argument("--out", help="write the full JSON report here")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser(
+        "approvals", help="list pending or decided approval requests")
+    sp.add_argument("--store", required=True, help="ApprovalStore JSONL")
+    sp.add_argument("--status", choices=("pending", "approved", "rejected", "all"),
+                    default="pending", help="which requests to list (default pending)")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser(
+        "approve", help="approve one pending request (human-only)")
+    sp.add_argument("--store", required=True, help="ApprovalStore JSONL")
+    sp.add_argument("--key", required=True, help="approval request key")
+    sp.add_argument("--note", default="", help="why the request was approved")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser(
+        "reject", help="reject one pending request (human-only)")
+    sp.add_argument("--store", required=True, help="ApprovalStore JSONL")
+    sp.add_argument("--key", required=True, help="approval request key")
+    sp.add_argument("--note", default="", help="why the request was rejected")
     sp.set_defaults(fn=cmd_governed_harness)
 
     s = sub.add_parser(

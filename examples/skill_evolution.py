@@ -1,14 +1,19 @@
-"""Flagship example: real skill self-evolution, end to end, using every module.
+"""Instruction / playbook evolution on BIG-Bench-Hard (AppendRules), not a skill folder.
 
-Evolves a "skill playbook" (accumulated lessons) on a real **BIG-Bench-Hard**
-task with a real **Claude** agent, wiring the whole framework together:
+Evolves accumulated **lessons in a prompt** (`AppendRules`) on a real BBH task
+with a real Claude agent. This is the measured playbook demo — useful, but it is
+**not** an Agent Skill directory. For a multi-file skill *library* that an agent
+reads off disk, see ``examples.skill_library_evolution``; for one skill folder,
+``examples.skill_dir_evolution``; for the EvoSkill paper port, ``examples.evoskill``.
+
+Wires the whole text-strategy path together:
 
     agentdescent.agents      claude()  -> a Completion               (provider layer)
     agentdescent.evolution   LLMAgent + evolve() + AppendRules        (the engine + rule)
     agentdescent.parallel    DataParallel                             (parallelism method)
-    governance            blast_radius=0.2  -> L2 skill layer      (governance)
+    governance            blast_radius=0.2  -> L2 layer             (governance)
 
-Default task: `salient_translation_error_detection` -- a *single-skill* task
+Default task: `salient_translation_error_detection` -- a single-kind task
 (classify which of 6 error types a translation has), where haiku 4.5 is
 mid-range (~0.75), so a learned lesson has room to help AND transfers to every
 held-out problem. On a real run this lifts held-out accuracy, e.g. 0.750 ->
@@ -159,7 +164,7 @@ def main() -> None:
           f"(cached repeats are free; use --model claude-haiku-4-5 to cut cost)")
 
     if args.dry_run:
-        print("\n[dry-run] not calling the API. Drop --dry-run to evolve the skill.")
+        print("\n[dry-run] not calling the API. Drop --dry-run to evolve the playbook.")
         return
 
     if not args.yes and sys.stdin.isatty():
@@ -180,7 +185,7 @@ def main() -> None:
               "for claude set ANTHROPIC_API_KEY (or `ant auth login`).")
         return
 
-    print("\nEvolving skill (agents + evolution + AppendRules + DataParallel + L2 governance)...\n")
+    print("\nEvolving playbook (agents + evolution + AppendRules + DataParallel + L2 governance)...\n")
     # the full pipeline: engine + strategy + parallelism method + governance layer.
     result = evolve(tasks, reward, agent=agent,
                     strategy=AppendRules(), parallel=DataParallel(),
@@ -188,7 +193,7 @@ def main() -> None:
                     rounds=args.rounds, n_workers=args.workers,
                     held_out_frac=args.heldout / total, verbose=True)
 
-    print("\n=== evolved skill playbook ===")
+    print("\n=== evolved instruction playbook ===")
     print(result.rendered)
     label = "held-out accuracy" if mc else "held-out score"
     # `history[0]` is the score after round 0 has already merged, not the score

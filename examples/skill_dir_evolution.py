@@ -1,7 +1,8 @@
 """Evolve a **skill directory** that a real agent reads off disk.
 
-Every other example evolves text that ends up *in a prompt*. This one evolves a
-directory: the candidate is materialised into a throwaway workspace at
+Every other text example evolves content that ends up *in a prompt*. This one
+evolves a **single** Agent Skill directory (for a multi-file *library*, see
+``examples.skill_library_evolution``): the candidate is materialised into a throwaway workspace at
 ``.claude/skills/<name>/`` and the agent has to open the files to know what to do.
 That is the whole point -- the skill only helps if the agent reads it, which means
 the run measures the directory, not the model's prior knowledge.

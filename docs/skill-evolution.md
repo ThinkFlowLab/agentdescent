@@ -1,8 +1,10 @@
-# Example: skill evolution (real API, all modules)
+# Example: instruction / playbook evolution (BBH, AppendRules)
 
-The one complete, end-to-end example — a real dataset, a real LLM, and every
-module wired together. It evolves a **skill playbook** (accumulated lessons) on a
-**BIG-Bench-Hard** task, and it uses:
+A complete end-to-end example of evolving **prompt lessons** — a real dataset, a
+real LLM, and every text-strategy module wired together. It evolves an
+`AppendRules` **playbook**, not an Agent Skill folder. For a multi-file skill
+library, see [`examples.skill_library_evolution`](https://github.com/ThinkFlowLab/agentdescent/blob/main/examples/skill_library_evolution.py);
+for one skill directory, [evolve a directory](quickstart-directory.md). It uses:
 
 | Module | Used for |
 |---|---|
@@ -24,7 +26,7 @@ result = evolve(
     agent=LLMAgent(claude(model="claude-haiku-4-5")),
     strategy=AppendRules(),                          # deduped, fused lessons
     parallel=DataParallel(),                         # parallelism method
-    blast_radius=0.2,                                # L2 (a local skill)
+    blast_radius=0.2,                                # L2 (local instruction layer)
     rounds=6, n_workers=4,
 )
 print(result.rendered, result.final_reward)

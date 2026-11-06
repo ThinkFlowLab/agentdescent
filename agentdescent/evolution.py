@@ -874,9 +874,10 @@ def _requested_merge_policies(pol) -> list:
 
 
 def _apply_merge_policies(aggregator, pol) -> list:
-    """Attach merge-side Policies onto an aggregator that exposes the slots.
+    """Attach merge-side Policies onto an aggregator that exposes the seats.
 
-    ``PopulationAggregator`` / ``Aggregator`` take them at construction;
+    ``PopulationAggregator`` / ``Aggregator`` store them as ``*_policy`` at
+    construction (``population_factory`` closes over the Policies values);
     mechanism cards such as GEPA/SkillOpt expose ``acceptance`` and often
     ``merge_round`` as the fusion seat. Returns the names that landed.
     """
@@ -885,23 +886,33 @@ def _apply_merge_policies(aggregator, pol) -> list:
         val = getattr(pol, name, None)
         if val is None:
             continue
-        attr = name
-        if name == "fusion" and not hasattr(aggregator, "fusion") and hasattr(
-                aggregator, "merge_round"):
-            attr = "merge_round"
-        if not hasattr(aggregator, attr):
-            continue
-        current = getattr(aggregator, attr)
-        if current is None:
-            try:
-                setattr(aggregator, attr, val)
-            except AttributeError:
+        attrs = [name]
+        if name == "fusion":
+            attrs.append("merge_round")
+        attrs.append(f"{name}_policy")
+        landed = False
+        for attr in attrs:
+            if not hasattr(aggregator, attr):
                 continue
-            if attr == "merge_round" and hasattr(val, "bind"):
-                binder = getattr(aggregator, "verifier", None)
-                if binder is not None:
-                    val.bind(binder)
-        applied.append(name)
+            current = getattr(aggregator, attr)
+            if current is None:
+                try:
+                    setattr(aggregator, attr, val)
+                except AttributeError:
+                    continue
+                if attr == "merge_round" and hasattr(val, "bind"):
+                    binder = getattr(aggregator, "verifier", None)
+                    if binder is not None:
+                        val.bind(binder)
+                landed = True
+                break
+            if current is val:
+                # Factory already closed this Policies value into the seat
+                # (Aggregator uses ``conflict_policy`` / ``fusion_policy`` / …).
+                landed = True
+                break
+        if landed:
+            applied.append(name)
     return applied
 
 

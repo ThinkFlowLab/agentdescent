@@ -115,3 +115,20 @@ def test_gepa_factory_honours_policies_acceptance():
     # self_verify=False leaves before_after_delta at 0, so GEPA keeps survivors
     # and must consult Policies(acceptance=) before admitting them.
     assert NeverAccept.calls > 0, "Policies(acceptance=) never reached GEPA"
+
+
+def test_population_factory_path_honours_merge_policies_without_orphan():
+    """Policies(selection=…) installs population_factory; Aggregator seats are
+    ``*_policy``, so composition must count those as applied (#807 CI)."""
+    from agentdescent.selection import Archive
+    from agentdescent.fusion import KeepContradictions
+
+    result = evolve(
+        _tasks(), _reward, run=_run, propose=_propose,
+        strategy=SingleSlot(initial_value="cap:0"),
+        policies=Policies(selection=Archive(seed=0),
+                          conflict=KeepContradictions()),
+        rounds=2, n_workers=1, max_concurrency=1,
+        held_out_frac=0.5, seed=0, self_verify=False,
+    )
+    assert result.error is None, result.error

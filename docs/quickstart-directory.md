@@ -6,10 +6,6 @@ doing the work. No API key needed for the offline run.
 The full reference is [evolving a directory](directory-evolution.md); this is the
 path through it.
 
-For a **library** of several Agent Skills (not one folder), use
-`python -m examples.skill_library_evolution` instead — same offline claim,
-`layout="skill_library"`, and `--install-to` for the whole tree.
-
 ## 1. Run it offline first
 
 ```bash

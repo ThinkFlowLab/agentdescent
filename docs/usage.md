@@ -55,7 +55,7 @@ python -m examples.rq2_staleness
 
 ```bash
 python -m examples.skill_dir_evolution
-python -m examples.skill_library_evolution --dry-run   # multi-file skill library
+python -m examples.skill_library_evolution --dry-run
 ```
 
 Materialises a candidate skill directory into a throwaway workspace at
@@ -118,7 +118,7 @@ pytest -q tests/test_async.py   # just the async runtime
 
 Covered in full elsewhere, and not repeated here:
 
-* **[Quickstart](quickstart-skill.md)** — dataset → instruction, Agent Skill, or skill library in one
+* **[Quickstart](quickstart-skill.md)** — a dataset to an evolved skill in one
   call, with the measured result of running it.
 * **[The `evolve` method](evolution.md)** — the entry point underneath, with every
   parameter and what it plugs into.

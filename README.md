@@ -104,11 +104,9 @@ print(result.outcomes())      # why it went that way
 
 On 40 HotpotQA items (12 held out) this took held-out exact match from **0.167
 to 0.583**, learning *"Respond with only the requested answer, omitting any extra
-explanation or restatement."* That path evolves an **instruction** (`SingleSlot`),
-not an Agent Skill folder. For a multi-file skill library an agent reads off disk,
-run `python -m examples.skill_library_evolution --dry-run` (or one skill folder
-via `examples.skill_dir_evolution` / the EvoSkill port). Pass
-`agent=LLMAgent(claude_code())` (or any
+explanation or restatement."* That evolves an **instruction** (`SingleSlot`), not
+an Agent Skill folder — for a library run `python -m examples.skill_library_evolution --dry-run`.
+Pass `agent=LLMAgent(claude_code())` (or any
 [agent or LLM](https://thinkflowlab.github.io/agentdescent/agents/)) instead of
 `run`/`propose` to evolve against a tool-using CLI agent.
 [Quickstart — dataset to skill →](https://thinkflowlab.github.io/agentdescent/quickstart-skill/)

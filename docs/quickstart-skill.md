@@ -1,38 +1,30 @@
 ---
-description: Turn a dataset into an evolved instruction, Agent Skill, or skill library. Worked HotpotQA numbers for the instruction path; library and skill-dir demos for real on-disk skills.
+description: Turn a dataset into an evolved skill in one evolve() call. A worked example on 40 HotpotQA items that raises held-out exact match from 0.167 to 0.583.
 ---
 
 # Dataset → evolved skill (which kind?)
 
-"Skill" in this repo covers three different artifacts. Pick the one you mean
-before you copy a snippet:
-
-| Artifact | What evolves | Agent sees it as | Start here |
-|---|---|---|---|
-| **Instruction / playbook** | One prompt string (`SingleSlot`) or accumulated lessons (`AppendRules`) | Text pasted into the prompt | This page (below), or [`examples.skill_evolution`](skill-evolution.md) |
-| **Agent Skill (one dir)** | A folder with `SKILL.md` + helpers | Files under `.claude/skills/<name>/` | [`examples.skill_dir_evolution`](quickstart-directory.md) |
-| **Skill library** | Several `*/SKILL.md` skills together | Files under `.claude/skills/` (`layout="skill_library"`) | [`examples.skill_library_evolution`](https://github.com/ThinkFlowLab/agentdescent/blob/main/examples/skill_library_evolution.py), [`examples.evoskill`](algo-evoskill.md) |
-
-Calling a `SingleSlot` / `AppendRules` result "a skill" without that split
-teaches the wrong mental model: those demos never write an Agent Skill folder.
-If you want a host (Claude Code, Codex, OpenCode, DSH) to *discover* what you
-evolved, use the skill-dir or skill-library path.
+Pick the artifact: **instruction** (`SingleSlot` / `AppendRules`, this page /
+[`skill_evolution`](skill-evolution.md)), **one Agent Skill**
+([`skill_dir_evolution`](quickstart-directory.md)), or a **skill library**
+(`python -m examples.skill_library_evolution --dry-run`, [`evoskill`](algo-evoskill.md)).
+A `SingleSlot` result is not an Agent Skill folder.
 
 ---
 
-## Instruction path — one `evolve()` call
+## Instruction path
 
-There is one entry point, [`evolve`](evolution.md). Evolving an **instruction**
-from a dataset needs three things that are genuinely yours:
+There is one entry point, [`evolve`](evolution.md). Evolving an **instruction** from a
+dataset needs three things that are genuinely yours:
 
 1. **your data**,
 2. **how to score an answer**,
 3. **which model**.
 
-Everything else — wrapping rows as `Task`s, the line that puts the instruction in
-front of the question, the scorer, the proposer — is a public building block, so
-the whole program is a dozen lines and every one of them is an ordinary
-`evolve()` argument:
+Everything else — wrapping rows as `Task`s, the line that puts the skill in front
+of the question, the scorer, the proposer — is a public building block, so the
+whole program is a dozen lines and every one of them is an ordinary `evolve()`
+argument:
 
 ```python
 from agentdescent import SingleSlot, evolve, openai_compatible, reflector, scorer, tasks_from
@@ -89,7 +81,7 @@ job, not a stuck run.
 | `scorer(name_or_callable)` | a name from `SCORERS` below, or your own `(task, output) -> float` |
 | `run=` | how the instruction meets the question. The lambda above is the whole default; put it after the question, or inside a scaffold, by writing a different one |
 | `propose=reflector(model)` | any [completion](agents.md) as the proposer. A cheap model here behind an expensive one in `run=` is a fine trade |
-| `strategy=SingleSlot(initial_value=…)` | the artifact is one instruction, and each accepted proposal replaces it. `AppendRules` / `KeyedRules` are the other [text strategies](strategies.md) |
+| `strategy=SingleSlot(initial_value=…)` | one instruction; `AppendRules` / `KeyedRules` are the other [text strategies](strategies.md) |
 
 ## The scorers
 
@@ -124,32 +116,13 @@ is a default of `evolve()` itself:
 
 Everything else — a barrier-free run (`asynchronous=True, max_seconds=600`), a
 custom optimizer (`aggregator_factory=`), a multi-step agent as `run=` — is
-[a further argument to the same call](evolution.md). Prefer
-[`Policies(...)`](aggregator-factory.md) when you need a decision-plane override
-instead of inventing a bespoke factory.
-
----
-
-## Want a real Agent Skill / skill library instead?
-
-```bash
-python -m examples.skill_dir_evolution --dry-run            # one skill folder
-python -m examples.skill_library_evolution --dry-run        # ≥2 skills, layout=skill_library
-python -m examples.evoskill.evoskill_skill_discovery --dry-run
-```
-
-Those demos materialise files into a workspace and fail closed when the agent
-does not read them. Installing is explicit: `--install-to DIR` /
-`result.write_to(...)`.
+[a further argument to the same call](evolution.md).
 
 ---
 
 ## Next
 
-* **Have a folder rather than a dataset?**
-  [Quickstart — evolve a directory](quickstart-directory.md) does the same thing
-  for a skill folder, an agent folder, or its code, with a real agent reading the
-  files off disk.
+* **Want a real Agent Skill / library?** `python -m examples.skill_library_evolution --dry-run` or [evolve a directory](quickstart-directory.md).
 * **Want the knobs?** [The `evolve` method](evolution.md).
 * **Want to know why it works?** [Concepts](concepts.md), then
   [the aggregator](aggregator.md).

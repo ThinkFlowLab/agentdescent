@@ -61,7 +61,7 @@ nav:
     - Use it from your agent (DSH / Claude Code / Codex / OpenCode / Grok Bot): plugins.md
     - MCP / CLI Path A: mcp-path-a.md
     - Set it up and test it: testing-guide.md
-    - Quickstart — dataset to skill (instruction / library): quickstart-skill.md
+    - Quickstart — dataset to skill: quickstart-skill.md
     - Quickstart — evolve a directory: quickstart-directory.md
     - Quickstart — evolve an agent's code: quickstart-agent-code.md
   - Core concepts:
@@ -146,7 +146,7 @@ nav:
   - API reference: api.md
   - Run everything, and extend it: usage.md
   - Examples and results:
-    - Complete example — instruction / playbook evolution: skill-evolution.md
+    - Complete example — skill evolution: skill-evolution.md
     - Efficiency experiments: efficiency.md
     - Measured results: results.md
     - Runtime matrix: matrix-overview.md

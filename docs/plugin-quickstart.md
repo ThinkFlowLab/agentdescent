@@ -92,7 +92,7 @@ so:
 ```bash
 agentdescent show  <run_id>              # the diff
 agentdescent apply <run_id> --dry-run    # what it would write
-agentdescent apply <run_id>              # write it, keeping a .bak- backup
+agentdescent apply <run_id>              # write it; dir backup under ~/.agentdescent/backups/
 ```
 
 When a run learns little, `show` also lists the worst rollouts (`samples`:
@@ -159,7 +159,7 @@ echo "Call the agentdescent doctor tool and print its run_store field." | \
 Skip `install` — Codex reads the same plugin package Claude Code does:
 
 ```bash
-codex plugin marketplace add Birfy/agentdescent
+codex plugin marketplace add ThinkFlowLab/agentdescent
 codex plugin add agentdescent@agentdescent
 codex mcp list        # agentdescent ... enabled
 ```

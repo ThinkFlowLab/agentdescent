@@ -367,6 +367,8 @@ def starter_spec(path: str, *, kind: Optional[str] = None, data: Optional[str] =
         if agent == "claude_code":
             spec["agent"] = {"ref": "claude_code",
                              "extra_args": ["--permission-mode", "acceptEdits"]}
+    if kind == "agent_dir":
+        spec["reflect"] = dict(llm)
     if kind == "agent_code":
         spec["entrypoint"] = ["python", "main.py"]
         spec["reflect"] = dict(llm)
@@ -2173,9 +2175,11 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     ``agentdescent campaign`` leaves its best artifact in a workspace copy and
     keeps no run id, so ``apply <run_id>`` has nothing to point at. This takes
     the artifact path itself and gives it the same guarantees: a dry-run plan,
-    a ``.bak-N`` backup of whatever ``to`` held, and a no-op when ``to`` already
-    matches. Files in ``to`` that the artifact does not have are reported as
-    ``extra`` and left alone.
+    a backup of whatever ``to`` held (sibling ``.bak-N`` for a text file;
+    under ``$AGENTDESCENT_HOME/backups/`` for a directory, so host skill scanners
+    do not load the backup as another skill — #758), and a no-op when ``to``
+    already matches. Files in ``to`` that the artifact does not have are reported
+    as ``extra`` and left alone.
 
     Symlinks are refused (never dereferenced into real files). ``apply
     <run_id>`` materialises from FileTree state, which already skips symlinks
@@ -2284,7 +2288,8 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     if dry_run or plan["noop"]:
         return plan
     if backup and os.path.isdir(dest):
-        slot = _backup_slot(dest)
+        from .evolution import _file_tree_backup_path
+        slot = _file_tree_backup_path(dest)
         shutil.copytree(dest, slot, symlinks=True)
         plan["backup"] = [slot]
     for rel in changed:
@@ -2721,6 +2726,57 @@ def cmd_traces(a: argparse.Namespace) -> int:
                 print(f"{event['run_id']}/{event['task_id']} "
                       f"step={event['step']} {event['kind']}/{event['name']}  "
                       f"{event['text'][:200]}")
+    return 0
+
+
+def cmd_predictions(a: argparse.Namespace) -> int:
+    """``agentdescent predictions`` -- declare, observe and score edit predictions."""
+    from .prediction import (
+        PredictionError, PredictionLog, ProposalPrediction,
+    )
+
+    action = getattr(a, "predictions_cmd", None)
+    try:
+        log = PredictionLog(a.store)
+        if action == "predict":
+            prediction = ProposalPrediction(
+                expected_delta=a.delta, confidence=a.confidence,
+                expected_tasks=a.tasks or (), rationale=a.rationale or "")
+            pid = log.predict(a.artifact_id, a.diff_id or "", prediction)
+            payload = {
+                "schema_version": 1, "ok": True, "store": log.path,
+                "prediction_id": pid, "pending": True,
+                "prediction": prediction.to_dict(),
+            }
+        elif action == "observe":
+            payload = log.observe(
+                a.prediction_id, observed_delta=a.delta,
+                observed_tasks=a.tasks or (), tolerance=a.tolerance,
+                note=a.note or "").to_dict()
+        elif action == "report":
+            payload = log.report()
+        else:
+            raise PredictionError("predictions needs predict, observe or report")
+    except (PredictionError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "predict":
+            print(f"prediction: {payload['prediction_id']}  pending")
+        elif action == "observe":
+            print(f"{payload['prediction_id']}  hit={payload['hit']}  "
+                  f"brier={payload['brier']}  "
+                  f"error={payload['delta_error']:.3f}")
+        else:
+            print(f"predictions: {payload['predictions']}  "
+                  f"observed: {payload['observed']}  pending: {payload['pending']}")
+            print(f"hit_rate: {payload['hit_rate']}  "
+                  f"mean_brier: {payload['mean_brier']}  "
+                  f"mean_abs_error: {payload['mean_abs_error']}")
+            for bucket in payload["calibration"]:
+                print(f"confidence {bucket['low']:.1f}-{bucket['high']:.1f}: "
+                      f"n={bucket['count']} hit={bucket['hit_rate']:.3f}")
     return 0
 
 
@@ -4156,6 +4212,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="module:attribute harness_evidence callable for the harness ring")
     s.add_argument("--bias-threshold", type=float, default=0.1, dest="bias_threshold")
     s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser(
+        "predictions", help="declare, observe and score edit predictions")
+    predictions_sub = s.add_subparsers(dest="predictions_cmd", required=True)
+    sp = predictions_sub.add_parser("predict", help="store a prediction before measuring")
+    sp.add_argument("--store", required=True, help="prediction JSONL")
+    sp.add_argument("--artifact-id", required=True, dest="artifact_id")
+    sp.add_argument("--diff-id", default="", dest="diff_id")
+    sp.add_argument("--delta", type=float, required=True,
+                    help="expected change in held-out reward")
+    sp.add_argument("--confidence", type=float, required=True)
+    sp.add_argument("--tasks", default="",
+                    help="comma-separated task ids expected to flip")
+    sp.add_argument("--rationale", default="")
+    sp.set_defaults(fn=cmd_predictions)
+    sp = predictions_sub.add_parser("observe", help="record the measured result")
+    sp.add_argument("--store", required=True)
+    sp.add_argument("--prediction-id", required=True, dest="prediction_id")
+    sp.add_argument("--delta", type=float, required=True,
+                    help="observed change in held-out reward")
+    sp.add_argument("--tasks", default="")
+    sp.add_argument("--tolerance", type=float, default=0.0)
+    sp.add_argument("--note", default="")
+    sp.set_defaults(fn=cmd_predictions)
+    sp = predictions_sub.add_parser("report", help="hit rate, Brier and calibration")
+    sp.add_argument("--store", required=True)
+    sp.set_defaults(fn=cmd_predictions)
+
+
 
     s = sub.add_parser(
         "traces", help="summarise raw agent trajectories or drill into them")

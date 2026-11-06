@@ -1,5 +1,7 @@
 # Porting checklist
 
+> Not sure this is the right track? [Algorithm decision tree](algorithm-decision-tree.md) (card vs MethodPolicy vs factory vs this checklist).
+
 Use this before calling an algorithm example a **benchmark-faithful** port;
 microports/analogues follow the [MethodPolicy checklist](porting-methodpolicy.md).
 

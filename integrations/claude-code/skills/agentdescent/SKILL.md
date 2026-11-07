@@ -28,10 +28,12 @@ unless the user asked and the server was started with `--advanced` /
    Write every path **absolute**. A relative one is resolved against whatever
    directory read the spec -- the host started its MCP server somewhere you
    cannot see -- so the same spec finds the file from one host and not another.
-   - `kind`: `text` (a prompt or instruction), `skill_dir` (a SKILL.md folder),
-     `agent_dir` (subagent definitions), `agent_code` (a tree that runs behind
-     tests), `plugin` (a host plugin; needs `host`), `policy_slot` (a decision
-     rule of the optimiser itself -- see below; almost never what a user means).
+   - `kind`: `text` (a prompt or instruction), `skill_dir` (one SKILL.md folder),
+     `skill_library` (a directory of `*/SKILL.md` skills; see
+     `examples.skill_library_evolution`), `agent_dir` (subagent definitions),
+     `agent_code` (a tree that runs behind tests), `plugin` (a host plugin;
+     needs `host`), `policy_slot` (a decision rule of the optimiser itself --
+     see below; almost never what a user means).
    - **`policy_slot` is not for improving the user's files.** Its artifact is one
      slot of AgentDescent's own search (`selection`, `task_sampler`, ...), and
      one rollout is a *whole inner search*, so a round costs minutes to hours

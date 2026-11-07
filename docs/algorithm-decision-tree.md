@@ -36,7 +36,7 @@ them. Carrying them in both places is a silent drop on the evolve path today;
 
 Factory ⊕ merge Policies composition **landed** via
 [#807](https://github.com/ThinkFlowLab/agentdescent/issues/807) /
-[#812](https://github.com/ThinkFlowLab/agentdescent/pull/812): `evolve`
+[#813](https://github.com/ThinkFlowLab/agentdescent/pull/813): `evolve`
 forwards merge-side slots into the factory (or onto the returned aggregator)
 and **raises** on unused requested slots unless
 `Policies(accept_orphaned_merge_policies=True)`. Details:

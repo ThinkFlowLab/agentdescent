@@ -64,11 +64,6 @@ Parent sampling from an archive of every accepted candidate, tempered by novelty
 - **Cost:** none
 - **Source:** Darwin Gödel Machine (choose_selfimproves), ADAS archive, SICA best-agent
 - **Spec:** `"algorithm": "archive_selection"`
-- **Path A (skill library):** the non-evoskill card for `kind=skill_library` —
-  `agentdescent init <lib> --kind skill_library --algorithm archive_selection`
-  (see [quickstart-skill](quickstart-skill.md); Refs #846 / #864). Offline smoke
-  remains `agentdescent demo --algorithm archive_selection` on a **skill_dir**
-  fixture.
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|

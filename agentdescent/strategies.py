@@ -102,9 +102,12 @@ class SeededAppendRules:
         return {}
 
     def render(self, state: Dict[str, str]) -> str:
-        body = (self.seed or "").rstrip()
+        # Empty state must round-trip the seed bytes (incl. trailing newline) so
+        # apply is a no-op when the run accepted nothing (#849 CI / #837).
+        seed = self.seed or ""
         if not state:
-            return body if body else f"{self.title}\n(empty)"
+            return seed if seed else f"{self.title}\n(empty)"
+        body = seed.rstrip()
         rules = "\n".join([self.title] + [f"- {state[k]}" for k in sorted(state)])
         return f"{body}\n\n{rules}" if body else rules
 

@@ -75,3 +75,9 @@ def test_text_evolve_one_accept_keeps_seed_substance():
     )
     assert "You are a careful assistant." in res.rendered
     assert "Always show units" in res.rendered
+
+
+def test_empty_state_preserves_seed_trailing_newline():
+    """apply no-op depends on empty render matching the on-disk seed (#849)."""
+    seed = "original\n"
+    assert SeededAppendRules(seed=seed).render({}) == seed

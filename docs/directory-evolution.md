@@ -151,15 +151,15 @@ run = tree_runner(claude_code(), layout="claude_skill", name="pdf-audit")
 |---|---|
 | `claude_skill` | `.claude/skills/<name>/` |
 | `skill_library` | `.claude/skills/` (a directory *of* skills) |
+| `claude_agent` | `.claude/agents/` |
+| `dsh_skill` | `.dsh/skills/<name>/` (DeepSeek Harness project skill) |
+| `agents_skill` | `.agents/skills/<name>/` (the Agent Skills standard; dsh and Codex both read it) |
+| `root` | the workspace itself |
 
 Path A: `agentdescent init DIR --kind skill_library` seeds ≥2 `*/SKILL.md`,
 and `kind: "skill_library"` in a spec composes `FileTree` + `tree_runner(layout="skill_library")`.
 See also [`examples.skill_library_evolution`](https://github.com/ThinkFlowLab/agentdescent/blob/main/examples/skill_library_evolution.py)
 and [EvoSkill](algo-evoskill.md).
-| `claude_agent` | `.claude/agents/` |
-| `dsh_skill` | `.dsh/skills/<name>/` (DeepSeek Harness project skill) |
-| `agents_skill` | `.agents/skills/<name>/` (the Agent Skills standard; dsh and Codex both read it) |
-| `root` | the workspace itself |
 
 Any literal prefix works too. Per rollout the runner makes a fresh workspace,
 materialises the candidate, overlays the pristine frozen files, stages the task's

@@ -50,7 +50,7 @@ unless the user asked and the server was started with `--advanced` /
      one) before naming one; filter by kind so ineligible cards are not offered.
      Same-name `examples/<algo>/` research ports are source-only and may differ
      in fidelity — `plan` echoes `fidelity` / `research_port` / `fidelity_note`;
-     never claim the paper port ran when only the card did. The same data is in
+     never claim the paper port ran when only the card did. **Hard contract (#384):** Path A names **cards only**; MethodPolicy / full ports stay `python -m examples…` until a scoped card issue lands. The same data is in
      `agentdescent algorithms list` / `show`. To build the spec for one,
      call `algorithm_spec` (name, absolute `path`, absolute `cases`, optional
      `params` object, `rounds`/`workers` 1/1 for a quick trial): it writes the
@@ -89,7 +89,7 @@ unless the user asked and the server was started with `--advanced` /
        agent here**: `claude_code` / `codex` / `dsh` / `opencode` are
        file-editing agents, and pointing one at a prompt costs a whole agent
        session per case to answer a question a model answers in one call.
-     - `skill_dir` / `agent_dir` / `agent_code` / `plugin` -- the agent has to
+     - `skill_dir` / `skill_library` / `agent_dir` / `agent_code` / `plugin` -- the agent has to
        read and edit files, so it must be a CLI agent, and `reflect` is where a
        cheap model goes.
    - **Never invent a model name.** `openai_compatible` needs one and there is

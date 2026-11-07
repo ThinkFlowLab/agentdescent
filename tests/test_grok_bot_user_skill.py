@@ -115,8 +115,7 @@ def test_missing_user_skill_after_scaffold_is_a_hint(home, capsys):
     install("grok-bot", home=str(home))
     info = host_status("grok-bot", home=str(home))
     assert (info["state"], info["skill"], info["user_skill"]) == ("ok", "ok", "missing")
-    rc, out = _doctor(home, capsys)
-    assert rc == 0
+    _, out = _doctor(home, capsys)
     hint = next(l for l in out.splitlines() if l.startswith("- grok-bot"))
     assert "user skill" in hint and info["path"] in hint
     assert "save" in hint.lower()

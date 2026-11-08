@@ -191,7 +191,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
             run_id, "cancelled", "the run was cancelled before it finished",
             evidence={"stop_reason": payload.get("stop_reason"),
                       "outcomes": payload.get("outcomes") or {}},
-            recommendations=(f"resume it if the answer is still wanted: "
+            recommendations=("resume it if the answer is still wanted: "
                              f"`agentdescent resume {run_id}`",))
     if payload.get("error"):
         evidence = {"error": payload["error"]}
@@ -278,7 +278,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
                       "final_reward": final_value, "outcomes": outcomes,
                       "committed": committed},
             recommendations=("raise rounds or n_workers for another attempt",
-                             f"inspect the remaining failures in "
+                             "inspect the remaining failures in "
                              f"`agentdescent show {run_id} --json`"))
 
     if rejected:

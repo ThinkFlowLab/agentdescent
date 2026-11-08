@@ -681,10 +681,17 @@ def cmd_demo(a: argparse.Namespace) -> int:
                 f"{list(demo_mod.OFFLINE_ALGORITHMS)}. Run it for real with "
                 f"`agentdescent algorithms run {algo} <path> <cases.jsonl>` "
                 f"(`agentdescent algorithms show {algo}` for its parameters)")
+    try:
+        demo_mod.resolve_demo_kind(algo, getattr(a, "kind", None))
+    except ValueError as e:
+        raise SpecError(str(e)) from None
     root = os.path.abspath(os.path.expanduser(a.dir)) if a.dir else tempfile.mkdtemp(
         prefix="agentdescent-demo-")
     os.makedirs(root, exist_ok=True)
-    spec_dict = demo_mod.build(root, algorithm=algo)
+    try:
+        spec_dict = demo_mod.build(root, algorithm=algo, kind=getattr(a, "kind", None))
+    except ValueError as e:
+        raise SpecError(str(e)) from None
     kind = spec_dict["kind"]
 
     as_json = getattr(a, "json", False)
@@ -695,6 +702,15 @@ def cmd_demo(a: argparse.Namespace) -> int:
             print(f"  prompt.txt   ->  {open(prompt_path).read().strip()!r}   "
                   f"(wrong: `id` is a row number)")
             print("  cases.jsonl  ->  12 prompts with embedded CSVs and known totals")
+        elif kind == "skill_library":
+            csv_rules = os.path.join(root, "csv-total", "references", "rules.md")
+            date_rules = os.path.join(root, "date-parse", "references", "rules.md")
+            print(f"A two-skill library (csv-total + date-parse), in {root}")
+            print(f"  csv-total/references/rules.md   ->  "
+                  f"{open(csv_rules).read().strip()!r}   (wrong: `id` is a row number)")
+            print(f"  date-parse/references/rules.md  ->  "
+                  f"{open(date_rules).read().strip()!r}   (wrong: date tasks ask for year)")
+            print("  cases.jsonl                      ->  12 tasks (CSV totals + date years)")
         else:
             skill = os.path.join(root, demo_mod.DEMO_SKILL)
             rules = os.path.join(skill, "references", "rules.md")
@@ -703,8 +719,9 @@ def cmd_demo(a: argparse.Namespace) -> int:
                   f"{open(rules).read().strip()!r}   (wrong: `id` is a row number)")
             print("  cases.jsonl                        ->  12 CSVs with known totals")
         print("  the agent is a local program, so this costs nothing and needs no key")
-        print("  note: this is a smoke trajectory; for multi-round library edits see")
-        print("        python -m examples.skill_library_evolution  (#847)")
+        if kind != "skill_library":
+            print("  note: this is a smoke trajectory; for multi-round library edits see")
+            print("        agentdescent demo --kind skill_library")
         if algo:
             print(f"  algorithm: {algo}   (`agentdescent algorithms show {algo}`)")
         print()
@@ -734,6 +751,14 @@ def cmd_demo(a: argparse.Namespace) -> int:
             f"agentdescent show  {rd.run_id}",
             f"agentdescent apply {rd.run_id} --dry-run",
             "agentdescent init <your-prompt.txt> --kind text --data <your-cases.jsonl> --out spec.json",
+            "agentdescent doctor",
+            "agentdescent plan spec.json",
+        ]
+    elif kind == "skill_library":
+        next_steps = [
+            f"agentdescent show  {rd.run_id}",
+            f"agentdescent apply {rd.run_id} --dry-run",
+            "agentdescent init <your-skill-library> --kind skill_library --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
             "agentdescent plan spec.json",
         ]
@@ -799,6 +824,19 @@ Your own run is the same shape with a real model instead of the offline pair:
 
   agentdescent init <your-prompt.txt> --kind text --data <your-cases.jsonl> --out spec.json
   agentdescent doctor
+  agentdescent plan spec.json""")
+    elif kind == "skill_library":
+        print(f"""
+The library on disk is untouched -- an evolved artifact only lands when you say so:
+
+  agentdescent show  {rd.run_id}          the diff
+  agentdescent apply {rd.run_id} --dry-run  what it would write
+
+Your own run is the same spec with three things changed -- your library, your
+cases.jsonl, and a real agent instead of the offline one:
+
+  agentdescent init <your-skill-library> --kind skill_library --data <your-cases.jsonl> --out spec.json
+  agentdescent doctor        # what is missing before a real run
   agentdescent plan spec.json""")
     else:
         print(f"""
@@ -1239,10 +1277,10 @@ def write_starter_spec(
                 if spec["kind"] == "skill_library":
                     # #864 / #846: demo is skill_dir smoke; name the library card path.
                     report.append(("next",
-                                   "(`agentdescent demo --algorithm archive_selection` "
-                                   "is an offline skill_dir smoke; for this library "
-                                   "Path A card use --algorithm archive_selection — "
-                                   "see docs/quickstart-skill.md)"))
+                                   "(`agentdescent demo --kind skill_library` is "
+                                   "the offline library demo; `demo --algorithm "
+                                   "archive_selection` is a one-skill smoke of the "
+                                   "same card — see docs/quickstart-skill.md)"))
                 else:
                     report.append(("next", "(`agentdescent demo` runs a complete example, "
                                    "offline, to copy from)"))
@@ -4608,10 +4646,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("demo", help="build a complete example and run it, offline")
     s.add_argument("--dir", help="where to build it (default: a temp directory)")
+    s.add_argument("--kind", choices=("skill_dir", "text", "skill_library"),
+                   help="demo fixture (default: skill_dir, or text when "
+                        "--algorithm is a text-only card)")
     s.add_argument("--algorithm", metavar="NAME",
                    help="run the demo with this named algorithm offline "
-                        "(skill_dir: archive_selection; text: gepa, dgm, ace, "
-                        "skillopt, rrsi; evoskill is refused — needs a real model). "
+                        "(skill_dir / skill_library: archive_selection; text: "
+                        "gepa, dgm, ace, skillopt, rrsi; evoskill is refused — "
+                        "needs a real model). "
                         "Currently: " + ", ".join(_demo_offline_algorithms()))
     s.set_defaults(fn=cmd_demo)
 

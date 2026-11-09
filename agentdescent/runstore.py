@@ -666,14 +666,6 @@ def resume(run_id: str, *, store: Optional[str] = None, **launch_kwargs: Any) ->
     st = rd.status()
     if st.state == "running" and st.alive():
         raise RunStoreError(f"{run_id} is still running (pid {st.pid})")
-    if st.state == "done" and st.stop_reason == "target_reward":
-        # A solved run has nothing left to search for; relaunching it spent
-        # calls again and overwrote its recorded result with the no-op rerun
-        # (#900). Runs that ended on a bound still resume.
-        raise RunStoreError(
-            f"{run_id} already reached its target (done [target_reward]); "
-            f"nothing to resume -- see `agentdescent show {run_id}` or "
-            f"`agentdescent apply {run_id} --dry-run`")
     return launch(rd, **launch_kwargs)
 
 

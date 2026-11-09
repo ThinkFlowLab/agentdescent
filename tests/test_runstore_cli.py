@@ -321,6 +321,9 @@ def test_resume_continues_on_the_same_ledger(store, tmp_path):
     _, spec = _spec_file(tmp_path)
     rd = runstore.create(spec.to_dict(), store=store)
     runstore.execute(rd)
+    # The offline spec solves its task; a solved run is not resumable (#900), so
+    # record a bound-stopped run to exercise the relaunch itself.
+    rd.update_status(stop_reason="max_iters")
     n_before = len(rd.rounds())
     st = runstore.resume(rd.run_id, store=store)
     assert st.state == "running"
@@ -339,6 +342,9 @@ def test_a_relative_store_works_for_create_resume_and_launch(tmp_path, monkeypat
     rd = runstore.create(spec.to_dict(), store="./store")
     assert os.path.isabs(rd.path) and os.path.isabs(rd.log_path)
     runstore.execute(rd)
+    # The offline spec solves its task; a solved run is not resumable (#900), so
+    # record a bound-stopped run to exercise the relaunch itself.
+    rd.update_status(stop_reason="max_iters")
     n_before = len(rd.rounds())
     st = runstore.resume(rd.run_id, store="./store")          # relative, as typed
     assert st.state == "running"
@@ -355,6 +361,11 @@ def test_cli_resume_with_a_relative_store(tmp_path, monkeypatch):
     code, out = _cli("--store", "./store", "--json", "evolve", path)
     assert code == 0, out
     rid = json.loads(out)["run_id"]
+    rd = runstore.get(rid, store="./store")
+    _wait(rd)
+    # The offline spec solves its task; a solved run is not resumable (#900), so
+    # record a bound-stopped run to exercise the relaunch itself.
+    rd.update_status(stop_reason="max_iters")
     code, out = _cli("--store", "./store", "resume", rid)
     assert code == 0 and rid in out
     assert _wait(runstore.get(rid, store="./store")).state == "done"

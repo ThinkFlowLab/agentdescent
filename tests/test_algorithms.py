@@ -163,6 +163,39 @@ def test_a_failed_builtin_load_keeps_its_original_error(monkeypatch):
 def test_choices_are_enforced():
     with pytest.raises(AlgorithmError, match=r"sampling: must be one of \[.*'best'"):
         resolve_params(algorithms.get("archive_selection"), {"sampling": "greedy"})
+    with pytest.raises(AlgorithmError) as e:
+        resolve_params(algorithms.get("archive_selection"), {"sampling": "greedy"})
+    assert "did you mean" not in str(e.value)
+
+
+def test_resolve_params_folds_choice_value_aliases():
+    """#888: `sigmoid-novelty` / `KEEP_ALL` resolve like parameter-name aliases."""
+    arch = resolve_params(algorithms.get("archive_selection"),
+                          {"sampling": "sigmoid-novelty"})
+    assert arch["sampling"] == "sigmoid_novelty"
+    assert resolve_params(
+        algorithms.get("archive_selection"),
+        {"sampling": "SIGMOID_NOVELTY"},
+    )["sampling"] == "sigmoid_novelty"
+    assert resolve_params(
+        algorithms.get("dgm"), {"archive_mode": "keep-all"},
+    )["archive_mode"] == "keep_all"
+    assert resolve_params(
+        algorithms.get("dgm"), {"archive_mode": "KEEP_ALL"},
+    )["archive_mode"] == "keep_all"
+    assert resolve_params(
+        algorithms.get("skillopt"), {"mode": "Linear"},
+    )["mode"] == "linear"
+
+
+@pytest.mark.parametrize("alg,param,typo,meant", [
+    ("archive_selection", "sampling", "novlty", "novelty"),
+    ("dgm", "archive_mode", "keep_al", "keep_all"),
+    ("skillopt", "mode", "cosin", "cosine"),
+])
+def test_invalid_choice_names_the_near_miss(alg, param, typo, meant):
+    with pytest.raises(AlgorithmError, match=rf"did you mean '{meant}'\?$"):
+        resolve_params(algorithms.get(alg), {param: typo})
 
 
 def test_the_registry_works_from_a_wheel_without_examples():
@@ -441,6 +474,27 @@ def test_init_writes_the_algorithm_and_only_the_params_given(tmp_path, capsys):
     assert "wrote" in capsys.readouterr().out
 
 
+def test_init_writes_the_registered_name_for_an_alias(tmp_path, capsys):
+    # #894: `init --algorithm GEPA` / `archive-selection` validated but wrote
+    # the alias verbatim into the spec.
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("be terse\n")
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "a.json"),
+                     "--algorithm", "GEPA", "--model", "m"]) == 0
+    assert json.loads((tmp_path / "a.json").read_text())["algorithm"] == "gepa"
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "b.json"),
+                     "--algorithm", "RRSI", "--param", 'protected=["s"]',
+                     "--model", "m"]) == 0
+    assert json.loads((tmp_path / "b.json").read_text())["algorithm"] == {
+        "name": "rrsi", "params": {"protected": ["s"]}}
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\nbody\n")
+    assert cli.main(["init", str(skill), "--out", str(tmp_path / "c.json"),
+                     "--algorithm", "archive-selection", "--agent", "opencode"]) == 0
+    assert json.loads((tmp_path / "c.json").read_text())["algorithm"] == "archive_selection"
+
+
 def test_init_refuses_an_unknown_algorithm_or_wrong_kind(tmp_path, capsys):
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("be terse\n")
@@ -489,7 +543,11 @@ def test_mcp_lists_and_describes_the_registry():
         ["archive_selection", "evoskill"]
     assert [a["name"] for a in t.list_algorithms("agent_dir")["algorithms"]] == \
         ["archive_selection", "evoskill"]
+    assert [a["name"] for a in t.list_algorithms("skill-library")["algorithms"]] == \
+        [a["name"] for a in t.list_algorithms("skill_library")["algorithms"]]
     assert "unknown kind" in t.list_algorithms("nope")["error"]
+    err = t.list_algorithms("skil_library")["error"]
+    assert "unknown kind" in err and "did you mean 'skill_library'?" in err
     card = t.describe_algorithm("rrsi")
     assert card["name"] == "rrsi" and any(p["name"] == "b_max" for p in card["params"])
     assert "unknown algorithm" in t.describe_algorithm("nope")["error"]

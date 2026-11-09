@@ -47,7 +47,8 @@ from urllib.parse import urlparse
 
 from . import runstore
 from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
-                         compose, estimate, load_spec, _POLICY_SLOTS)
+                         compose, estimate, fold_kind, load_spec, resolve_kind,
+                         _POLICY_SLOTS)
 
 __all__ = ["main", "doctor_report", "starter_spec"]
 
@@ -307,8 +308,13 @@ def algorithm_override(name: Optional[str], params: Optional[Mapping[str, Any]],
             alg, kind, target=target, prefix="--algorithm"))
     if params:
         params = algorithms._canonical_param_map(alg, params, where="algorithm.params")
-    algorithms.resolve_params(alg, params)      # validates types/unknowns/choices
-    return name if not params else {"name": name, "params": dict(params)}
+    resolved = algorithms.resolve_params(alg, params)  # types/unknowns/choices
+    # Write the registered name, not the alias the user typed (`GEPA`,
+    # `archive-selection`), so the spec reads the same as `algorithms list`.
+    if not params:
+        return alg.name
+    # Store user-supplied keys only, with coerced (folded) values (#888).
+    return {"name": alg.name, "params": {k: resolved[k] for k in params}}
 
 
 def missing_target_message(path: str) -> str:
@@ -746,30 +752,40 @@ def cmd_demo(a: argparse.Namespace) -> int:
     init = getattr(result, "initial_reward", None)
     learned = demo_mod.learned_summary(result.state, kind=kind)
     ok = result.final_reward >= 1.0
-    if kind == "text":
-        next_steps = [
-            f"agentdescent show  {rd.run_id}",
-            f"agentdescent apply {rd.run_id} --dry-run",
-            "agentdescent init <your-prompt.txt> --kind text --data <your-cases.jsonl> --out spec.json",
+    # #902: one list feeds both the human footer and --json.next, and with
+    # --algorithm NAME the "your own run" steps keep the algorithm just shown.
+    target = {"text": "<your-prompt.txt>",
+              "skill_library": "<your-skill-library>"}.get(kind, "<your-skill-dir>")
+    if algo:
+        own_steps = [
+            f"agentdescent algorithms run {algo} {target} <your-cases.jsonl> "
+            f"--model <model> [--base-url <url>] --rounds 1 --workers 1",
+            "agentdescent doctor",
+            f"agentdescent evolve agentdescent.{algo}.spec.json",
+        ]
+    elif kind == "text":
+        own_steps = [
+            f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
             "agentdescent plan spec.json",
         ]
     elif kind == "skill_library":
-        next_steps = [
-            f"agentdescent show  {rd.run_id}",
-            f"agentdescent apply {rd.run_id} --dry-run",
-            "agentdescent init <your-skill-library> --kind skill_library --data <your-cases.jsonl> --out spec.json",
+        own_steps = [
+            f"agentdescent init {target} --kind skill_library --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
             "agentdescent plan spec.json",
         ]
     else:
-        next_steps = [
-            f"agentdescent show  {rd.run_id}",
-            f"agentdescent apply {rd.run_id} --dry-run",
-            "agentdescent init <your-skill-dir> --data <your-cases.jsonl> --out spec.json",
+        own_steps = [
+            f"agentdescent init {target} --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
             "agentdescent plan spec.json",
         ]
+    next_steps = [
+        f"agentdescent show  {rd.run_id}",
+        f"agentdescent apply {rd.run_id} --dry-run",
+        *own_steps,
+    ]
 
     if as_json:
         # #862: honour the advertised --json flag so hosts can assert an
@@ -813,6 +829,10 @@ def cmd_demo(a: argparse.Namespace) -> int:
         print("\n(that is lower than expected for the demo; the run store has the detail:")
         print(f" {rd.path})")
         return 1
+    own = "\n".join(f"  {step}" + ("        # what is missing before a real run"
+                                     if step == "agentdescent doctor" and kind != "text"
+                                     else "")
+                     for step in own_steps)
     if kind == "text":
         print(f"""
 The prompt on disk is untouched -- an evolved artifact only lands when you say so:
@@ -822,9 +842,7 @@ The prompt on disk is untouched -- an evolved artifact only lands when you say s
 
 Your own run is the same shape with a real model instead of the offline pair:
 
-  agentdescent init <your-prompt.txt> --kind text --data <your-cases.jsonl> --out spec.json
-  agentdescent doctor
-  agentdescent plan spec.json""")
+{own}""")
     elif kind == "skill_library":
         print(f"""
 The library on disk is untouched -- an evolved artifact only lands when you say so:
@@ -835,9 +853,7 @@ The library on disk is untouched -- an evolved artifact only lands when you say 
 Your own run is the same spec with three things changed -- your library, your
 cases.jsonl, and a real agent instead of the offline one:
 
-  agentdescent init <your-skill-library> --kind skill_library --data <your-cases.jsonl> --out spec.json
-  agentdescent doctor        # what is missing before a real run
-  agentdescent plan spec.json""")
+{own}""")
     else:
         print(f"""
 The skill on disk is untouched -- an evolved artifact only lands when you say so:
@@ -848,9 +864,7 @@ The skill on disk is untouched -- an evolved artifact only lands when you say so
 Your own run is the same spec with three things changed -- your directory, your
 cases.jsonl, and a real agent instead of the offline one:
 
-  agentdescent init <your-skill-dir> --data <your-cases.jsonl> --out spec.json
-  agentdescent doctor        # what is missing before a real run
-  agentdescent plan spec.json""")
+{own}""")
     return 0
 
 
@@ -929,13 +943,31 @@ _WORKSPACE_REFS = ("claude_code", "codex", "dsh", "opencode", "cli_agent")
 _PLAIN_REFS = ("openai_compatible", "host_model", "claude", "echo")
 
 
+def fold_agent_ref(ref: str) -> str:
+    """Canonical built-in agent short ref when ``ref`` is a case/hyphen alias.
+
+    ``claude-code`` and ``CLAUDE_CODE`` become ``claude_code``. A value that
+    is not such an alias — including ``module:attribute`` and install-only
+    host names like ``deepseek-harness`` — is returned unchanged, so
+    :func:`init_agent_unknown` can still hint or refuse it.
+    """
+    if not isinstance(ref, str) or ":" in ref:
+        return ref
+    folded = ref.strip().casefold().replace("-", "_")
+    if folded in _WORKSPACE_REFS + _PLAIN_REFS:
+        return folded
+    return ref
+
+
 def init_agent_unknown(ref: str) -> Optional[str]:
     """Why ``--agent ref`` can never resolve, or None (#745).
 
     ``plan`` would refuse a name that is neither a built-in agent short ref nor
     ``module:attribute``; say so before a spec is written, list only the agent
     refs (not the policy classes ``SHORT_REFS`` also holds), and point a host
-    name such as ``claude-code`` at its ref spelling.
+    name such as ``deepseek-harness`` at its worker spelling. Callers should
+    run :func:`fold_agent_ref` first so ``claude-code`` is stored as
+    ``claude_code`` rather than rejected (#884).
     """
     agents = _WORKSPACE_REFS + _PLAIN_REFS
     if ref in agents or ":" in ref:
@@ -1143,11 +1175,14 @@ def write_starter_spec(
         if value is not None and (isinstance(value, bool) or not isinstance(value, int)
                                   or value < 1):
             raise ValueError(f"{flag} must be an integer >= 1, got {value!r}")
+    if kind is not None:
+        kind = resolve_kind(kind, where="--kind")
     agent_explicit = agent is not None
     if agent is None:
         agent, found = default_agent_ref()
     else:
         found = True
+        agent = fold_agent_ref(agent)
     # Refuse a missing PATH before kind guess / agent mismatch / writing (#706).
     missing = require_existing_target(path, kind)
     if missing:
@@ -1621,6 +1656,22 @@ def require_cli_on_path(spec: EvolveSpec) -> None:
             + _bare_opencode_gateway_messages(spec))
     if msgs:
         raise SpecError("; ".join(msgs))
+
+
+def require_resume_not_solved(run_id: str, *, store: Optional[str] = None) -> None:
+    """Refuse to relaunch a run that already reached its target (#900).
+
+    A ``done [target_reward]`` run has nothing left to search for; relaunching
+    it spent calls again and overwrote its recorded initial reward and outcomes
+    with the no-op rerun, so ``show``/``diagnose`` lost what it had learned.
+    Runs that stopped on a bound, were cancelled or failed still resume.
+    """
+    st = runstore.get(run_id, store=store).status()
+    if st.state == "done" and st.stop_reason == "target_reward":
+        raise SpecError(
+            f"cannot resume {run_id}: it already reached its target "
+            f"(done [target_reward]) -- see `agentdescent show {run_id}` or "
+            f"`agentdescent apply {run_id} --dry-run`")
 
 
 def require_resume_host_on_path(run_id: str, *, store: Optional[str] = None) -> None:
@@ -2136,6 +2187,7 @@ def cmd_run(a: argparse.Namespace) -> int:
 def status_payload(run_id: Optional[str], *, store: Optional[str] = None,
                    recent_rounds: int = 3) -> Any:
     if run_id:
+        run_id = resolve_run_id(run_id, store=store)
         rd = runstore.get(run_id, store=store)
         st = rd.status().to_dict()
         st["recent_rounds"] = rd.rounds()[-recent_rounds:]
@@ -2398,6 +2450,7 @@ def _partial_show(rd: "runstore.RunDir", st: Any) -> Dict[str, Any]:
 
 def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
                  max_chars: int = 40_000) -> Dict[str, Any]:
+    run_id = resolve_run_id(run_id, store=store) or run_id
     rd = runstore.get(run_id, store=store)
     st = rd.status()
     result = rd.result()
@@ -2562,6 +2615,7 @@ def resolve_apply_dest(to: Optional[str], install_to: Optional[str]) -> Optional
 
 def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str] = None,
                   dry_run: bool = False, backup: bool = True) -> Dict[str, Any]:
+    run_id = resolve_run_id(run_id, store=store) or run_id
     rd = runstore.get(run_id, store=store)
     result = rd.result()
     if result is None:
@@ -2813,6 +2867,7 @@ def cmd_resume(a: argparse.Namespace) -> int:
     # from an agent session and resumed from a shell has lost whatever
     # `host_model` was borrowing.
     runstore.require_budget_pair(a.budget, a.usd_per_call)
+    require_resume_not_solved(a.run_id, store=a.store)
     # Hard gate, unlike the warnings below: a missing plugin host cannot run a
     # single rollout, so do not relaunch the detached process at all (#370).
     require_resume_host_on_path(a.run_id, store=a.store)
@@ -3379,8 +3434,8 @@ def cmd_algorithms(a: argparse.Namespace) -> int:
               file=sys.stderr)
     as_json = getattr(a, "json", False)
     if a.action in (None, "list"):
-        if a.kind is not None and a.kind not in KINDS:
-            raise SpecError(f"--kind must be one of {list(KINDS)}, got {a.kind!r}")
+        if a.kind is not None:
+            a.kind = resolve_kind(a.kind, where="--kind")
         found = algorithms.listing(a.kind)
         # Same explanation MCP list_algorithms already returns for this kind
         # (#799): policy_slot evolves a policy value, so no named algorithm
@@ -3479,11 +3534,13 @@ def algorithms_run_payload(
     except algorithms.AlgorithmError as e:
         return {"ok": False, "error": str(e), "_stage": "pre"}
     out = out or f"agentdescent.{name}.spec.json"
-    if kind is not None and kind not in KINDS:
-        # The group-level --kind is free text; fail closed with the real choices
-        # before anything is written (#688).
-        return {"ok": False, "_stage": "pre",
-                "error": f"--kind must be one of {list(KINDS)}, got {kind!r}"}
+    if kind is not None:
+        # The group-level --kind is free text; fold aliases and fail closed
+        # with the real choices before anything is written (#688, #882).
+        try:
+            kind = resolve_kind(kind, where="--kind")
+        except SpecError as e:
+            return {"ok": False, "_stage": "pre", "error": str(e)}
     # The name is positional here: say so, route the one-file fix through
     # `algorithms run`, and name --kind when the kind was only guessed (#702).
     alg = algorithms.get(name)
@@ -4592,8 +4649,51 @@ def cmd_mcp(a: argparse.Namespace) -> int:
 
 
 # Sub-commands that exist for AgentDescent's own use and are kept out of
-# `--help` and the usage line.
+# `--help`, the usage line, and unknown-verb ``choose from`` lists (#420, #886).
 _INTERNAL_COMMANDS = frozenset({"run"})
+
+
+def _visible_choices(action: argparse.Action) -> List[Any]:
+    """``action.choices`` without internal commands, in registration order."""
+    if action.choices is None:
+        return []
+    return [c for c in action.choices if c not in _INTERNAL_COMMANDS]
+
+
+def _did_you_mean_choice(value: Any, choices: Sequence[Any]) -> Optional[str]:
+    """The unique visible choice ``value`` most likely meant, or ``None``.
+
+    An exact match after folding case and ``-``/``_`` wins (``compile_skill``
+    → ``compile-skill``). Otherwise a single close typo at cutoff 0.75, the
+    same bar as unknown algorithm names (#874).
+    """
+    if not isinstance(value, str) or not choices:
+        return None
+    folded = value.strip().casefold().replace("_", "-")
+    pool: Dict[str, Any] = {}
+    for choice in choices:
+        key = str(choice).casefold().replace("_", "-")
+        # Two visible names that fold together are ambiguous; skip both.
+        if key in pool:
+            pool[key] = None
+        else:
+            pool[key] = choice
+    if folded in pool and pool[folded] is not None:
+        return str(pool[folded])
+    close = difflib.get_close_matches(
+        folded, [k for k, v in pool.items() if v is not None], n=1, cutoff=0.75)
+    return str(pool[close[0]]) if close else None
+
+
+def _invalid_choice_message(action: argparse.Action, value: Any) -> str:
+    """argparse's invalid-choice text, minus internal verbs, plus a hint (#886)."""
+    visible = _visible_choices(action)
+    shown = ", ".join(repr(c) for c in visible)
+    msg = f"invalid choice: {value!r} (choose from {shown})"
+    guess = _did_you_mean_choice(value, visible)
+    if guess is not None:
+        msg += f"; did you mean {guess!r}?"
+    return msg
 
 
 class _CliParser(argparse.ArgumentParser):
@@ -4604,6 +4704,9 @@ class _CliParser(argparse.ArgumentParser):
     ``--json`` that leaves a script with nothing to parse on stdout, so the
     same exit code instead comes with one ``{"ok": false, "error", "usage"}``
     object.  Subparsers inherit this class through ``add_subparsers``.
+
+    ``_check_value`` hides internal verbs such as ``run`` from the
+    ``choose from`` list and appends ``did you mean`` for a near-miss (#886).
     """
 
     json_errors = False
@@ -4614,6 +4717,11 @@ class _CliParser(argparse.ArgumentParser):
                   "usage": self.format_usage().strip()}, as_json=True)
             self.exit(2)
         super().error(message)
+
+    def _check_value(self, action, value):  # type: ignore[override]
+        if action.choices is None or value in action.choices:
+            return
+        raise argparse.ArgumentError(action, _invalid_choice_message(action, value))
 
 
 def _wants_json(argv: Sequence[str]) -> bool:
@@ -4659,8 +4767,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("init", help="write a starter spec for a path")
     s.add_argument("path")
-    s.add_argument("--kind", choices=("text", "skill_dir", "skill_library", "agent_dir",
-                                  "agent_code", "plugin", "policy_slot"))
+    s.add_argument("--kind", type=fold_kind, choices=KINDS)
     s.add_argument("--data", help="cases file, or a module:attribute problems ref for policy_slot")
     s.add_argument("--agent", default=None,
                    help="worker agent short name (default: the first of claude_code, "
@@ -4720,7 +4827,8 @@ def build_parser() -> argparse.ArgumentParser:
     # agentdescent.cli run --run-dir <dir>`); not a user verb.  argparse does
     # not honour help=SUPPRESS on a sub-parser (it prints "==SUPPRESS==" and
     # keeps the name in the {...} list), so register it with no help at all
-    # -- no help line -- and leave it out of the metavar below (#420).
+    # -- no help line -- leave it out of the metavar below (#420), and strip
+    # it from unknown-verb ``choose from`` lists (#886).
     s = sub.add_parser("run", description="internal: the worker `agentdescent evolve "
                                           "--detach` starts; use `evolve` instead")
     s.add_argument("--run-dir", required=True, dest="run_dir")
@@ -4734,12 +4842,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("watch", help="follow a run's rounds until it ends")
-    s.add_argument("run_id")
+    s.add_argument("run_id", help="a run id, or `latest` for the newest run")
     s.add_argument("--interval", type=float, default=5.0)
     s.set_defaults(fn=cmd_watch)
 
     s = sub.add_parser("show", help="the evolved artifact, and the diff against the original")
-    s.add_argument("run_id")
+    s.add_argument("run_id", help="a run id, or `latest` for the newest run")
     s.add_argument("--diff", action="store_true", default=True)
     s.add_argument("--no-diff", action="store_false", dest="diff")
     s.set_defaults(fn=cmd_show)
@@ -4947,8 +5055,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="endpoint URL for that model (written as default_base_url)")
     s2.add_argument("--key-env", dest="key_env", default=None,
                     help="environment variable holding its key")
-    s2.add_argument("--kind", choices=("text", "skill_dir", "skill_library", "agent_dir",
-                                       "agent_code", "plugin", "policy_slot"),
+    s2.add_argument("--kind", type=fold_kind, choices=KINDS,
                     default=argparse.SUPPRESS,
                     help="spec kind (default: guessed from PATH, as init --kind)")
     s2.add_argument("--out", help="where to write the spec "
@@ -4967,7 +5074,7 @@ def build_parser() -> argparse.ArgumentParser:
     s2.set_defaults(fn=cmd_algorithms)
 
     s = sub.add_parser("diagnose", help="why a run learned nothing (or stopped)")
-    s.add_argument("run_id")
+    s.add_argument("run_id", help="a run id, or `latest` for the newest run")
     s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                    help="machine-readable output")
     s.set_defaults(fn=cmd_diagnose)
@@ -5389,6 +5496,48 @@ def _accept_json_after_verb(sub: "argparse._SubParsersAction") -> None:
                             help="machine-readable output")
 
 
+#: Words that stand for "the newest run in the store" wherever a run id goes (#892, #896).
+LATEST_RUN_ALIASES = ("latest", "last")
+
+
+def resolve_run_id(run_id: Optional[str], *, store: Optional[str] = None
+                   ) -> Optional[str]:
+    """Map ``latest`` / ``last`` to the newest run id.
+
+    A real run directory named ``latest`` or ``last`` still wins. An empty
+    store raises :class:`~agentdescent.runstore.RunStoreError` with the same
+    wording the CLI uses (#892), so MCP tools and payload helpers match
+    ``agentdescent show latest`` instead of looking up a folder named
+    ``latest`` (#896). Any other value, including ``None``, is returned
+    unchanged.
+    """
+    if not isinstance(run_id, str) or run_id.lower() not in LATEST_RUN_ALIASES:
+        return run_id
+    if os.path.isdir(os.path.join(runstore.store_path(store), run_id)):
+        return run_id
+    runs = runstore.list_runs(store=store)
+    if not runs:
+        raise runstore.RunStoreError(
+            f"no runs under {runstore.store_path(store)} yet, so {run_id!r} has nothing "
+            "to point at; start one with `agentdescent demo` or `agentdescent evolve`")
+    return runs[0].run_id
+
+
+def _resolve_latest_run(a: argparse.Namespace) -> None:
+    """Swap ``latest`` / ``last`` for the newest run id on run-id commands.
+
+    A real run directory with that name still wins, and an empty store is a
+    clear error rather than ``no run 'latest'``.
+    """
+    if getattr(a, "fn", None) not in (cmd_status, cmd_watch, cmd_show, cmd_apply,
+                                      cmd_cancel, cmd_resume, cmd_diagnose):
+        return
+    rid = getattr(a, "run_id", None)
+    resolved = resolve_run_id(rid, store=getattr(a, "store", None))
+    if resolved is not None:
+        a.run_id = resolved
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     _CliParser.json_errors = _wants_json(args)
@@ -5397,6 +5546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         _CliParser.json_errors = False
     try:
+        _resolve_latest_run(a)
         return a.fn(a)
     except (SpecError, runstore.RunStoreError) as e:
         # `--json` callers get the same object `_spec_error` prints (#658).

@@ -230,9 +230,15 @@ def demo_text_spec(root: str) -> Dict[str, Any]:
     }
 
 
-def build(root: str, algorithm: Optional[str] = None) -> Dict[str, Any]:
+def build(root: str, algorithm: Optional[str] = None,
+          kind: Optional[str] = None) -> Dict[str, Any]:
     """Write the demo's skill/prompt, dataset and spec under ``root``."""
-    use_text = algorithm in OFFLINE_TEXT_ALGORITHMS
+    if kind == "text":
+        use_text = True
+    elif kind == "skill_dir":
+        use_text = False
+    else:
+        use_text = algorithm in OFFLINE_TEXT_ALGORITHMS
     if use_text:
         with open(os.path.join(root, "prompt.txt"), "w", encoding="utf-8") as fh:
             fh.write(_TEXT_SEED)

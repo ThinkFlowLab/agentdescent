@@ -123,6 +123,28 @@ def test_a_verdict_carrying_its_tip_inline_counts():
     assert r["ok"] and r["by"] == "Birfy" and r["tip"] == "b0a30224"
 
 
+def test_a_verdict_above_a_bare_tip_label_counts():
+    # #905, 2026-11-09: `Verdict: PASS`, then a `Tip: <sha>` line of its own, and
+    # `What I ran (...)` as the evidence list.
+    body = "\n".join([
+        "Verdict: PASS",
+        "",
+        f"Tip: {HEAD}",
+        "",
+        "What I ran (shared venv):",
+        "- tests/test_mcp.py",
+        "- tests/test_demo.py",
+        "",
+        "Not run:",
+        "  - Ark real-model run — no model path changed",
+    ])
+    parsed = rg.parse_report(body)
+    assert parsed["tip"] == HEAD and parsed["verdict"] == "PASS"
+    assert parsed["ran"] == ["- tests/test_mcp.py", "- tests/test_demo.py"]
+    r = rg.decide(HEAD, "HugoXK", [c(body)], POLICY)
+    assert r["ok"] and r["by"] == "Birfy" and not r["weak"]
+
+
 def test_a_seven_hex_tip_that_is_not_the_head_stays_not_pass():
     body = "\n".join([
         "Ran:",

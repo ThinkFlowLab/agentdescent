@@ -11,6 +11,7 @@ is `filetree.materialize`'s, not a second copy of it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -113,8 +114,41 @@ def test_a_tree_file_link_pointing_outside_the_destination_is_refused(
     assert not _leaked_backups(tmp_path, b"PRIVATE KEY\n", home)
 
 
-def test_apply_of_a_run_refuses_a_planted_destination_link(tmp_path):
+def test_a_dangling_link_in_the_backup_dir_is_skipped(tmp_path, capsys,
+                                                      monkeypatch):
+    """`bak-N` is scanned with `lexists`: a dangling link is not free (#977).
+
+    `_file_tree_backup_path` scanned with `exists`, so a dangling link at
+    `bak-0` looked free and `copytree` died on it with `FileExistsError`.
+    """
+    home = str(tmp_path / "ad-home")
+    monkeypatch.setenv("AGENTDESCENT_HOME", home)
+    src = _artifact(tmp_path, {"skills/SKILL.md": "evolved\n"})
+    dest = tmp_path / "dest"
+    (dest / "skills").mkdir(parents=True)
+    (dest / "skills" / "SKILL.md").write_text("old\n", encoding="utf-8")
+    abs_dest = os.path.abspath(str(dest))
+    name = abs_dest.rstrip(os.sep).rsplit(os.sep, 1)[-1] or "dir"
+    digest = hashlib.sha256(abs_dest.encode("utf-8")).hexdigest()[:12]
+    bak_dir = os.path.join(home, "backups", f"{name}-{digest}")
+    os.makedirs(bak_dir)
+    os.symlink(str(tmp_path / "gone"), os.path.join(bak_dir, "bak-0"))
+
+    assert cli.main(["apply", "--from", src, "--to", str(dest)]) == 0
+    assert (dest / "skills" / "SKILL.md").read_text(encoding="utf-8") == "evolved\n"
+    assert os.path.islink(os.path.join(bak_dir, "bak-0"))
+    assert not (tmp_path / "gone").exists()
+    bak1 = os.path.join(bak_dir, "bak-1")
+    assert os.path.isdir(bak1)
+    with open(os.path.join(bak1, "skills", "SKILL.md"), encoding="utf-8") as fh:
+        assert fh.read() == "old\n"
+
+
+def test_apply_of_a_run_refuses_a_planted_destination_link(tmp_path, monkeypatch):
     """The run-id path writes through `filetree.materialize`; same refusal."""
+    real_home = os.path.join(os.path.expanduser("~"), ".agentdescent")
+    home_before = sorted(os.listdir(real_home)) if os.path.isdir(real_home) else None
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "ad-home"))
     outside = tmp_path / "id_rsa"
     outside.write_text("PRIVATE KEY\n", encoding="utf-8")
     dest = tmp_path / "dest"
@@ -126,3 +160,6 @@ def test_apply_of_a_run_refuses_a_planted_destination_link(tmp_path):
     with pytest.raises(TreeError, match="symlink"):
         result.write_to(str(dest))
     assert outside.read_text(encoding="utf-8") == "PRIVATE KEY\n"
+    # The run-id path must not fall back to the developer's own home.
+    home_after = sorted(os.listdir(real_home)) if os.path.isdir(real_home) else None
+    assert home_after == home_before

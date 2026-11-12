@@ -178,13 +178,14 @@ class DecisionLog:
                cost: Optional[Dict[str, Any]] = None,
                parent_id: Optional[str] = None,
                record_id: Optional[str] = None,
-               policy_digest: Optional[str] = None) -> DecisionRecord:
+               policy_digest: str = "") -> DecisionRecord:
         """Append one decision and return it.
 
-        ``policy_digest`` defaults to the digest of the shipped bundle, because
-        that *is* the procedure of a caller who passed no ``Policies`` -- the
-        field is meant to be always present on a row, not only when someone
-        remembered it. A caller that knows better passes its own.
+        ``policy_digest`` is recorded exactly as given and defaults to ``""``:
+        an absent version is honest, while the shipped bundle's digest would be
+        a false claim on any run that injected its own policies. A caller that
+        knows its procedure passes it -- ``runtime.GuardedRun`` passes the
+        digest its ``EvolutionResult`` carries.
 
         When the digest differs from the last one this log recorded for the same
         artifact, the record gets ``parent_id`` pointing at that earlier record
@@ -194,14 +195,14 @@ class DecisionLog:
         the record unparented -- the chain is the policy history, not every
         append.
         """
-        if policy_digest is None:
-            from .policies import policy_digest as _policy_digest
-            policy_digest = _policy_digest()
-        digest = str(policy_digest)
+        digest = str(policy_digest or "")
         with self._lock:
             prior = self._prior_policy(str(artifact_id))
             fields = dict(evidence or {})
-            if parent_id is None and prior is not None and prior[0] != digest:
+            # No digest, no edge: "unknown" is not "changed", and a run that
+            # cannot name its procedure must not start a policy history.
+            if (digest and parent_id is None and prior is not None
+                    and prior[0] != digest):
                 parent_id = prior[1]
                 fields.setdefault("policy_change",
                                   {"from": prior[0], "to": digest})

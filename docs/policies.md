@@ -67,13 +67,16 @@ actually measures, and stamps it on:
   beside the manifest id, never inside it, so the same inputs judged by a new
   policy are the same run with a different procedure rather than a second id.
 
-What is hashed is **class identity plus the config knobs**, not live state: a
-policy's caches, counters and spend change while a run spends them, and hashing
-those would report a policy change every round. Two consequences are worth
-knowing: two instances of the same rule with different constructor arguments
-hash the same unless the class implements a `policy_fingerprint()` method, and
-passing the shipped default explicitly is a different bundle from passing
-nothing. Nothing here reads the environment, the clock or the filesystem.
+Flags, numbers and strings are hashed **by value**, and a replaceable piece is
+hashed by class plus its optional `policy_fingerprint()` method — which is how a
+rule that keeps its knobs on the instance stays visible: `StableDistanceAcceptance(strength=0.1)`
+and `strength=0.9` hash differently, and so do two `AdaptiveTrustRegion`s with a
+different `window`. Live state is never hashed: a policy's caches, counters and
+spend change while a run spends them, and hashing those would report a policy
+change every round. The honest limitation is that a class which keeps an
+admission-affecting argument on the instance and does not implement the hook is
+identified by its class alone. Nothing here reads the environment, the clock or
+the filesystem.
 
 ## Which seam is my mechanism?
 

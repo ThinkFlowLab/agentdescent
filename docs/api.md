@@ -4280,6 +4280,7 @@ AdaptiveTrustRegion(
 | method | what it does |
 |---|---|
 | `observe(outcome: str) -> TrustRegion` | Record one merge outcome and return the region for the next merge. |
+| `policy_fingerprint() -> dict` | This policy's configuration, for `policies.policy_digest` (#943). |
 
 ### `AdvantageAcceptance(inner = None, strength: float = 1.0) -> None`
 
@@ -4301,6 +4302,10 @@ Standardise a rollout's reward against the group it belongs to.
 ### `StableDistanceAcceptance(inner = None, strength: float = 0.1) -> None`
 
 Penalise candidates that drift far from the confirmed branch.
+
+| method | what it does |
+|---|---|
+| `policy_fingerprint() -> dict` | `strength` is a decision knob kept on the instance (#943). |
 
 ### `TrustRegion(ops: int, chars: int) -> None`
 

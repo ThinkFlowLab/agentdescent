@@ -606,10 +606,12 @@ class Policies:
 #: ``cas_attempts`` / ``cas_backoff`` are deliberately absent: they buy retries
 #: *after* somebody else committed first, so no value of them can change a
 #: decision. ``audit_drain_per_step`` moves spend between the gate and the
-#: ranking, not the gate. ``trust_region_policy`` is an object, so it is
-#: described by its class like every other replaceable piece. A field left out
-#: here is a deliberate "this cannot change an outcome", and a new config field
-#: is a decision to make rather than something that silently enters the digest.
+#: ranking, not the gate. A field left out here is a deliberate "this cannot
+#: change an outcome", and a new config field is a decision to make rather than
+#: something that silently enters the digest.
+#:
+#: ``trust_region_policy`` is not in this list because it is not a scalar -- it
+#: goes through :func:`_value` below, class *and* fingerprint, like a policy.
 _DECISION_CONFIG_FIELDS: Tuple[str, ...] = (
     "base_delta", "anneal_half_life", "accept_samples",
     "batch_trigger", "max_wait_rounds",
@@ -643,12 +645,14 @@ def _describe(obj: Any) -> Optional[Dict[str, Any]]:
     policy carries caches, counters and bound verifiers that change during a run,
     so hashing ``__dict__`` would report a policy change every round. What makes
     a *version* is which class implements the slot, plus whatever the class says
-    about itself through the optional ``policy_fingerprint()`` hook (see
-    :meth:`AggregatorConfig`-carrying policies such as
-    :class:`~agentdescent.advantage.StableDistanceAcceptance`, which keep their
-    knobs on the instance). A hook that raises records the exception type rather
-    than failing a run: a digest is an observation, and it is not allowed to be
-    the reason a run dies.
+    about itself through the optional ``policy_fingerprint()`` hook -- the knobs
+    a rule keeps on the instance, which are not live state but configuration
+    (:class:`~agentdescent.advantage.StableDistanceAcceptance.strength`,
+    :class:`~agentdescent.advantage.AdaptiveTrustRegion`'s bounds). A rule whose
+    constructor arguments change what it admits implements the hook; a rule that
+    does not is identified by its class alone. A hook that raises records the
+    exception type rather than failing a run: a digest is an observation, and it
+    is not allowed to be the reason a run dies.
     """
     if obj is None:
         return None
@@ -663,6 +667,21 @@ def _describe(obj: Any) -> Optional[Dict[str, Any]]:
         except Exception as exc:                  # noqa: BLE001 - see docstring
             out["fingerprint"] = f"<error:{type(exc).__name__}>"
     return out
+
+
+def _value(obj: Any) -> Any:
+    """A slot's value, hashed **by value** when it is a plain scalar.
+
+    ``_describe`` is right for an object and wrong for a flag: it reduces
+    ``True`` and ``False`` to ``builtins.bool``, so ``Policies(
+    accept_orphaned_merge_policies=True)`` -- the flag that decides whether merge
+    policies may be dropped -- hashed the same as ``False``. Bools, numbers and
+    strings are their own description; everything else goes through
+    :func:`_describe`.
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    return _describe(obj)
 
 
 def _scalars(obj: Any, names: Sequence[str]) -> Dict[str, Any]:
@@ -697,13 +716,11 @@ def policy_digest(policies: Optional["Policies"] = None, *,
     manifest) are all out, because a digest that drifts is worse than none --
     every ``policy_change`` edge it produces would be false.
 
-    Two honest limitations, both the conservative direction:
-
-    * a slot is identified by **class**, so two instances of the same rule with
-      different constructor arguments hash the same unless the class implements
-      ``policy_fingerprint()``;
-    * passing the shipped default *explicitly* is a different bundle from
-      passing ``None``, so those two hashes differ even though the runs agree.
+    Flags and numbers are hashed **by value**; a replaceable piece is hashed by
+    class plus its ``policy_fingerprint()``, so the honest limitation is that two
+    instances of a rule whose constructor arguments matter hash the same unless
+    that class implements the hook. ``stale, counter-carrying state is never
+    hashed`` -- that would report a policy change every round.
 
     ``policies=None`` means :class:`Policies`, i.e. the shipped bundle -- the
     same reading ``evolve()`` gives it. Nothing here reads the environment, the
@@ -716,10 +733,17 @@ def policy_digest(policies: Optional["Policies"] = None, *,
         config = AggregatorConfig()
     fields = getattr(bundle, "__dataclass_fields__", {})
     payload = {
-        "schema": 1,
-        "policies": {name: _describe(getattr(bundle, name, None))
+        "schema": 2,
+        "policies": {name: _value(getattr(bundle, name, None))
                      for name in sorted(fields)},
-        "aggregator": _scalars(config, _DECISION_CONFIG_FIELDS),
+        "aggregator": {
+            **_scalars(config, _DECISION_CONFIG_FIELDS),
+            # A policy, not a scalar: `AdaptiveTrustRegion(initial=…, window=…)`
+            # decides which diffs are in range, and hashing it by class alone
+            # made every knob invisible (#975 review).
+            "trust_region_policy": _value(
+                getattr(config, "trust_region_policy", None)),
+        },
         "verifier": {
             "described": _describe(verifier),
             "config": _scalars(verifier, _DECISION_VERIFIER_FIELDS),

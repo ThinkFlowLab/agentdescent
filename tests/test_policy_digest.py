@@ -36,14 +36,27 @@ def _payloads(path):
 
 
 def test_a_written_decision_carries_the_policy_version(tmp_path):
+    """The record on disk names the procedure -- when the caller says which."""
     log = DecisionLog(str(tmp_path / "decisions.jsonl"))
+    digest = "e" * 64
     log.record(kind="merge", artifact_id="skill", diff_id="w0:abc:1", accepted=True,
-               category="committed")
+               category="committed", policy_digest=digest)
     stored = _payloads(log.path)
     assert stored
-    assert "policy_digest" in stored[0]          # the decision names its policy
-    digest = stored[0]["policy_digest"]
-    assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+    assert stored[0]["policy_digest"] == digest
+
+
+def test_an_unstated_policy_stays_empty_rather_than_claiming_the_default(tmp_path):
+    """A run that injected its own acceptance is not running the shipped bundle.
+
+    Filling the field with the default's digest would make every run look alike
+    in the log -- the confusion #943 exists to remove.
+    """
+    log = DecisionLog(str(tmp_path / "decisions.jsonl"))
+    record = log.record(kind="merge", artifact_id="skill", accepted=True)
+    assert record.policy_digest == ""
+    assert _payloads(log.path)[0]["policy_digest"] == ""
+    assert record.parent_id is None       # and no policy edge from "unknown"
 
 
 def test_the_same_decision_under_two_policies_is_distinguishable(tmp_path):
@@ -82,6 +95,41 @@ def test_the_digest_is_stable_and_order_independent():
     assert policy_digest(Policies()) == policy_digest(None)
     assert policy_digest(Policies(), config=AggregatorConfig()) == \
         policy_digest(Policies(), config=AggregatorConfig())
+
+
+def test_a_trust_region_policy_is_hashed_not_just_named():
+    """`AdaptiveTrustRegion(window=…)` changes what is admitted; so must the hash."""
+    from agentdescent.advantage import AdaptiveTrustRegion
+    from agentdescent.policies import policy_digest
+
+    plain = policy_digest(Policies(), config=AggregatorConfig())
+    tight = policy_digest(
+        Policies(), config=AggregatorConfig(trust_region_policy=AdaptiveTrustRegion()))
+    loose = policy_digest(
+        Policies(),
+        config=AggregatorConfig(trust_region_policy=AdaptiveTrustRegion(window=3)))
+    assert plain != tight          # installing it at all
+    assert tight != loose          # and its own knobs
+
+
+def test_an_instance_knob_on_a_policy_moves_the_digest():
+    """The `policy_fingerprint()` hook, on the class the docstring names."""
+    from agentdescent.advantage import StableDistanceAcceptance
+    from agentdescent.policies import policy_digest
+
+    weak = policy_digest(Policies(acceptance=StableDistanceAcceptance(strength=0.1)))
+    strong = policy_digest(Policies(acceptance=StableDistanceAcceptance(strength=0.9)))
+    assert weak != strong
+
+
+def test_a_bool_flag_on_the_bundle_moves_the_digest():
+    """A flag hashed by type would make True and False one version (#975 review)."""
+    from agentdescent.policies import policy_digest
+
+    allowed = policy_digest(Policies(accept_orphaned_merge_policies=True))
+    refused = policy_digest(Policies(accept_orphaned_merge_policies=False))
+    assert allowed != refused
+    assert refused != policy_digest(Policies())      # False is not None
 
 
 def test_a_custom_policy_class_changes_the_digest():

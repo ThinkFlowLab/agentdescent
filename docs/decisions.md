@@ -37,10 +37,13 @@ dashboard, a replay tool or an audit export needs.
 
 `policy_digest` is the other axis: **which decision procedure** produced the
 record ([`policy_digest()`](policies.md#which-version-of-this-bundle-is-a-run-using)).
-`record()` always fills it — a caller who passes no `Policies` is running the
-shipped bundle, and that bundle's digest is what it records. When the digest
-differs from the previous record for the same artifact, the new record points at
-that earlier one and carries `evidence["policy_change"] = {"from": …, "to": …}`,
-so "these commits were admitted under the old rule" is one lookup. An unchanged
-digest leaves the record unparented: the chain is the policy history, not every
+It is recorded exactly as the caller gives it and stays empty when the caller
+does not say — the shipped bundle's digest would be a false claim on any run that
+injected its own policies, and the log could no longer tell those runs apart.
+`runtime.run_guarded()` passes the digest its `EvolutionResult` carries. When the
+digest differs from the previous record for the same artifact, the new record
+points at that earlier one and carries
+`evidence["policy_change"] = {"from": …, "to": …}`, so "these commits were
+admitted under the old rule" is one lookup. An unchanged digest — or an absent
+one — leaves the record unparented: the chain is the policy history, not every
 append.

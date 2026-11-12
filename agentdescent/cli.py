@@ -2074,15 +2074,26 @@ def _plan_target_line(payload: Dict[str, Any]) -> str:
     kind = payload.get("kind") or spec.get("kind") or "?"
     target = spec.get("target") or "?"
     line = f"ok: {kind} {target}"
-    name = payload.get("algorithm")
-    if name:
-        line += f"  algorithm={name}"
-        try:
-            from . import algorithms
+    algo = payload.get("algorithm")
+    if algo:
+        # `plan_payload` stores the algorithm *card*, not its name (#919), so
+        # take the label and the fidelity straight from the card; a bare name
+        # (an older payload) still resolves through the registry.
+        if isinstance(algo, dict):
+            name, fidelity = algo.get("name"), algo.get("fidelity")
+        else:
+            name, fidelity = algo, None
+        if name:
+            line += f"  algorithm={name}"
+            if fidelity:
+                line += f" ({fidelity})"
+            elif not isinstance(algo, dict):
+                try:
+                    from . import algorithms
 
-            line += f" ({algorithms.get(name).fidelity})"
-        except Exception:  # noqa: BLE001 - a label must never fail a valid plan
-            pass
+                    line += f" ({algorithms.get(name).fidelity})"
+                except Exception:  # noqa: BLE001 - a label must never fail a valid plan
+                    pass
     return line
 
 

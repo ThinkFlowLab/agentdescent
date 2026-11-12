@@ -57,6 +57,21 @@ def test_plain_plan_is_short_and_human(tmp_path, capsys):
     assert "warning: the held-out set has only 2 task(s)" in err
 
 
+def test_plain_plan_first_line_names_the_algorithm_card(tmp_path, capsys):
+    # The payload carries the algorithm *card*, not its name, so the first line
+    # must print `algorithm=gepa (mechanism_microport)` and never the dict.
+    path = _spec(tmp_path)
+    doc = json.loads(open(path, encoding="utf-8").read())
+    doc["algorithm"] = "gepa"
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    assert cli.main(["plan", path]) == 0
+    out = capsys.readouterr().out
+    first = out.splitlines()[0]
+    assert first == f"ok: text {doc['target']}  algorithm=gepa (mechanism_microport)", first
+    assert "{" not in first and "}" not in first
+
+
 def test_plain_plan_keeps_the_estimate_when_priced(tmp_path, capsys):
     path = _spec(tmp_path)
     assert cli.main(["plan", path, "--usd-per-call", "0.01"]) == 0

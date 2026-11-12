@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .conformal import ConformalGate, ConformalReport
@@ -44,7 +44,7 @@ from .sequential import SequentialReport, sequential_test
 from .stats_eval import bootstrap_ci, is_significant, paired_gain
 from .verifier_ensemble import EnsembleReport, VerifierEnsemble
 
-__all__ = ["TrustEvidence", "build_trust_evidence"]
+__all__ = ["RunHealth", "TrustEvidence", "build_trust_evidence"]
 
 
 def _finite(value: Any, name: str) -> float:
@@ -65,6 +65,101 @@ def _content_hash(before: Mapping[str, float], after: Mapping[str, float]) -> st
 
 
 @dataclass(frozen=True)
+class RunHealth:
+    """How much of a run produced a real answer (#993).
+
+    ``failed_tasks`` are the task ids whose call never produced an answer -- a
+    provider error, a harness or sandbox failure, an exception. They are not
+    scored as zero: the bundle drops them from the paired scores and reports
+    the gain over the tasks that answered, with the failure count beside it.
+    Above ``threshold`` the run fails its gate, because a run that mostly did
+    not measure is not evidence of an improvement.
+    """
+
+    attempted: int
+    failed_tasks: Tuple[str, ...] = ()
+    threshold: float = 0.2
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempted, bool) or not isinstance(self.attempted, int):
+            raise ValueError("run health attempted must be an int")
+        if self.attempted < 1:
+            raise ValueError("run health attempted must be at least 1")
+        failed = tuple(str(task) for task in (self.failed_tasks or ()))
+        if len(set(failed)) != len(failed):
+            raise ValueError("run health failed_tasks must not repeat a task")
+        if len(failed) > self.attempted:
+            raise ValueError("run health failed_tasks exceeds attempted")
+        threshold = _finite(self.threshold, "run health threshold")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("run health threshold must be in [0, 1]")
+        object.__setattr__(self, "failed_tasks", failed)
+        object.__setattr__(self, "threshold", threshold)
+
+    @property
+    def failed(self) -> int:
+        """How many tasks produced no answer."""
+        return len(self.failed_tasks)
+
+    @property
+    def failure_rate(self) -> float:
+        return self.failed / self.attempted
+
+    @property
+    def censored(self) -> bool:
+        """True when the run is too broken to read as evidence."""
+        return self.failure_rate > self.threshold
+
+    def to_dict(self) -> dict:
+        return {"attempted": self.attempted, "failed": self.failed,
+                "failure_rate": self.failure_rate, "threshold": self.threshold,
+                "failed_tasks": list(self.failed_tasks)}
+
+
+def _run_health(value: Any) -> RunHealth:
+    """Coerce the metadata form of a health record into `RunHealth`."""
+    if isinstance(value, RunHealth):
+        return value
+    if not isinstance(value, Mapping):
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+    if not isinstance(value, Mapping):
+        raise ValueError("run health must be a mapping or a RunHealth")
+    allowed = {"attempted", "failed_tasks", "threshold", "failed",
+               "failure_rate"}
+    unknown = sorted(str(key) for key in set(value) - allowed)
+    if unknown:
+        raise ValueError(
+            f"unknown run health field(s): {', '.join(unknown)}")
+    if "attempted" not in value:
+        raise ValueError("run health needs attempted")
+    return RunHealth(
+        attempted=value["attempted"],
+        failed_tasks=tuple(value.get("failed_tasks") or ()),
+        threshold=value.get("threshold", 0.2))
+
+
+def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
+    """Recompute the gate over the tasks that answered, not the failures."""
+    failed = set(health.failed_tasks)
+    answered = {task: delta for task, delta in result.per_task.items()
+                if str(task) not in failed}
+    n = len(answered)
+    delta = (sum(answered.values()) / n) if n else 0.0
+    interval = bootstrap_ci({task: 0.0 for task in answered}, answered)
+    censored = health.censored or n == 0
+    detail = (f"{result.detail}; run health: {health.failed} of "
+              f"{health.attempted} tasks failed at the provider or harness "
+              f"(rate {health.failure_rate:.2f} vs threshold "
+              f"{health.threshold:.2f}); gain is the mean over {n} answered "
+              f"task(s)")
+    return replace(result, n=n, delta=delta, ci=(interval.lo, interval.hi),
+                   per_task=answered,
+                   passed=result.passed and not censored, detail=detail)
+
+
+@dataclass(frozen=True)
 class TrustEvidence:
     """The reports one paired evaluation produced, ready for `promote()`."""
 
@@ -79,6 +174,7 @@ class TrustEvidence:
     contaminated: Optional[bool] = None
     risk: Optional[float] = None
     approved: Optional[bool] = None
+    run_health: Optional[RunHealth] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -90,7 +186,21 @@ class TrustEvidence:
             risk = _finite(self.risk, "risk")
             if not 0.0 <= risk <= 1.0:
                 raise ValueError("risk must be in [0, 1]")
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        metadata = dict(self.metadata or {})
+        object.__setattr__(self, "metadata", metadata)
+        health = self.run_health
+        if health is None and metadata.get("run_health") is not None:
+            health = _run_health(metadata["run_health"])
+        elif health is not None:
+            health = _run_health(health)
+        if health is not None:
+            # Every construction path gets the same treatment, including
+            # ``dataclasses.replace`` on a bundle that already exists.
+            object.__setattr__(self, "run_health", health)
+            if metadata.get("run_health") != health.to_dict():
+                metadata["run_health"] = health.to_dict()
+            object.__setattr__(self, "eval_result",
+                               _drop_failed_tasks(self.eval_result, health))
 
     def to_promotion_request(self, artifact_id: str, *,
                              artifact_hash: Optional[str] = None,
@@ -117,7 +227,7 @@ class TrustEvidence:
             calibration=self.calibration, metadata=metadata)
 
     def to_dict(self) -> dict:
-        return {
+        body = {
             "eval": self.eval_result.to_dict(),
             "canary": asdict(self.canary),
             "conformal": None if self.conformal is None else asdict(self.conformal),
@@ -134,6 +244,9 @@ class TrustEvidence:
             "approved": self.approved,
             "metadata": dict(self.metadata),
         }
+        if self.run_health is not None:
+            body["run_health"] = self.run_health.to_dict()
+        return body
 
 
 def build_trust_evidence(

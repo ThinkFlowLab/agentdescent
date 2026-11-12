@@ -44,7 +44,7 @@ elif "/reviews" in args:
 else:
     payload = data["pull"]
 if isinstance(payload, list):
-    print("\\\\n".join(json.dumps(item) for item in payload))
+    print("\\n".join(json.dumps(item) for item in payload))
 else:
     print(json.dumps(payload))
 '''

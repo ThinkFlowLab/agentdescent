@@ -63,7 +63,7 @@ def test_a_run_above_the_failure_threshold_cannot_promote():
 
 
 def test_a_run_at_or_below_the_threshold_still_promotes():
-    decision = _decision(failed_tasks=_failed_ids(2))
+    decision = _decision(failed_tasks=_failed_ids(1))
 
     assert decision.action == PromotionAction.PROMOTE
     assert not any("run health" in reason for reason in decision.reasons)

@@ -174,14 +174,15 @@ class Trajectory:
     trace_id: str = ""
     #: What a replay of this evaluation would need that the record above does
     #: not carry: the RNG seed/state digests at interaction boundaries, the
-    #: environment fingerprint (cwd, tool versions, hashed allowlisted env
-    #: names) and any hidden state that was summarised -- plus the sources that
-    #: could not be captured at all. ``None`` means fidelity was never captured,
-    #: which reads as ``replay_eligible=False``: a consumer must refuse a
-    #: counterfactual over it rather than compare two scores taken in
-    #: (possibly) different environments. Not part of the identity triple: the
-    #: identity is what an evaluation *is*, the fidelity is what could be
-    #: reconstructed about it afterwards.
+    #: environment fingerprint (cwd, tool versions, the names of the
+    #: allowlisted environment variables that were present, and their count),
+    #: any hidden state that was summarised, and the sources that could not be
+    #: captured at all. ``None`` means fidelity was never captured, which reads
+    #: as ``replay_eligible=False``: a consumer must refuse a counterfactual
+    #: over it rather than compare two scores taken in (possibly) different
+    #: environments. Not part of the identity triple: the identity is what an
+    #: evaluation *is*, the fidelity is what could be reconstructed about it
+    #: afterwards.
     replay: Optional[ReplayFidelity] = None
 
     @property

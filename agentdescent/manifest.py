@@ -18,7 +18,9 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from .replay_fidelity import ReplayFidelity
 
 __all__ = ["RunManifest", "build_manifest", "diff_manifest", "verify_manifest"]
 
@@ -113,6 +115,17 @@ class RunManifest:
     #: incomparable. ``build_manifest`` takes it, nothing compares it in
     #: :func:`diff_manifest` (see there).
     policy_digest: str = ""
+    #: Whether this run's replay inputs were captured (RNG boundary digests, the
+    #: environment fingerprint, hidden-state coverage). False with ``replay_notes``
+    #: explaining what is missing: a counterfactual over such a run would be a
+    #: guess, and ``ReplayLab`` refuses it. Not part of ``manifest_id`` and not
+    #: compared by ``diff_manifest`` -- those describe the *inputs* that make two
+    #: runs the same run, while fidelity is a property of the record kept about
+    #: one of them (two identical runs can be recorded with and without a
+    #: capture, and that must not change which inputs they share).
+    replay_eligible: bool = False
+    replay_notes: Tuple[str, ...] = ()
+    replay: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -131,6 +144,9 @@ class RunManifest:
             # Additive within ``schema_version: 1``: absent on older manifests,
             # read as "" by :meth:`from_dict`, so either side loads the other.
             "policy_digest": self.policy_digest,
+            "replay_eligible": self.replay_eligible,
+            "replay_notes": list(self.replay_notes),
+            "replay": dict(self.replay),
         }
 
     @classmethod
@@ -150,13 +166,17 @@ class RunManifest:
             model_config=dict(payload.get("model_config") or {}),
             extra=dict(payload.get("extra") or {}),
             policy_digest=str(payload.get("policy_digest", "")),
+            replay_eligible=bool(payload.get("replay_eligible", False)),
+            replay_notes=tuple(payload.get("replay_notes") or ()),
+            replay=dict(payload.get("replay") or {}),
         )
 
 
 def build_manifest(spec: Any, *, data_paths: Sequence[str] = (),
                    model_config: Optional[Mapping[str, Any]] = None,
                    code_version: str = "", extra: Optional[Mapping[str, Any]] = None,
-                   policy_digest: str = ""
+                   policy_digest: str = "",
+                   replay: Optional[ReplayFidelity] = None
                    ) -> RunManifest:
     """Hash a spec, its data files/directories, model config and code version.
 
@@ -168,6 +188,12 @@ def build_manifest(spec: Any, *, data_paths: Sequence[str] = (),
     inputs judged by a different policy are the same run with a different
     procedure, and a run whose id changed with its acceptance threshold could not
     be compared with an older one at all.
+    ``replay`` is the run's :class:`~agentdescent.replay_fidelity.ReplayFidelity`
+    capture, when one was taken. It never enters ``manifest_id`` (see the field
+    docstring); it only decides whether a consumer may claim a replay, and
+    ``replay_notes`` says what was not captured. Without a capture the manifest
+    still records *why* it cannot be replayed, so "unknown" is never mistaken
+    for "reproducible".
     """
     spec_dict = spec.to_dict() if hasattr(spec, "to_dict") else dict(spec)
     spec_hash = _sha(_canonical(redact(spec_dict)))
@@ -204,12 +230,28 @@ def build_manifest(spec: Any, *, data_paths: Sequence[str] = (),
         "algorithm": algorithm,
         "extra": redact(dict(extra or {})),
     }
+    if replay is None:
+        replay_eligible = False
+        replay_notes = ("replay fidelity was not captured: rng, environment and "
+                        "hidden state are unknown, so no counterfactual may be "
+                        "claimed from this run",)
+        replay_record: Dict[str, Any] = {}
+    else:
+        replay_eligible = replay.eligible
+        replay_notes = replay.notes()
+        # Redacted like `model_config` / `extra` above: the record carries tool
+        # command lines and paths, and a token that appears `"<redacted>"` in one
+        # serialized form and verbatim in another is worse than no redaction --
+        # it reads as safe (#952 Security review).
+        replay_record = redact(replay.to_dict())
     return RunManifest(
         manifest_id=_sha(_canonical(fields)), spec_hash=spec_hash,
         data_hash=data_hash, model_hash=model_hash,
         code_version=str(code_version), seeds=seeds, algorithm=algorithm,
         files=files, missing=tuple(missing), model_config=safe_model,
-        extra=redact(dict(extra or {})), policy_digest=str(policy_digest))
+        extra=redact(dict(extra or {})), policy_digest=str(policy_digest),
+        replay_eligible=replay_eligible,
+        replay_notes=tuple(replay_notes), replay=replay_record)
 
 
 def diff_manifest(a: RunManifest, b: RunManifest) -> Dict[str, Dict[str, Any]]:

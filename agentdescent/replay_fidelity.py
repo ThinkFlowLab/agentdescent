@@ -6,13 +6,14 @@ environment variable values) are not manifest inputs. A replay or counterfactual
 claim made from such a record therefore overstates what is reconstructible, and a
 "same run" comparison can silently change the environment underneath the score.
 
-This module records the missing inputs as digests and names what it could not
-capture:
+This module records what the missing inputs looked like and names what it could
+not capture:
 
 * :class:`EnvironmentFingerprint` -- cwd, interpreter and OS, tool versions, and
-  the **hashes** of an allowlisted set of environment variables
-  (:data:`REPLAY_ENV_ALLOWLIST`); a value is never stored, and a name that looks
-  secret is refused even when a caller asks for it;
+  the sorted **names** of an allowlisted set of environment variables
+  (:data:`REPLAY_ENV_ALLOWLIST`) that were present plus how many there were; no
+  value is read at all, so none can be stored or confirmed against a candidate,
+  and a name that looks secret is refused even when a caller asks for it;
 * :class:`RngRecord` -- one seed/state digest per interaction boundary, built by
   :func:`rng_digest`, which refuses to invent a digest when it is given neither;
 * :class:`ReplayFidelity` -- the two plus hidden-state digests and the list of
@@ -316,7 +317,7 @@ class ReplayFidelity:
         out = []
         if self.environment is None:
             out.append("environment: not captured (cwd, tool versions and "
-                       "allowlisted env hashes are missing)")
+                       "allowlisted env names are missing)")
         if not self.rng:
             out.append("rng: no interaction-boundary seed/state digest was recorded")
         out.extend(self.uncaptured)

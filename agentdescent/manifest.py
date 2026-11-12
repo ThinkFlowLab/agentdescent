@@ -58,13 +58,6 @@ def redact(value: Any) -> Any:
     if isinstance(value, str):
         text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1<redacted>", value)
         text = re.sub(r"(?i)(api[_-]?key=)[^&\s]+", r"\1<redacted>", text)
-        # `--token=…` / `secret=…` / `password=…` (the replay record carries DSNs
-        # and command lines, #952): the generic shapes above miss a value whose
-        # alphabet includes '-', so key=value on a credential-shaped name is the
-        # rule that actually covers them.
-        text = re.sub(
-            r"(?i)\b(token|secret|password|passwd|api[_-]?key|access[_-]?key|auth)"
-            r"=([^&\s]+)", r"\1=<redacted>", text)
         text = re.sub(r"\bsk-[A-Za-z0-9]{6,}\b", "<redacted>", text)
         return text
     return value

@@ -5062,6 +5062,84 @@ A table whose caption cannot claim more than the numbers support.
 
 ---
 
+## Replay fidelity
+
+The RNG, environment and hidden-state inputs a manifest cannot see. &nbsp;·&nbsp; `agentdescent.replay_fidelity` &nbsp;·&nbsp; [guide](manifest.md)
+
+### `EnvironmentFingerprint(...)`
+
+The environment a run happened in, as far as it is safe to record it.
+
+```python
+EnvironmentFingerprint(
+    cwd: str,
+    python: str,
+    platform: str,
+    tools: Mapping[str, str] = <factory>,
+    env_hashes: Mapping[str, str] = <factory>,
+    missing_env: Tuple[str, ...] = ()
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `capture(...)` | Fingerprint this process (or the explicit values a caller supplies). |
+| `diff(other: 'EnvironmentFingerprint') -> Tuple[str, ...]` | Names of the environment inputs that differ (empty when identical). |
+
+### `ReplayCheck(...)`
+
+The result of comparing a captured run with its replay.
+
+```python
+ReplayCheck(
+    ok: bool,
+    changed: Tuple[str, ...] = (),
+    verdict_changed: bool = False,
+    notes: Tuple[str, ...] = ()
+) -> None
+```
+
+### `ReplayFidelity(...)`
+
+Everything a replay needs that the manifest's input hashes do not cover.
+
+```python
+ReplayFidelity(
+    environment: Optional[EnvironmentFingerprint] = None,
+    rng: Tuple[RngRecord, ...] = (),
+    hidden_state: Mapping[str, str] = <factory>,
+    uncaptured: Tuple[str, ...] = ()
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `capture(...)` | Assemble a record; hidden-state summaries are digested here. |
+| `diff(other: 'ReplayFidelity') -> Tuple[str, ...]` | Names of the recorded inputs that differ (empty for the same run). |
+| `notes() -> Tuple[str, ...]` | What would stop a replay claim, in words (empty when eligible). |
+
+### `ReplayNotEligible(notes: Iterable[str]) -> None`
+
+A counterfactual was asked for over a run that cannot be replayed.
+
+### `RngRecord(boundary: str, digest: str, seed: Optional[str] = None) -> None`
+
+One RNG seed/state digest at an interaction boundary.
+
+### `content_digest(value: Any) -> str`
+
+A sha256 digest of any JSON-able summary.
+
+### `replay_check(captured: Any, replayed: Any) -> ReplayCheck`
+
+Whether `replayed` reproduces `captured` -- or refuses to say.
+
+### `rng_digest(*, seed: Any = None, state: Any = None) -> str`
+
+A digest of an RNG seed and/or a state summary at one boundary.
+
+---
+
 ## Type aliases and constants
 
 Values rather than classes or functions.
@@ -5245,10 +5323,6 @@ Short stable ``evolve()`` contract to teach first; the long tail is advanced (Po
 ### `EloRating`
 
 A minimal Elo rating over pairwise matches (K-factor 32).
-
-### `EnvironmentFingerprint`
-
-The environment a run happened in, as far as it is safe to record it.
 
 ### `EvaluationReport`
 
@@ -5496,7 +5570,7 @@ How a rollout becomes candidate changes.
 
 ### `REPLAY_ENV_ALLOWLIST`
 
-—
+Environment variable names whose **values** may affect a run and whose *hashes* are therefore worth recording. Chosen for determinism, not convenience: the hash seed changes dict/set iteration, `PYTHONPATH` decides which code is imported at all, the locale changes sorting and number formatting, `TZ` changes timestamps a prompt may contain, and the thread counts change floating-point reduction order in numeric workloads. Nothing provider- or credential-shaped belongs here -- and `capture` refuses such a name even if a caller passes it explicitly, so a future edit to this tuple cannot leak one.
 
 ### `ROUTE_SEED`
 
@@ -5538,21 +5612,9 @@ A callable named rather than sent: `"module:attribute"` plus config.
 
 A reference could not be resolved, and why -- never a bare ImportError.
 
-### `ReplayCheck`
-
-The result of comparing a captured run with its replay.
-
 ### `ReplayExample`
 
 One replayed past example: the task it came from, its recorded outcome, and the rolling statistics that decide how curious the artifact still is.
-
-### `ReplayFidelity`
-
-Everything a replay needs that the manifest's input hashes do not cover.
-
-### `ReplayNotEligible`
-
-A counterfactual was asked for over a run that cannot be replayed.
 
 ### `Result`
 
@@ -5573,10 +5635,6 @@ First-match risk rules with a fail-closed default.
 ### `RiskRule`
 
 One ordered rule; every supplied condition must match.
-
-### `RngRecord`
-
-One RNG seed/state digest at an interaction boundary.
 
 ### `RolloutSpec`
 
@@ -5802,10 +5860,6 @@ Run the harness(es) for a domain, record the outcomes, pick a winner.
 
 Fraction of validation n-grams that also occur in the training text.
 
-### `content_digest`
-
-A sha256 digest of any JSON-able summary.
-
 ### `cost_adjusted_reward`
 
 `quality - lam * (cost / baseline)`, clipped to `[0, 1]`.
@@ -6001,14 +6055,6 @@ Attack `value` by mutating the seed tasks outward and scoring each mutation. Ret
 ### `red_team_evolve`
 
 Evolve, attack the result, retrain on the failures it found.
-
-### `replay_check`
-
-Whether `replayed` reproduces `captured` -- or refuses to say.
-
-### `rng_digest`
-
-A digest of an RNG seed and/or a state summary at one boundary.
 
 ### `rollback_plan`
 

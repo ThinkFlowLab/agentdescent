@@ -131,6 +131,7 @@ from .policies import (
     SandboxSpec,
     ScreenPolicy,
     VerifierProtocol,
+    policy_digest,
 )
 from .evalcache import CacheProtocol, FileCache, MemoryCache
 from .trajectory import (
@@ -640,6 +641,7 @@ __all__ = [
     "ReflectiveStaleness",
     "get_policy",
     "Policies",
+    "policy_digest",
     "AcceptancePolicy",
     "AcceptDecision",
     "ConflictPolicy",

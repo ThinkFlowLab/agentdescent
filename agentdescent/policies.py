@@ -72,6 +72,7 @@ __all__ = [
     "SandboxProvider",
     "SandboxSpec",
     "VerifierProtocol",
+    "policy_digest",
 ]
 
 
@@ -128,6 +129,14 @@ class MergeContext:
     #: difference as a quality change -- in either direction.
     base_env: str = ""
     cand_env: str = ""
+    #: Which decision procedure produced this decision, as
+    #: :func:`policy_digest`'s 64-hex digest. ``""`` is the honest "the caller
+    #: built this context by hand and did not say", and it is the default so
+    #: that every hand-built :class:`MergeContext` keeps working unchanged. The
+    #: aggregator fills it from ``Aggregator.policy_digest``; a policy that
+    #: branches on it would be reading the version of itself, which no shipped
+    #: policy does.
+    policy_digest: str = ""
 
     @staticmethod
     def rate(counts: Tuple[float, float]) -> float:
@@ -586,3 +595,134 @@ class Policies:
             if value is not None:
                 merged[key] = value
         return Policies(**merged)
+
+
+# ---------------------------------------------------------------------------
+# The policy version
+# ---------------------------------------------------------------------------
+
+#: The ``AggregatorConfig`` fields that decide which candidates are admitted.
+#:
+#: ``cas_attempts`` / ``cas_backoff`` are deliberately absent: they buy retries
+#: *after* somebody else committed first, so no value of them can change a
+#: decision. ``audit_drain_per_step`` moves spend between the gate and the
+#: ranking, not the gate. ``trust_region_policy`` is an object, so it is
+#: described by its class like every other replaceable piece. A field left out
+#: here is a deliberate "this cannot change an outcome", and a new config field
+#: is a decision to make rather than something that silently enters the digest.
+_DECISION_CONFIG_FIELDS: Tuple[str, ...] = (
+    "base_delta", "anneal_half_life", "accept_samples",
+    "batch_trigger", "max_wait_rounds",
+    "alpha_head", "alpha_tail",
+    "trust_region_ops", "trust_region_chars",
+    "promote_after_k", "fusion_tournament", "bounded_gate",
+)
+
+#: The verifier's own knobs: how it measures, not what it measures.
+#:
+#: ``held_out`` (the task list) is data, and it is already in the run manifest.
+#: ``budget`` is absent on purpose: it is a spend cap whose counters *change
+#: while the run spends them*, so folding it in would make the digest of one
+#: unchanging policy drift round by round -- exactly the false "policy changed"
+#: signal this feature exists to rule out.
+_DECISION_VERIFIER_FIELDS: Tuple[str, ...] = (
+    "rule_subset", "learned_noise", "seed",
+)
+
+
+def _canonical(payload: Any) -> str:
+    """Deterministic JSON: sorted keys, no whitespace, nothing unserialisable."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      allow_nan=False, default=repr)
+
+
+def _describe(obj: Any) -> Optional[Dict[str, Any]]:
+    """A replaceable piece as ``{type, fingerprint?}`` -- never its live state.
+
+    Instance state would be the obvious thing to hash and it is the wrong one: a
+    policy carries caches, counters and bound verifiers that change during a run,
+    so hashing ``__dict__`` would report a policy change every round. What makes
+    a *version* is which class implements the slot, plus whatever the class says
+    about itself through the optional ``policy_fingerprint()`` hook (see
+    :meth:`AggregatorConfig`-carrying policies such as
+    :class:`~agentdescent.advantage.StableDistanceAcceptance`, which keep their
+    knobs on the instance). A hook that raises records the exception type rather
+    than failing a run: a digest is an observation, and it is not allowed to be
+    the reason a run dies.
+    """
+    if obj is None:
+        return None
+    cls = obj if isinstance(obj, type) else type(obj)
+    name = (f"{getattr(cls, '__module__', '')}."
+            f"{getattr(cls, '__qualname__', str(cls))}")
+    out: Dict[str, Any] = {"type": name}
+    hook = getattr(obj, "policy_fingerprint", None)
+    if callable(hook):
+        try:
+            out["fingerprint"] = hook()
+        except Exception as exc:                  # noqa: BLE001 - see docstring
+            out["fingerprint"] = f"<error:{type(exc).__name__}>"
+    return out
+
+
+def _scalars(obj: Any, names: Sequence[str]) -> Dict[str, Any]:
+    """The named attributes that are plain JSON scalars; anything else is skipped.
+
+    A field holding an object is described elsewhere (or not at all) by whoever
+    decided to leave it out of ``names``. Coercing it through ``repr`` here would
+    put a memory address in the digest.
+    """
+    out: Dict[str, Any] = {}
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            out[name] = value
+    return out
+
+
+def policy_digest(policies: Optional["Policies"] = None, *,
+                  config: Any = None, verifier: Any = None) -> str:
+    """The 64-hex version of a decision procedure: the bundle, the config, the verifier.
+
+    A commit records the artifact and the diff. It did not record **which
+    acceptance / conflict / fusion / promotion / staleness rules admitted it**,
+    so a three-line policy change that moved the acceptance rate (#52) could not
+    be separated from the commits that landed before it. This is that missing
+    version, as a content hash a ledger can store beside a decision and a run can
+    compare between rounds.
+
+    Deliberately **not** hashed: anything that changes without a policy change.
+    Environment, timestamps, mutable counters, the verifier's spend (see
+    ``_DECISION_VERIFIER_FIELDS``) and the held-out data (it belongs to the
+    manifest) are all out, because a digest that drifts is worse than none --
+    every ``policy_change`` edge it produces would be false.
+
+    Two honest limitations, both the conservative direction:
+
+    * a slot is identified by **class**, so two instances of the same rule with
+      different constructor arguments hash the same unless the class implements
+      ``policy_fingerprint()``;
+    * passing the shipped default *explicitly* is a different bundle from
+      passing ``None``, so those two hashes differ even though the runs agree.
+
+    ``policies=None`` means :class:`Policies`, i.e. the shipped bundle -- the
+    same reading ``evolve()`` gives it. Nothing here reads the environment, the
+    clock or the filesystem, so the same arguments give the same digest on any
+    machine.
+    """
+    bundle = policies if policies is not None else Policies()
+    if config is None:
+        from .aggregator import AggregatorConfig      # circular at module import
+        config = AggregatorConfig()
+    fields = getattr(bundle, "__dataclass_fields__", {})
+    payload = {
+        "schema": 1,
+        "policies": {name: _describe(getattr(bundle, name, None))
+                     for name in sorted(fields)},
+        "aggregator": _scalars(config, _DECISION_CONFIG_FIELDS),
+        "verifier": {
+            "described": _describe(verifier),
+            "config": _scalars(verifier, _DECISION_VERIFIER_FIELDS),
+        },
+    }
+    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()

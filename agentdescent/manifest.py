@@ -105,6 +105,14 @@ class RunManifest:
     missing: Tuple[str, ...] = ()
     model_config: Dict[str, Any] = field(default_factory=dict)
     extra: Dict[str, Any] = field(default_factory=dict)
+    #: The decision procedure this run used, as
+    #: :func:`~agentdescent.policies.policy_digest`'s 64-hex content hash.
+    #: **Deliberately outside ``manifest_id``**: the id hashes the run's
+    #: *inputs*, and the policy that judges them is a different axis -- folding it
+    #: in would give the same data two ids and make every pre-existing manifest
+    #: incomparable. ``build_manifest`` takes it, nothing compares it in
+    #: :func:`diff_manifest` (see there).
+    policy_digest: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -120,6 +128,9 @@ class RunManifest:
             "missing": list(self.missing),
             "model_config": dict(self.model_config),
             "extra": dict(self.extra),
+            # Additive within ``schema_version: 1``: absent on older manifests,
+            # read as "" by :meth:`from_dict`, so either side loads the other.
+            "policy_digest": self.policy_digest,
         }
 
     @classmethod
@@ -138,18 +149,25 @@ class RunManifest:
             missing=tuple(payload.get("missing") or ()),
             model_config=dict(payload.get("model_config") or {}),
             extra=dict(payload.get("extra") or {}),
+            policy_digest=str(payload.get("policy_digest", "")),
         )
 
 
 def build_manifest(spec: Any, *, data_paths: Sequence[str] = (),
                    model_config: Optional[Mapping[str, Any]] = None,
-                   code_version: str = "", extra: Optional[Mapping[str, Any]] = None
+                   code_version: str = "", extra: Optional[Mapping[str, Any]] = None,
+                   policy_digest: str = ""
                    ) -> RunManifest:
     """Hash a spec, its data files/directories, model config and code version.
 
     ``data_paths`` defaults to the spec's ``data.path`` when it names a real
     file/directory. The manifest id is a hash of the canonical field record, so
     two runs with identical inputs share it.
+
+    ``policy_digest`` is recorded beside that id and **not** inside it: the same
+    inputs judged by a different policy are the same run with a different
+    procedure, and a run whose id changed with its acceptance threshold could not
+    be compared with an older one at all.
     """
     spec_dict = spec.to_dict() if hasattr(spec, "to_dict") else dict(spec)
     spec_hash = _sha(_canonical(redact(spec_dict)))
@@ -191,11 +209,19 @@ def build_manifest(spec: Any, *, data_paths: Sequence[str] = (),
         data_hash=data_hash, model_hash=model_hash,
         code_version=str(code_version), seeds=seeds, algorithm=algorithm,
         files=files, missing=tuple(missing), model_config=safe_model,
-        extra=redact(dict(extra or {})))
+        extra=redact(dict(extra or {})), policy_digest=str(policy_digest))
 
 
 def diff_manifest(a: RunManifest, b: RunManifest) -> Dict[str, Dict[str, Any]]:
-    """Field-level differences between two manifests (empty when identical)."""
+    """Field-level differences between two manifests (empty when identical).
+
+    ``policy_digest`` is not compared, and that is the point of keeping it out of
+    ``manifest_id``: :func:`verify_manifest` rebuilds the manifest from the
+    run's *inputs* and cannot re-derive the procedure, so comparing it would
+    report every recorded manifest as changed. Read
+    ``a.policy_digest != b.policy_digest`` directly to compare two runs'
+    policies.
+    """
     out = {}
     for key in ("spec_hash", "data_hash", "model_hash", "code_version",
                 "seeds", "algorithm", "files", "missing", "model_config",

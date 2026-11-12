@@ -253,6 +253,18 @@ class MergeOutcome(str, Enum):
     #: An RRSI-style selector refused the candidate on its cost rule (either
     #: branch): the improvement costs more policy tokens than it is worth.
     COST_RULE = "cost-rule"
+    #: The installed acceptance policy asked for task-level probes and the
+    #: aggregator could not supply them (#938). Not a rejection: the gate
+    #: deferred, and the artifact's prior is left alone.
+    PROBES_UNAVAILABLE = "probes-unavailable"
+    #: Falsification gate (#938): the candidate did not improve the
+    #: target-transfer partition.
+    NO_TARGET_TRANSFER = "no-target-transfer"
+    #: Falsification gate (#938): the candidate regressed an archived task.
+    ARCHIVED_REGRESSION = "archived-regression"
+    #: Falsification gate (#938): the candidate changed a verdict on the
+    #: falsification partition, so it is over-broad.
+    FALSIFICATION_MOVED = "falsification-moved"
 
     def __str__(self) -> str:            # so f-strings render the value, not the name
         return self.value
@@ -1621,6 +1633,48 @@ class Aggregator:
         c.cand_cheap = self.verifier.cheap_eval(c.candidate)
         return c
 
+    def _probe_context(self):
+        """Task-level probes for an acceptance policy that declares it needs them.
+
+        ``MergeContext`` carries counts only, by design -- they are what the
+        shipped gate reads, and a count cannot name the task that regressed
+        (#938). A policy that wants task-level evidence sets
+        ``needs_probes = True`` and publishes its three partitions through
+        ``probe_partitions()``; the **evaluator** comes from here, so a policy
+        cannot score its own candidate.
+
+        ``None`` in every ordinary run: the default gate does not ask, so the
+        probes cost nothing. A policy that asks and cannot be served also gets
+        ``None`` and must defer -- the aggregator never invents a measurement and
+        never substitutes the count-only verdict.
+        """
+        if not getattr(self.acceptance_policy, "needs_probes", False):
+            return None
+        partitions = getattr(self.acceptance_policy, "probe_partitions", None)
+        eval_fn = getattr(self.verifier, "eval_fn", None)
+        if not callable(partitions) or not callable(eval_fn):
+            return None
+        try:
+            parts = partitions()
+            target = tuple(getattr(parts, "target", ()) or ())
+            falsification = tuple(getattr(parts, "falsification", ()) or ())
+            archived = tuple(getattr(parts, "archived", ()) or ())
+        except Exception:  # noqa: BLE001 - an unusable probe spec is a deferral
+            return None
+        if not (target and falsification and archived):
+            return None
+        from .falsification import ProbeContext
+
+        def evaluate(artifact, tasks):
+            # Per task, not per partition: the reject reason has to name the
+            # failing id, and `eval_fn`'s aggregate cannot. The caller chose
+            # these partitions and opted into this gate, so the extra calls are
+            # the price of a decidable verdict rather than a hidden one.
+            return {task.id: float(eval_fn(artifact, [task])) for task in tasks}
+
+        return ProbeContext(target=target, falsification=falsification,
+                            archived=archived, evaluate=evaluate)
+
     def _decide(self, c: "_Candidate") -> MergeReport:
         """Accept or reject, audit, and commit. Single-threaded by contract.
 
@@ -1649,7 +1703,8 @@ class Aggregator:
             base_counts=c.base_counts, cand_counts=c.cand_counts,
             diff=c.diff, base_cheap=base_score, cand_cheap=cand_score,
             prior=prior, trust_radius=c.artifact.blast_radius,
-            stable_distance=stable_distance))
+            stable_distance=stable_distance,
+            probes=self._probe_context()))
         p_improve = decision.p_improve
 
         # The full held-out rates. The regression guard below must use *these*
@@ -1687,6 +1742,16 @@ class Aggregator:
         if rejected:
             _observe_outcome(False)
             return report(None, None, "oracle rejected", MergeOutcome.ORACLE_REJECTED)
+
+        if decision.defer:
+            # The gate could not measure what it needs (#938). Report it as its
+            # own category and leave the prior alone: a missing measurement is
+            # not evidence against the lesson, and folding a zero delta in here
+            # would let "probes never ran" quietly look like "the candidate was
+            # neutral".
+            _observe_outcome(False)
+            return report(None, None, decision.detail,
+                          MergeOutcome(decision.category))
 
         if not decision.accept:
             _observe_outcome(False)
@@ -1742,6 +1807,22 @@ class Aggregator:
             return report(None, None, "CAS conflict", MergeOutcome.CAS_CONFLICT)
 
         prior.update(True, weight=2.0)  # a committed improvement is strong evidence.
+
+        # Review evidence for a lesson that passed a falsification gate (#938).
+        # Written *after* the CAS commit returned, on this thread, so it can
+        # never describe a change that did not land -- and it writes beside the
+        # ledger, not into artifact state, so it cannot bypass the CAS that
+        # decided the commit. Advisory: losing provenance must not undo a commit
+        # the ledger already accepted.
+        if decision.provenance:
+            try:
+                from .falsification import append_provenance
+                append_provenance(self.ledger, c.artifact_id, decision.provenance)
+            except Exception as error:  # noqa: BLE001 - evidence, not state
+                log = getattr(self, "logger", None)
+                if log is not None:
+                    log.warning("provenance for %s was not written: %s",
+                                c.artifact_id, error)
 
         if c.diff.contract_breaking and self.on_contract_change is not None:
             self.on_contract_change(c.artifact_id, c.branch or Ledger.DEV)

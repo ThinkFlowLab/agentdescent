@@ -383,6 +383,7 @@ from .promotion import (
     ProofEvidence,
     PromotionRequest,
     PromotionDecision,
+    ReviewCost,
     promote,
 )
 from .trust_evidence import TrustEvidence, build_trust_evidence
@@ -424,6 +425,17 @@ from .platform import PlatformConfig, PlatformReport, RSIPlatform
 from .risk_policy import RiskContext, RiskDecision, RiskPolicy, RiskRule
 from .manifest import (RunManifest, build_manifest, diff_manifest,
                        verify_manifest)
+from .replay_fidelity import (
+    REPLAY_ENV_ALLOWLIST,
+    EnvironmentFingerprint,
+    ReplayCheck,
+    ReplayFidelity,
+    ReplayNotEligible,
+    RngRecord,
+    content_digest,
+    replay_check,
+    rng_digest,
+)
 from .recursive import (
     RecursiveRound,
     RecursiveSelfImproveReport,
@@ -911,6 +923,7 @@ __all__ = [
     "ProofEvidence",
     "PromotionRequest",
     "PromotionDecision",
+    "ReviewCost",
     "promote",
     "PromotionLedger",
     "ReleaseRecord",
@@ -959,6 +972,15 @@ __all__ = [
     "build_manifest",
     "diff_manifest",
     "verify_manifest",
+    "REPLAY_ENV_ALLOWLIST",
+    "EnvironmentFingerprint",
+    "ReplayCheck",
+    "ReplayFidelity",
+    "ReplayNotEligible",
+    "RngRecord",
+    "content_digest",
+    "replay_check",
+    "rng_digest",
     "RecursiveRound",
     "RecursiveSelfImproveReport",
     "recursive_self_improve",

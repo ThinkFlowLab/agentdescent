@@ -3464,6 +3464,14 @@ def evolve(
         score candidates only on held-out should pass ``False``.
     held_out_frac:
         Fraction of ``tasks`` reserved for held-out scoring, in ``(0, 1)``.
+    test_frac:
+        Carve a **test** partition out of the held-out tail (#843). Selection and
+        every gate keep reading the select partition; the test split is scored
+        once, after the loop, and returned as :attr:`EvolutionResult.test_reward`
+        (with ``test_tasks`` / ``select_tasks`` for the sizes). ``0.0`` (the
+        default) is the old single-split run exactly -- the CLI then says the
+        printed reward is select-set rather than an unseen test. Synchronous
+        only: the async path warns that it does not split yet.
     repo_path:
         Where the git-backed ledger lives. Omit for a throwaway repo that is
         removed when this call returns (not held until interpreter exit, so a
@@ -3742,12 +3750,10 @@ def evolve(
         # The asynchronous driver does not split a test partition yet (#843).
         # Refusing is the honest option: accepting the argument and silently
         # running without a test split would report a select-set number as if a
-        # generalisation measurement had been asked for and produced.
-        if test_frac:
-            raise ValueError(
-                "test_frac= needs the synchronous loop; "
-                "evolve(asynchronous=True) / async_evolve() do not carve a test "
-                "split yet. Run it synchronously, or wait for the async slice.")
+        # generalisation measurement had been asked for and produced. It goes
+        # through the warn-and-ignore loop below, which is this path's contract
+        # for a knob it does not honour (`test_no_evolve_argument_is_dropped_
+        # without_notice` pins that no new kwarg falls through silently).
         # Deprecated bridge (#809): sync and async are two contracts, not a mode
         # flag. Prefer ``async_evolve`` directly. Validate budgets before the
         # deprecation warning so a misconfigured call fails closed without the
@@ -3765,6 +3771,10 @@ def evolve(
             ("refresh_interval", None if refresh_interval == 1 else refresh_interval,
              "it staggers snapshot refresh across round barriers, and the async "
              "path has none -- async_ratio is its lag budget"),
+            ("test_frac", None if not test_frac else test_frac,
+             "the barrier-free runtime has no select/test split yet, so a run "
+             "would report a select-set reward as if a test split had been "
+             "measured -- run synchronously to get a test_reward (#843)"),
         ):
             if value is not None:
                 warnings.warn(

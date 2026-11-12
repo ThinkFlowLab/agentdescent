@@ -38,14 +38,18 @@ from collections import deque
 import difflib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from . import runstore
+from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_path,
+                        reward_set_line)
 from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
                          compose, estimate, fold_kind, load_spec, resolve_kind,
                          _POLICY_SLOTS)
@@ -664,17 +668,38 @@ def _demo_offline_algorithms() -> Tuple[str, ...]:
     return demo_mod.OFFLINE_ALGORITHMS
 
 
-def cmd_demo(a: argparse.Namespace) -> int:
-    """Build a complete example and run it, so the first thing seen works."""
+def _drop_temp_demo_root(root: str, directory: Optional[str]) -> None:
+    """#906: a bare run's root is only worth keeping while its payload returns."""
+    if directory:
+        return
+    import shutil
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def demo_payload(
+    algorithm: Optional[str] = None,
+    *,
+    kind: Optional[str] = None,
+    directory: Optional[str] = None,
+    store: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run the offline demo and return the same dict as ``demo --json``.
+
+    Shared by the CLI and the MCP ``demo`` tool (#903). Raises
+    :class:`SpecError` for an unknown or real-model-only algorithm, or a
+    ``kind`` with no offline fixture, so both surfaces report the same
+    message.
+    """
     import tempfile
 
     from . import algorithms
     from . import demo as demo_mod
 
     algo = None
-    if getattr(a, "algorithm", None):
+    if algorithm:
         try:
-            algo = algorithms.get(a.algorithm, where="demo --algorithm").name
+            algo = algorithms.get(algorithm, where="demo --algorithm").name
         except algorithms.AlgorithmError as e:
             raise SpecError(str(e)) from None
         why = demo_mod.skip_reason(algo)
@@ -688,74 +713,41 @@ def cmd_demo(a: argparse.Namespace) -> int:
                 f"`agentdescent algorithms run {algo} <path> <cases.jsonl>` "
                 f"(`agentdescent algorithms show {algo}` for its parameters)")
     try:
-        demo_mod.resolve_demo_kind(algo, getattr(a, "kind", None))
+        demo_mod.resolve_demo_kind(algo, kind)
     except ValueError as e:
-        raise SpecError(str(e)) from None
-    root = os.path.abspath(os.path.expanduser(a.dir)) if a.dir else tempfile.mkdtemp(
-        prefix="agentdescent-demo-")
+        # Keep the #905 MCP contract: a bad --kind is actionable from a host
+        # too, so name the offline fixtures beside the resolver's message.
+        raise SpecError(f"{e} (offline kinds: ['skill_dir', 'text', "
+                        "'skill_library'])") from None
+
+    root = (os.path.abspath(os.path.expanduser(directory)) if directory
+            else tempfile.mkdtemp(prefix="agentdescent-demo-"))
     os.makedirs(root, exist_ok=True)
     try:
-        spec_dict = demo_mod.build(root, algorithm=algo, kind=getattr(a, "kind", None))
+        spec_dict = demo_mod.build(root, algorithm=algo, kind=kind)
     except ValueError as e:
+        _drop_temp_demo_root(root, directory)
         raise SpecError(str(e)) from None
-    kind = spec_dict["kind"]
-
-    as_json = getattr(a, "json", False)
-    if not as_json:
-        if kind == "text":
-            prompt_path = os.path.join(root, "prompt.txt")
-            print(f"A text prompt that totals a CSV column, in {root}")
-            print(f"  prompt.txt   ->  {open(prompt_path).read().strip()!r}   "
-                  f"(wrong: `id` is a row number)")
-            print("  cases.jsonl  ->  12 prompts with embedded CSVs and known totals")
-        elif kind == "skill_library":
-            csv_rules = os.path.join(root, "csv-total", "references", "rules.md")
-            date_rules = os.path.join(root, "date-parse", "references", "rules.md")
-            print(f"A two-skill library (csv-total + date-parse), in {root}")
-            print(f"  csv-total/references/rules.md   ->  "
-                  f"{open(csv_rules).read().strip()!r}   (wrong: `id` is a row number)")
-            print(f"  date-parse/references/rules.md  ->  "
-                  f"{open(date_rules).read().strip()!r}   (wrong: date tasks ask for year)")
-            print("  cases.jsonl                      ->  12 tasks (CSV totals + date years)")
-        else:
-            skill = os.path.join(root, demo_mod.DEMO_SKILL)
-            rules = os.path.join(skill, "references", "rules.md")
-            print(f"A skill that totals a column of a CSV, in {root}")
-            print(f"  {demo_mod.DEMO_SKILL}/references/rules.md  ->  "
-                  f"{open(rules).read().strip()!r}   (wrong: `id` is a row number)")
-            print("  cases.jsonl                        ->  12 CSVs with known totals")
-        print("  the agent is a local program, so this costs nothing and needs no key")
-        if kind != "skill_library":
-            print("  note: this is a smoke trajectory; for multi-round library edits see")
-            print("        agentdescent demo --kind skill_library")
-        if algo:
-            print(f"  algorithm: {algo}   (`agentdescent algorithms show {algo}`)")
-        print()
+    used_kind = spec_dict["kind"]
 
     spec = EvolveSpec.from_dict(spec_dict)
     comp = compose(spec)
     est = estimate(comp)
-    if not as_json:
-        print(f"plan: {len(comp.tasks)} tasks, "
-              f"{comp.kwargs['rounds']} rounds x {comp.kwargs['n_workers']} workers, "
-              f"up to {est['agent_calls_upper_bound']} agent calls\n")
-
-    rd = runstore.create(spec.to_dict(), store=a.store)
-    if not as_json:
-        print(f"running ({rd.run_id})...")
-    result = runstore.execute(rd)
-    if not as_json:
-        for info in result.history:
-            print(f"  round {info.round:>2}  reward={info.held_out_reward:.3f}  "
-                  f"+{info.committed}/-{info.rejected}")
+    rd = runstore.create(spec.to_dict(), store=store)
+    try:
+        result = runstore.execute(rd)
+    except BaseException:
+        # #906: a failed run cannot be reported, so its own root is dead weight.
+        _drop_temp_demo_root(root, directory)
+        raise
 
     init = getattr(result, "initial_reward", None)
-    learned = demo_mod.learned_summary(result.state, kind=kind)
+    learned = demo_mod.learned_summary(result.state, kind=used_kind)
     ok = result.final_reward >= 1.0
     # #902: one list feeds both the human footer and --json.next, and with
     # --algorithm NAME the "your own run" steps keep the algorithm just shown.
     target = {"text": "<your-prompt.txt>",
-              "skill_library": "<your-skill-library>"}.get(kind, "<your-skill-dir>")
+              "skill_library": "<your-skill-library>"}.get(used_kind, "<your-skill-dir>")
     if algo:
         own_steps = [
             f"agentdescent algorithms run {algo} {target} <your-cases.jsonl> "
@@ -763,7 +755,7 @@ def cmd_demo(a: argparse.Namespace) -> int:
             "agentdescent doctor",
             f"agentdescent evolve agentdescent.{algo}.spec.json",
         ]
-    elif kind == "text":
+    elif used_kind == "text":
         own_steps = [
             f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
@@ -786,59 +778,111 @@ def cmd_demo(a: argparse.Namespace) -> int:
         f"agentdescent apply {rd.run_id} --dry-run",
         *own_steps,
     ]
+    return {
+        "ok": ok,
+        "dir": root,
+        "kind": used_kind,
+        "algorithm": algo,
+        "run_id": rd.run_id,
+        "plan": {
+            "tasks": len(comp.tasks),
+            "rounds": comp.kwargs["rounds"],
+            "n_workers": comp.kwargs["n_workers"],
+            "agent_calls_upper_bound": est["agent_calls_upper_bound"],
+        },
+        "initial_reward": init,
+        "final_reward": result.final_reward,
+        "outcomes": result.outcomes(),
+        "learned": learned,
+        "history": [
+            {"round": info.round,
+             "held_out_reward": info.held_out_reward,
+             "committed": info.committed,
+             "rejected": info.rejected}
+            for info in result.history
+        ],
+        "next": next_steps,
+        **({} if ok else {"note": "lower than expected for the demo; see the run store"}),
+    }
 
-    if as_json:
-        # #862: honour the advertised --json flag so hosts can assert an
-        # offline algo smoke without scraping the human narrative.
-        _out({
-            "ok": ok,
-            "dir": root,
-            "kind": kind,
-            "algorithm": algo,
-            "run_id": rd.run_id,
-            "plan": {
-                "tasks": len(comp.tasks),
-                "rounds": comp.kwargs["rounds"],
-                "n_workers": comp.kwargs["n_workers"],
-                "agent_calls_upper_bound": est["agent_calls_upper_bound"],
-            },
-            "initial_reward": init,
-            "final_reward": result.final_reward,
-            "outcomes": result.outcomes(),
-            "learned": learned,
-            "history": [
-                {"round": info.round,
-                 "held_out_reward": info.held_out_reward,
-                 "committed": info.committed,
-                 "rejected": info.rejected}
-                for info in result.history
-            ],
-            "next": next_steps,
-            **({} if ok else {"note": "lower than expected for the demo; see the run store"}),
-        }, as_json=True)
-        return 0 if ok else 1
 
-    if init is not None:
-        print(f"\nheld-out reward: {init:.3f} -> {result.final_reward:.3f}   "
-              f"outcomes: {result.outcomes()}")
+def _print_demo_human(payload: Dict[str, Any], *, store: Optional[str] = None,
+                      keep: bool = True) -> None:
+    """Reprint the narrative ``cmd_demo`` used to stream while the run ran."""
+    from . import demo as demo_mod
+
+    root = payload["dir"]
+    # #906: say which case keeps the files, so the line matches what is on disk.
+    where = root if keep else f"{root} (removed at exit)"
+    kind = payload["kind"]
+    algo = payload["algorithm"]
+    if kind == "text":
+        prompt_path = os.path.join(root, "prompt.txt")
+        print(f"A text prompt that totals a CSV column, in {where}")
+        print(f"  prompt.txt   ->  {open(prompt_path).read().strip()!r}   "
+              f"(wrong: `id` is a row number)")
+        print("  cases.jsonl  ->  12 prompts with embedded CSVs and known totals")
+    elif kind == "skill_library":
+        csv_rules = os.path.join(root, "csv-total", "references", "rules.md")
+        date_rules = os.path.join(root, "date-parse", "references", "rules.md")
+        print(f"A two-skill library (csv-total + date-parse), in {where}")
+        print(f"  csv-total/references/rules.md   ->  "
+              f"{open(csv_rules).read().strip()!r}   (wrong: `id` is a row number)")
+        print(f"  date-parse/references/rules.md  ->  "
+              f"{open(date_rules).read().strip()!r}   (wrong: date tasks ask for year)")
+        print("  cases.jsonl                      ->  12 tasks (CSV totals + date years)")
     else:
-        print(f"\nheld-out reward: {result.final_reward:.3f}   "
-              f"outcomes: {result.outcomes()}")
-    print(f"what it learned:  {learned}")
-    if not ok:
+        skill = os.path.join(root, demo_mod.DEMO_SKILL)
+        rules = os.path.join(skill, "references", "rules.md")
+        print(f"A skill that totals a column of a CSV, in {where}")
+        print(f"  {demo_mod.DEMO_SKILL}/references/rules.md  ->  "
+              f"{open(rules).read().strip()!r}   (wrong: `id` is a row number)")
+        print("  cases.jsonl                        ->  12 CSVs with known totals")
+    print("  the agent is a local program, so this costs nothing and needs no key")
+    if kind != "skill_library":
+        print("  note: this is a smoke trajectory; for multi-round library edits see")
+        print("        agentdescent demo --kind skill_library")
+    if algo:
+        print(f"  algorithm: {algo}   (`agentdescent algorithms show {algo}`)")
+    print()
+
+    plan = payload["plan"]
+    print(f"plan: {plan['tasks']} tasks, "
+          f"{plan['rounds']} rounds x {plan['n_workers']} workers, "
+          f"up to {plan['agent_calls_upper_bound']} agent calls\n")
+    print(f"running ({payload['run_id']})...")
+    for info in payload["history"]:
+        print(f"  round {info['round']:>2}  reward={info['held_out_reward']:.3f}  "
+              f"+{info['committed']}/-{info['rejected']}")
+
+    init = payload["initial_reward"]
+    if init is not None:
+        print(f"\nheld-out reward: {init:.3f} -> {payload['final_reward']:.3f}   "
+              f"outcomes: {payload['outcomes']}")
+    else:
+        print(f"\nheld-out reward: {payload['final_reward']:.3f}   "
+              f"outcomes: {payload['outcomes']}")
+    print(f"what it learned:  {payload['learned']}")
+    if not payload["ok"]:
         print("\n(that is lower than expected for the demo; the run store has the detail:")
-        print(f" {rd.path})")
-        return 1
+        try:
+            print(f" {runstore.get(payload['run_id'], store=store).path})")
+        except runstore.RunStoreError:
+            print(f" {payload['run_id']})")
+        return
+
+    own_steps = payload["next"][2:]
     own = "\n".join(f"  {step}" + ("        # what is missing before a real run"
                                      if step == "agentdescent doctor" and kind != "text"
                                      else "")
                      for step in own_steps)
+    run_id = payload["run_id"]
     if kind == "text":
         print(f"""
 The prompt on disk is untouched -- an evolved artifact only lands when you say so:
 
-  agentdescent show  {rd.run_id}          the diff
-  agentdescent apply {rd.run_id} --dry-run  what it would write
+  agentdescent show  {run_id}          the diff
+  agentdescent apply {run_id} --dry-run  what it would write
 
 Your own run is the same shape with a real model instead of the offline pair:
 
@@ -847,8 +891,8 @@ Your own run is the same shape with a real model instead of the offline pair:
         print(f"""
 The library on disk is untouched -- an evolved artifact only lands when you say so:
 
-  agentdescent show  {rd.run_id}          the diff
-  agentdescent apply {rd.run_id} --dry-run  what it would write
+  agentdescent show  {run_id}          the diff
+  agentdescent apply {run_id} --dry-run  what it would write
 
 Your own run is the same spec with three things changed -- your library, your
 cases.jsonl, and a real agent instead of the offline one:
@@ -858,14 +902,39 @@ cases.jsonl, and a real agent instead of the offline one:
         print(f"""
 The skill on disk is untouched -- an evolved artifact only lands when you say so:
 
-  agentdescent show  {rd.run_id}          the diff
-  agentdescent apply {rd.run_id} --dry-run  what it would write
+  agentdescent show  {run_id}          the diff
+  agentdescent apply {run_id} --dry-run  what it would write
 
 Your own run is the same spec with three things changed -- your directory, your
 cases.jsonl, and a real agent instead of the offline one:
 
 {own}""")
-    return 0
+
+
+def cmd_demo(a: argparse.Namespace) -> int:
+    """Build a complete example and run it, so the first thing seen works."""
+    import shutil
+
+    payload = demo_payload(
+        getattr(a, "algorithm", None),
+        kind=getattr(a, "kind", None),
+        directory=getattr(a, "dir", None),
+        store=a.store,
+    )
+    # #906: a bare demo's root lives only for this run. `--dir` is the user
+    # keeping it; `--json` hands the path to a host that reads it after exit.
+    keep = bool(getattr(a, "dir", None)) or bool(getattr(a, "json", False))
+    try:
+        if getattr(a, "json", False):
+            # #862: honour the advertised --json flag so hosts can assert an
+            # offline algo smoke without scraping the human narrative.
+            _out(payload, as_json=True)
+            return 0 if payload["ok"] else 1
+        _print_demo_human(payload, store=a.store, keep=keep)
+        return 0 if payload["ok"] else 1
+    finally:
+        if not keep:
+            shutil.rmtree(payload["dir"], ignore_errors=True)
 
 
 def _starter_model_warnings(spec: Dict[str, Any], out: str) -> List[str]:
@@ -1674,6 +1743,47 @@ def require_resume_not_solved(run_id: str, *, store: Optional[str] = None) -> No
             f"`agentdescent apply {run_id} --dry-run`")
 
 
+#: The provider's own words, when it names one: "It will reset at
+#: 2026-11-12 23:59:59 +0800 CST." The capture stops at the sentence's period or
+#: a quote, so a JSON body does not drag the rest of the message into the hint.
+_QUOTA_RE = re.compile(r"reset at ([^.\"}]+)")
+_QUOTA_MODEL_RE = re.compile(r"for model '([^']+)'")
+
+
+def require_resume_not_quota_exhausted(run_id: str, *,
+                                       store: Optional[str] = None) -> None:
+    """Refuse to relaunch a run whose last failure spent the provider quota (#926).
+
+    ``diagnose latest`` already says "wait for the reset", and ``resume`` is the
+    natural next command -- so it relaunched the detached worker, flipped the
+    status back to ``running`` and burned a start into the same 429, rewriting a
+    status the user was reading. A quota failure is not transient on a retry
+    timescale: the provider names a reset hours away. So the default is to
+    refuse, quote that reset when the message carries one, and name ``--force``
+    as the way to retry anyway.
+
+    Only a ``failed`` run is gated. A cancelled, bounded or ordinary provider
+    failure keeps resuming, and so does a run whose stored error is not a quota
+    refusal -- the gate reads why *this* attempt ended, not whether a quota error
+    ever appeared in the run's history.
+    """
+    st = runstore.get(run_id, store=store).status()
+    if st.state != "failed" or not st.error:
+        return
+    err = st.error.lstrip()
+    if not err.startswith("QuotaExhausted"):
+        return
+    model = _QUOTA_MODEL_RE.search(err)
+    reset = _QUOTA_RE.search(err)
+    who = f" for model '{model.group(1)}'" if model else ""
+    when = (f" (provider says the quota resets at {reset.group(1).strip()})"
+            if reset else " (the provider's message names the reset)")
+    raise SpecError(
+        f"cannot resume {run_id}: it failed on QuotaExhausted{who}{when} -- "
+        f"wait for the reset, or edit the run's agent model / api_key_env, or "
+        f"pass --force to retry now")
+
+
 def require_resume_host_on_path(run_id: str, *, store: Optional[str] = None) -> None:
     """Refuse to relaunch a stopped plugin run whose ``host`` CLI is not on PATH (#370).
 
@@ -2019,6 +2129,112 @@ def plan_payload(spec: EvolveSpec, *, usd_per_call: Optional[float] = None,
     return payload
 
 
+#: The sentence `evolve()` warns with when the held-out set is too small. `plan`
+#: records it as a note, so the human form reroutes it to stderr as a warning
+#: (the same line `evolve` prints) instead of hiding it near the JSON's bottom.
+_HELD_OUT_NOTE = "the held-out set has only"
+
+
+def _plan_target_line(payload: Dict[str, Any]) -> str:
+    """First human line of `plan`: what is evolved, by which algorithm card."""
+    spec = payload.get("spec") or {}
+    kind = payload.get("kind") or spec.get("kind") or "?"
+    target = spec.get("target") or "?"
+    line = f"ok: {kind} {target}"
+    algo = payload.get("algorithm")
+    if algo:
+        # `plan_payload` stores the algorithm *card*, not its name (#919), so
+        # take the label and the fidelity straight from the card; a bare name
+        # (an older payload) still resolves through the registry.
+        if isinstance(algo, dict):
+            name, fidelity = algo.get("name"), algo.get("fidelity")
+        else:
+            name, fidelity = algo, None
+        if name:
+            line += f"  algorithm={name}"
+            if fidelity:
+                line += f" ({fidelity})"
+            elif not isinstance(algo, dict):
+                try:
+                    from . import algorithms
+
+                    line += f" ({algorithms.get(name).fidelity})"
+                except Exception:  # noqa: BLE001 - a label must never fail a valid plan
+                    pass
+    return line
+
+
+def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
+    """The `agent:` line, when the spec names one; keys are reported, never read."""
+    agent = spec.get("agent")
+    block = agent if isinstance(agent, dict) else {}
+    ref = agent if isinstance(agent, str) else block.get("ref")
+    if not ref:
+        return None
+    line = f"agent: {ref}"
+    if block.get("model"):
+        line += f" {block['model']}"
+    if block.get("default_base_url"):
+        line += f" @ {block['default_base_url']}"
+    key_env = block.get("api_key_env")
+    if key_env:
+        try:
+            present = bool(doctor_report()["provider_keys_present"].get(key_env))
+        except Exception:  # noqa: BLE001 - a hint, not a preflight decision
+            present = bool(os.environ.get(key_env))
+        line += f" (key {key_env}: {'set' if present else 'not set'})"
+    return line
+
+
+def _print_plan(payload: Dict[str, Any], *, spec_path: str,
+                next_line: Optional[str] = None,
+                printed: Optional[set] = None) -> None:
+    """Print the human `plan` summary; warnings and the held-out note go to stderr.
+
+    `payload` is exactly the object `--json` prints, so both surfaces carry the
+    same facts and `--json` stays byte-identical (#919). `printed` holds lines an
+    earlier report already showed (`algorithms run` prints init's report first),
+    so a warning is never repeated.
+    """
+    already = set(printed or ())
+    for line in payload.get("warnings") or []:
+        if line not in already:
+            print(f"warning: {line}", file=sys.stderr)
+            already.add(line)
+    notes = list(payload.get("notes") or [])
+    for line in notes:
+        if line.startswith(_HELD_OUT_NOTE) and line not in already:
+            print(f"warning: {line}", file=sys.stderr)
+            already.add(line)
+    est = payload.get("estimate") or {}
+    rounds, workers = est.get("rounds"), est.get("n_workers")
+    tasks = est.get("tasks", payload.get("tasks")) or 0
+    held = est.get("held_out_tasks")
+    calls = est.get("agent_calls_upper_bound")
+    summary = f"plan: {tasks} task{'' if tasks == 1 else 's'}"
+    if held is not None:
+        summary += f" ({held} held out)"
+    if rounds is not None and workers is not None:
+        summary += (f", {rounds} round{'' if rounds == 1 else 's'}"
+                    f" x {workers} worker{'' if workers == 1 else 's'}")
+    if calls is not None:
+        summary += f", up to {calls} agent calls"
+    usd = est.get("usd_upper_bound")
+    summary += (f"  (${usd:.2f} upper bound)" if usd is not None
+                else "  (no $ estimate: pass --usd-per-call)")
+    lines = [_plan_target_line(payload), summary]
+    agent = _plan_agent_line(payload.get("spec") or {})
+    if agent:
+        lines.append(agent)
+    other_notes = [n for n in notes if not n.startswith(_HELD_OUT_NOTE)]
+    for line in other_notes[:3]:
+        lines.append(f"note: {line}")
+    if len(other_notes) > 3:
+        lines.append(f"note: (+{len(other_notes) - 3} more; --json lists every note)")
+    lines.append(f"next: {next_line or f'agentdescent evolve {spec_path}'}")
+    print("\n".join(lines))
+
+
 def _apply_algorithm_flag(spec: EvolveSpec, a: argparse.Namespace) -> None:
     """`plan/evolve --algorithm ... --param ...` override the spec in memory.
 
@@ -2066,7 +2282,19 @@ def cmd_plan(a: argparse.Namespace) -> int:
         # human `error: ...` line on stderr as a spec that does not compile (#553).
         print(f"error: {payload.get('error', 'plan failed')}", file=sys.stderr)
         return 2
-    _out(payload, as_json=a.json)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        # The human form is the default; `--json` above is the machine form and
+        # stays exactly the object it always was (#919).
+        next_line = f"agentdescent evolve {a.spec}"
+        # Keep an ad-hoc `--algorithm` / `--param` override in the suggested
+        # command: it lives in memory, not in the spec file.
+        if getattr(a, "algorithm", None):
+            next_line += f" --algorithm {a.algorithm}"
+            for param in getattr(a, "param", None) or []:
+                next_line += f" --param {param}"
+        _print_plan(payload, spec_path=a.spec, next_line=next_line)
     return 0 if payload.get("ok", True) else 2
 
 
@@ -2130,20 +2358,28 @@ def cmd_evolve(a: argparse.Namespace) -> int:
     init = getattr(result, "initial_reward", None)
     payload = {"run_id": rd.run_id, "state": st.state, "final_reward": result.final_reward,
                "initial_reward": init, "stop_reason": result.stop_reason,
+               # #843: the reward set, so `--json` callers do not have to
+               # re-derive it from a flag that may have been edited since.
+               "test_reward": getattr(result, "test_reward", None),
+               "test_tasks": getattr(result, "test_tasks", 0),
+               "select_tasks": getattr(result, "select_tasks", 0),
                "outcomes": result.outcomes(), "error": result.error, "dir": rd.path}
     from .diagnose import SEED_SOLVED_HINT, seed_already_solved
     seed_solved = seed_already_solved(init, result.final_reward, result.stop_reason)
     if seed_solved:
         payload["note"] = SEED_SOLVED_HINT
+    set_line = reward_set_line(result.final_reward,
+                               getattr(result, "test_reward", None))
     if init is not None:
         plain = (f"{_status_line(st)}\n"
                  f"held-out reward: {init:.3f} -> {result.final_reward:.3f}  "
                  f"outcomes: {result.outcomes()}\n"
+                 f"{set_line}\n"
                  + (f"{SEED_SOLVED_HINT}\n" if seed_solved else "")
                  + f"{rd.path}")
     else:
         plain = (f"{_status_line(st)}\nfinal reward: {result.final_reward:.3f}  "
-                 f"outcomes: {result.outcomes()}\n{rd.path}")
+                 f"outcomes: {result.outcomes()}\n{set_line}\n{rd.path}")
     _out(payload if a.json else plain, as_json=a.json)
     return 0 if result.error is None else 1
 
@@ -2467,6 +2703,12 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         return payload
     payload.update(final_reward=result.final_reward,
                    initial_reward=getattr(result, "initial_reward", None),
+                   # #843: which set each number is. `final_reward` is the
+                   # select set; `test_reward` is None unless the run carved a
+                   # test partition with `test_frac`.
+                   test_reward=getattr(result, "test_reward", None),
+                   test_tasks=getattr(result, "test_tasks", 0),
+                   select_tasks=getattr(result, "select_tasks", 0),
                    outcomes=result.outcomes(),
                    rounds=len(result.history))
     # Reflector exceptions (#395). Only when there were some, so a healthy run's
@@ -2537,10 +2779,20 @@ def cmd_show(a: argparse.Namespace) -> int:
         _out(payload, as_json=True)
         return 0
     for k in ("run_id", "state", "stop_reason", "error", "initial_reward",
-              "final_reward", "outcomes",
+              "final_reward", "test_reward", "outcomes",
               "best_reward", "propose_errors", "propose_error", "note"):
         if payload.get(k) is not None:
             print(f"{k}: {payload[k]}")
+    # #843: `final_reward` alone does not say whether it is the set that selected
+    # the winner or an unseen test. Keep the pinned `final_reward:` line and add
+    # the sentence that names the set; a split run also prints `test_reward:`
+    # above, which is the number that was never used for selection.
+    if payload.get("final_reward") is not None:
+        if payload.get("test_reward") is not None:
+            print("(final_reward is the select set; test_reward was never used "
+                  "for accept/select)")
+        else:
+            print(f"({SELECT_SET_NOTE})")
     if payload.get("fusion_summary"):
         print(payload["fusion_summary"])
     if payload.get("history"):
@@ -2605,16 +2857,187 @@ def _text_plan(dest: str, rendered: str) -> Dict[str, Any]:
 
 
 
-def resolve_apply_dest(to: Optional[str], install_to: Optional[str]) -> Optional[str]:
-    """Combine ``--to`` and ``--install-to`` (alias). Error if both differ."""
-    if to and install_to and os.path.expanduser(to) != os.path.expanduser(install_to):
+class GrokBotInstallError(runstore.RunStoreError):
+    """Raised when ``--install-to`` targets ``grok-bot`` (read-only user skills)."""
+
+
+def _resolve_install_to(value: str, *, home: Optional[str]) -> Tuple[str, Optional[str], bool]:
+    """Map a bare known host name/alias to its user skills root when unambiguous."""
+    from .integrations import HOSTS, _resolve_home, canonical_host, host_skills_dir
+
+    canonical = canonical_host(value)
+    if canonical in HOSTS:
+        # Preserve local relative-path semantics if a same-named entry exists in cwd (#935).
+        if os.path.lexists(value):
+            if home is not None:
+                try:
+                    _resolve_home(home)
+                except ValueError as e:
+                    raise runstore.RunStoreError(str(e)) from None
+            return value, (
+                f"note: local path {value!r} exists in cwd; treating --install-to "
+                f"{value!r} as a path (pass ./{value} to silence)"), False
+        try:
+            skills_dir = host_skills_dir(canonical, home=home)
+        except ValueError as e:
+            raise runstore.RunStoreError(str(e)) from None
+        if skills_dir is None:
+            raise GrokBotInstallError(
+                "grok-bot does not allow direct writes ($AGENTDESCENT_GROK_BOT_SKILLS "
+                "is read-only); ask Grok Bot to save each SKILL.md as a user skill")
+        return skills_dir, f"install-to {value} -> {skills_dir}", True
+    if home is not None:
+        try:
+            _resolve_home(home)
+        except ValueError as e:
+            raise runstore.RunStoreError(str(e)) from None
+    return value, None, False
+
+
+def resolve_apply_dest(to: Optional[str], install_to: Optional[str], *,
+                       home: Optional[str] = None,
+                       notes: Optional[List[str]] = None) -> Optional[str]:
+    """Combine ``--to`` and ``--install-to``, resolving host names/aliases (#823, #935)."""
+    resolved_install = None
+    note = None
+    resolved_host = False
+    if install_to:
+        resolved_install, note, resolved_host = _resolve_install_to(
+            install_to, home=home)
+    elif home is not None:
+        from .integrations import _resolve_home
+        try:
+            _resolve_home(home)
+        except ValueError as e:
+            raise runstore.RunStoreError(str(e)) from None
+    if to and resolved_install:
+        if os.path.normpath(os.path.expanduser(to)) != os.path.normpath(
+                os.path.expanduser(resolved_install)):
+            raise runstore.RunStoreError(
+                f"--to {to!r} and --install-to {install_to!r} disagree; pass one")
+    if notes is not None:
+        if note:
+            notes.append(note)
+        if home is not None and not resolved_host:
+            notes.append(
+                "note: --home only applies when --install-to resolves to a host; "
+                "ignored for path destination")
+    return resolved_install if install_to else to
+
+
+def _grok_bot_apply_message(*, run_id: Optional[str] = None,
+                            source: Optional[str] = None,
+                            store: Optional[str] = None,
+                            home: Optional[str] = None) -> str:
+    """Build manual user-skill save instructions for ``grok-bot`` without writing."""
+    from .integrations import _resolve_home, grok_bot_user_skills_dir
+
+    try:
+        resolved_home, honour_env = _resolve_home(home)
+    except ValueError as e:
+        raise runstore.RunStoreError(str(e)) from None
+    user_dir = grok_bot_user_skills_dir(resolved_home, honour_env)
+    if source:
+        src = os.path.abspath(os.path.expanduser(source))
+        if os.path.islink(src):
+            raise runstore.RunStoreError(
+                f"--from {src} is a symlink; refuse to apply (would dereference)")
+        if not os.path.exists(src):
+            raise runstore.RunStoreError(f"--from {src} does not exist")
+        if os.path.isfile(src):
+            paths = [src]
+        else:
+            rels: List[str] = []
+            for dirpath, dirnames, filenames in os.walk(src):
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if d not in (".git", "__pycache__")
+                    and not os.path.islink(os.path.join(dirpath, d)))
+                for fname in sorted(filenames):
+                    full = os.path.join(dirpath, fname)
+                    if fname == "SKILL.md" and not os.path.islink(full):
+                        rels.append(os.path.relpath(full, src))
+            paths = [os.path.join(src, rel) for rel in sorted(rels)] or [src]
+        return "\n".join([
+            f"grok-bot does not allow direct writes ({user_dir} is read-only). "
+            "ask Grok Bot to save each skill below as a user skill:",
+            *[f"  - {p}" for p in paths],
+        ])
+    if run_id:
+        resolved_id = resolve_run_id(run_id, store=store) or run_id
+        rd = runstore.get(resolved_id, store=store)
+        result = rd.result()
+        if result is None:
+            raise runstore.RunStoreError(f"{resolved_id} has no result to apply yet")
+        stage_dir = os.path.abspath(
+            os.path.join(tempfile.gettempdir(), f"agentdescent-apply-{resolved_id}"))
+        if isinstance(result.state, dict):
+            rels = sorted(
+                k for k in result.state
+                if k == "SKILL.md" or k.endswith("/SKILL.md"))
+            if not rels:
+                rels = sorted(result.state)
+            stage_target = stage_dir
+            paths = [os.path.join(stage_dir, rel.replace("/", os.sep)) for rel in rels]
+        else:
+            spec = EvolveSpec.from_dict(rd.spec_dict())
+            fname = os.path.basename(spec.target) or "SKILL.md"
+            stage_target = os.path.join(stage_dir, fname)
+            paths = [stage_target]
+        return "\n".join([
+            f"grok-bot does not allow direct writes ({user_dir} is read-only). "
+            f"First materialize without touching Grok Bot's store: "
+            f"`agentdescent apply {resolved_id} --to {stage_target}`; "
+            "then ask Grok Bot to save each file below as a user skill:",
+            *[f"  - {p}" for p in paths],
+        ])
+    return (
+        f"grok-bot does not allow direct writes ({user_dir} is read-only); "
+        "materialize with `agentdescent apply <run_id> --to <dir>` and ask "
+        "Grok Bot to save each SKILL.md as a user skill")
+
+
+def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
+                      install_to: Optional[str] = None, source: Optional[str] = None,
+                      store: Optional[str] = None, home: Optional[str] = None,
+                      dry_run: bool = False, backup: bool = True,
+                      cli_flags: bool = True,
+                      check_write: Optional[Callable[[str, str], Any]] = None
+                      ) -> Tuple[Dict[str, Any], List[str], str]:
+    """Shared CLI + MCP entry point for ``apply`` (#823, #935)."""
+    notes: List[str] = []
+    if source and run_id:
         raise runstore.RunStoreError(
-            f"--to {to!r} and --install-to {install_to!r} disagree; pass one")
-    return to or install_to
+            "pass a run_id or --from PATH, not both"
+            if cli_flags else "pass a run_id or from PATH, not both")
+    try:
+        dest = resolve_apply_dest(to, install_to, home=home, notes=notes)
+    except GrokBotInstallError:
+        raise GrokBotInstallError(
+            _grok_bot_apply_message(
+                run_id=run_id, source=source, store=store, home=home)) from None
+    if source:
+        if not dest:
+            raise runstore.RunStoreError(
+                "--from needs --to/--install-to PATH (where to install the artifact)"
+                if cli_flags
+                else "from needs to/install_to PATH (where to install the artifact)")
+        return (apply_from_payload(source, to=dest, dry_run=dry_run, backup=backup,
+                                   check_write=check_write),
+                notes, source)
+    if not run_id:
+        raise runstore.RunStoreError(
+            "apply needs a run_id, or --from PATH --to/--install-to PATH"
+            if cli_flags
+            else "apply needs a run_id, or from PATH and to/install_to PATH")
+    return (apply_payload(run_id, to=dest, store=store, dry_run=dry_run, backup=backup,
+                          check_write=check_write),
+            notes, f"run {run_id}")
 
 
 def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str] = None,
-                  dry_run: bool = False, backup: bool = True) -> Dict[str, Any]:
+                  dry_run: bool = False, backup: bool = True,
+                  check_write: Optional[Callable[[str, str], Any]] = None) -> Dict[str, Any]:
     run_id = resolve_run_id(run_id, store=store) or run_id
     rd = runstore.get(run_id, store=store)
     result = rd.result()
@@ -2638,28 +3061,28 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
                 "directory; pass --to FILE to write it to a file, or read it "
                 "with `show`")
         plan = _text_plan(dest, result.rendered)
+        slot = (_backup_slot(dest)
+                if backup and not plan["noop"] and os.path.exists(dest) else None)
+        _check_apply_paths(dest, plan["written"], slot, check_write)
         if dry_run:
             return {**plan, "dest": dest}
         if plan["noop"]:
             return {"written": [], "unchanged": [dest], "backup": [], "noop": True,
                     "dest": dest}
         saved = []
-        if backup and os.path.exists(dest):
+        if slot is not None:
             # `.bak-N`, never a fixed `.bak`: the directory path a few lines down
             # has always numbered its backups, and this one overwrote the single
             # slot on every apply. Apply, hand-edit, apply again and the second
             # backup was the hand-edit -- the original the first apply had saved
             # was gone, from the same command that promises to keep one.
-            n = 0
-            while os.path.exists(f"{dest}.bak-{n}"):
-                n += 1
-            shutil.copy2(dest, f"{dest}.bak-{n}")
-            saved = [f"{dest}.bak-{n}"]
+            shutil.copy2(dest, slot)
+            saved = [slot]
         with open(dest, "w", encoding="utf-8", newline="") as fh:
             fh.write(result.rendered)
         return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
                 "dest": dest}
-    plan = result.write_to(dest, backup=backup, dry_run=dry_run)
+    plan = result._write_to(dest, backup=backup, dry_run=dry_run, check_write=check_write)
     plan["dest"] = dest
     if spec.kind == "skill_library":
         # write_to default prune=False: host skills outside the evolved keys
@@ -2684,7 +3107,8 @@ def _backup_slot(dest: str) -> str:
 
 
 def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
-                       backup: bool = True) -> Dict[str, Any]:
+                       backup: bool = True,
+                       check_write: Optional[Callable[[str, str], Any]] = None) -> Dict[str, Any]:
     """Install an artifact that lives on disk, not in the run store (#533).
 
     ``agentdescent campaign`` leaves its best artifact in a workspace copy and
@@ -2719,14 +3143,16 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
         except (OSError, UnicodeDecodeError) as e:
             raise runstore.RunStoreError(f"cannot read {src}: {e}") from None
         plan = _text_plan(dest, rendered)
+        slot = (_backup_slot(dest)
+                if backup and not plan["noop"] and os.path.exists(dest) else None)
+        _check_apply_paths(dest, plan["written"], slot, check_write)
         if dry_run:
             return {**plan, "source": src, "dest": dest}
         if plan["noop"]:
             return {"written": [], "unchanged": [dest], "backup": [], "noop": True,
                     "source": src, "dest": dest}
         saved = []
-        if backup and os.path.exists(dest):
-            slot = _backup_slot(dest)
+        if slot is not None:
             shutil.copy2(dest, slot)
             saved = [slot]
         parent = os.path.dirname(dest)
@@ -2800,11 +3226,13 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     plan: Dict[str, Any] = {"written": changed, "unchanged": unchanged, "extra": extra,
                             "deleted": [], "backup": [], "noop": not changed,
                             "source": src, "dest": dest}
+    slot = (_file_tree_backup_path(dest)
+            if backup and not plan["noop"] and os.path.isdir(dest) else None)
+    _check_apply_paths(dest, [os.path.join(dest, rel.replace("/", os.sep))
+                             for rel in changed], slot, check_write)
     if dry_run or plan["noop"]:
         return plan
-    if backup and os.path.isdir(dest):
-        from .evolution import _file_tree_backup_path
-        slot = _file_tree_backup_path(dest)
+    if slot is not None:
         shutil.copytree(dest, slot, symlinks=True)
         plan["backup"] = [slot]
     for rel in changed:
@@ -2822,33 +3250,26 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
 
 
 def cmd_apply(a: argparse.Namespace) -> int:
-    source = getattr(a, "source", None)
     try:
-        dest = resolve_apply_dest(getattr(a, "to", None),
-                                  getattr(a, "install_to", None))
+        payload, notes, what = apply_with_target(
+            getattr(a, "run_id", None),
+            to=getattr(a, "to", None),
+            install_to=getattr(a, "install_to", None),
+            source=getattr(a, "source", None),
+            store=a.store,
+            home=getattr(a, "home", None),
+            dry_run=a.dry_run,
+            backup=not a.no_backup,
+        )
     except runstore.RunStoreError as e:
-        print(f"error: {e}", file=sys.stderr)
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
         return 2
-    if source:
-        if a.run_id:
-            print("error: pass a run_id or --from PATH, not both", file=sys.stderr)
-            return 2
-        if not dest:
-            print("error: --from needs --to/--install-to PATH "
-                  "(where to install the artifact)", file=sys.stderr)
-            return 2
-        payload = apply_from_payload(source, to=dest, dry_run=a.dry_run,
-                                     backup=not a.no_backup)
-        what = source
-    else:
-        if not a.run_id:
-            print("error: apply needs a run_id, or --from PATH --to/--install-to PATH",
-                  file=sys.stderr)
-            return 2
-        payload = apply_payload(a.run_id, to=dest, store=a.store, dry_run=a.dry_run,
-                                backup=not a.no_backup)
-        what = f"run {a.run_id}"
     _out(payload, as_json=True)
+    for note in notes:
+        print(note, file=sys.stderr)
     if payload.get("noop"):
         # After the JSON, on stderr: stdout stays one machine-readable document.
         print(f"nothing to apply: {payload.get('dest') or '(target)'} already matches "
@@ -2868,6 +3289,10 @@ def cmd_resume(a: argparse.Namespace) -> int:
     # `host_model` was borrowing.
     runstore.require_budget_pair(a.budget, a.usd_per_call)
     require_resume_not_solved(a.run_id, store=a.store)
+    # A spent quota is not retried by default: `diagnose` sends the user here and
+    # the relaunch only re-burned a call into the same 429 (#926).
+    if not getattr(a, "force", False):
+        require_resume_not_quota_exhausted(a.run_id, store=a.store)
     # Hard gate, unlike the warnings below: a missing plugin host cannot run a
     # single rollout, so do not relaunch the detached process at all (#370).
     require_resume_host_on_path(a.run_id, store=a.store)
@@ -3802,8 +4227,9 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
         print(f"error: {err}", file=sys.stderr)
         print(f"next: fix {out}, then {obj['next']}")
         return 2
-    _out(payload, as_json=False)
-    print(f"next: {obj['next']}")
+    # Same human form as `plan`: init's `wrote ...` lines above, then the plan
+    # summary with `next:` last -- never the JSON document (#919).
+    _print_plan(payload, spec_path=out, next_line=obj["next"], printed=printed)
     calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
     if (getattr(a, "rounds", None) is None and getattr(a, "workers", None) is None
             and isinstance(calls, (int, float)) and calls > QUICK_TRIAL_CALLS):
@@ -3833,6 +4259,16 @@ def cmd_diagnose(a: argparse.Namespace) -> int:
         _out(report.to_dict(), as_json=True)
         return 0
     print(f"{report.verdict}: {report.summary}")
+    # #843: the verdict talks about "the reward" without saying which set it
+    # came from. `diagnose` is the command a person runs to understand a run, so
+    # it has to name it -- select set, or select + test when the run split one.
+    try:
+        result = runstore.get(report.run_id, store=a.store).result()
+    except Exception:  # noqa: BLE001 - the diagnosis must still print
+        result = None
+    if result is not None:
+        print(reward_set_line(result.final_reward,
+                              getattr(result, "test_reward", None)))
     if report.evidence:
         print("evidence:", json.dumps(report.evidence, default=str)[:1200])
     for line in report.recommendations:
@@ -4906,7 +5342,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("demo", help="build a complete example and run it, offline")
-    s.add_argument("--dir", help="where to build it (default: a temp directory)")
+    s.add_argument("--dir", help="where to build it, and keep it "
+                   "(default: a temp directory, removed at exit)")
     s.add_argument("--kind", choices=("skill_dir", "text", "skill_library"),
                    help="demo fixture (default: skill_dir, or text when "
                         "--algorithm is a text-only card)")
@@ -5009,14 +5446,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("run_id", nargs="?")
     s.add_argument("--to", help="a different destination than the spec's target "
                    "(required with --from)")
-    s.add_argument("--install-to", dest="install_to", metavar="PATH",
+    s.add_argument("--install-to", dest="install_to", metavar="HOST|PATH",
                    help="install a skill_library (or any FileTree result) into a "
-                        "host skills root such as ~/.claude/skills; same write/"
-                        "backup semantics as --to (do not silently prune unrelated "
-                        "host skills). Alias of --to when --to is omitted")
+                        "host skills root: pass a host name/alias (claude-code/"
+                        "claude -> ~/.claude/skills, codex -> ~/.codex/skills, "
+                        "opencode -> ~/.config/opencode/skill, dsh/"
+                        "deepseek-harness -> ~/.dsh/skills, grok-bot/grok -> "
+                        "exits 2 with manual user-skill instructions without "
+                        "writing) or any directory path; same write/backup "
+                        "semantics as --to without pruning unrelated host skills")
     s.add_argument("--from", dest="source", metavar="PATH",
                    help="install an artifact from disk (e.g. a campaign's "
                    "final_target) instead of a run's result")
+    s.add_argument("--home", help="the host's home directory when --install-to "
+                   "names a host (default: the real home + host env vars)")
     s.add_argument("--dry-run", action="store_true", dest="dry_run")
     s.add_argument("--no-backup", action="store_true", dest="no_backup")
     s.set_defaults(fn=cmd_apply)
@@ -5029,6 +5472,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("run_id")
     s.add_argument("--budget", type=float)
     s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.add_argument("--force", action="store_true",
+                   help="resume even when the run failed on a spent provider quota (#926)")
     s.set_defaults(fn=cmd_resume)
 
     s = sub.add_parser("portfolio",

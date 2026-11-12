@@ -22,8 +22,8 @@ from agentdescent.aggregator import Aggregator, AggregatorConfig
 from agentdescent.defaults import DefaultAcceptance
 from agentdescent.evolvable import Diff, EvidenceCard
 from agentdescent.evolution import Task
-from agentdescent.falsification import (
-    FalsificationAcceptance, ProbeContext, ProbePartitions, append_provenance,
+from agentdescent.acceptance import (
+    FalsificationAcceptance, ProbeContext, ProbePartitions,
 )
 from agentdescent.ledger import Ledger
 from agentdescent.policies import AcceptDecision, MergeContext
@@ -195,13 +195,21 @@ def test_the_aggregator_populates_probes_only_for_a_policy_that_needs_them(tmp_p
     assert default._probe_context() is None
 
 
-def test_provenance_sidecar_is_written_beside_the_ledger(tmp_path):
-    ledger = Ledger(str(tmp_path / "repo"), serialize=lambda a: {"state": {}},
-                    deserialize=lambda aid, v, d: None)
-    path = append_provenance(ledger, "lesson", {
-        "rule_id": "d-1", "precondition": "p", "behavior_change": ["rule"],
-        "expected_effect": {"base": 0.0, "candidate": 0.5},
-        "verifier": "falsification-probes:v1", "trace_ids": [],
-        "evidence_card_hash": "abc"})
-    assert path.endswith("provenance/lesson.json")
-    assert "d-1" in open(path, encoding="utf-8").read()
+def test_the_commit_record_is_the_shape_the_shared_writer_takes():
+    """The gate produces the record; the *writer* belongs to #966.
+
+    ``agentdescent.falsification.append_provenance`` keeps records under
+    ``<ledger>/.git/provenance/`` and requires only a ``rule_id``; its own
+    behaviour is tested in ``tests/test_provenance_outside_worktree.py``. What
+    is asserted here is only that the aggregator hands it a usable record --
+    a mapping with a stable ``rule_id`` -- so the two halves meet.
+    """
+    probes = _probes({
+        "base": {"tgt-1": 0.0, "tgt-2": 0.0, "fal-1": 0.0, "fal-2": 1.0,
+                 "arc-1": 1.0, "arc-2": 1.0},
+        "cand": {"tgt-1": 1.0, "tgt-2": 0.0, "fal-1": 0.0, "fal-2": 1.0,
+                 "arc-1": 1.0, "arc-2": 1.0},
+    })
+    record = _policy().accept(_ctx(probes)).provenance
+    assert isinstance(record, dict)
+    assert isinstance(record["rule_id"], str) and record["rule_id"]

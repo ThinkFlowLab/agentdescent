@@ -141,6 +141,11 @@ class RunStatus:
     #: Held-out reward of the seed before round 0 (#708). ``None`` until the
     #: run finishes scoring it, or when seed scoring failed / predates the field.
     initial_reward: Optional[float] = None
+    #: Reward on the test split the run carved out with ``test_frac`` (#843).
+    #: ``None`` for a run with no split, or one whose test scoring failed -- so
+    #: ``show`` can say "select set only" instead of inventing a number. Never
+    #: read by a merge decision.
+    test_reward: Optional[float] = None
     committed: int = 0
     #: ``propose`` calls that raised, summed over the rounds so far (#395), and
     #: the first such exception as ``Type: message``. Non-zero with
@@ -897,6 +902,7 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
         stop_reason=result.stop_reason, error=result.error,
         best_reward=max(best) if best else final,
         last_reward=final, initial_reward=initial,
+        test_reward=_finite_or_none(getattr(result, "test_reward", None)),
         calls=usage.calls, pending_calls=0, phase=None,
         usd=None if usd_per_call is None else round(usage.calls * usd_per_call, 4))
     return result
@@ -1042,8 +1048,9 @@ def _http_handler(store: Optional[str], event_poll: float):
             by the run's own process, so no in-process event bus is needed and
             the server keeps its single read-only boundary.
 
-            Event ids are the round index, so a reconnecting client can send
-            ``Last-Event-ID`` and resume after the last round it saw.
+            Event ids are the 0-based append ordinal in ``rounds.jsonl``, so a
+            reconnecting client can send ``Last-Event-ID`` and resume after the
+            last event it saw.
             """
             try:
                 rd = get(run_id, store=store)
@@ -1054,7 +1061,7 @@ def _http_handler(store: Optional[str], event_poll: float):
             raw_id = self.headers.get("Last-Event-ID")
             if raw_id:
                 try:
-                    last_id = int(raw_id)
+                    last_id = max(-1, int(raw_id))
                 except ValueError:
                     last_id = -1
 
@@ -1096,11 +1103,10 @@ def _http_handler(store: Optional[str], event_poll: float):
                     if state.state != last_state:
                         emit("status", state.to_dict())
                         last_state = state.state
-                    for row in rd.rounds():
-                        index = row.get("round")
-                        if isinstance(index, int) and index > last_id:
-                            emit("round", row, index)
-                            last_id = index
+                    for seq, row in enumerate(rd.rounds()):
+                        if seq > last_id:
+                            emit("round", row, seq)
+                            last_id = seq
                     if state.state in ("done", "failed", "cancelled"):
                         self.close_connection = True
                         return

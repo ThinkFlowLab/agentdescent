@@ -7,7 +7,7 @@ verdict change on the falsification partition; each reject reason
 (`no-target-transfer`, `archived-regression`, `falsification-moved`) names the
 failing task ids. Probes are caller-supplied (`MergeContext.probes`), and when they
 are unavailable the policy defers (`AcceptDecision(defer=True)`) rather than falling
-back to the count-only gate. A committed lesson writes one provenance record per
-rule id beside the ledger, after `Ledger.commit`, with
-`rule_id -> {precondition, behavior_change, expected_effect, verifier, trace_ids,
-evidence_card_hash}` (#938).
+back to the count-only gate. A committed lesson hands its review evidence
+(`rule_id -> {precondition, behavior_change, expected_effect, verifier, trace_ids,
+evidence_card_hash}`) to the shared provenance writer as
+`AcceptDecision.provenance` (#938).

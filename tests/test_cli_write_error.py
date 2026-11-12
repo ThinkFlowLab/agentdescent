@@ -132,40 +132,23 @@ def test_a_writable_destination_still_writes_the_same_bytes(tmp_path, capsys):
     assert dest.read_text(encoding="utf-8") == "evolved rule\n"
 
 
-def _make_unwritable(path):
-    """Make a prepared directory refuse a new file, whatever creates it.
-
-    ``chmod`` is the portable way to make a directory refuse ``copyfile``, and
-    root ignores it, so probe once and skip the case the platform cannot
-    express. Call after the files the test needs already exist.
-    """
-    os.chmod(path, 0o500)
-    try:
-        (path / "probe").write_text("x", encoding="utf-8")
-    except OSError:
-        return
-    os.chmod(path, 0o700)
-    pytest.skip("running as a uid that ignores directory permissions")
-
-
 @pytest.mark.parametrize("as_json", MODES)
-def test_init_over_an_existing_spec_in_a_read_only_dir(tmp_path, capsys, as_json):
-    """The backup copy runs before the wrapped ``open(out)`` (#994)."""
-    proj = tmp_path / "proj-ro"
+def test_init_over_an_existing_spec_that_cannot_be_backed_up(tmp_path, capsys,
+                                                            as_json):
+    """The ``.bak-N`` copy runs before the wrapped ``open(out)`` (#994).
+
+    A 250-character file name is legal and its ``.bak-0`` sibling is 256, over
+    ``NAME_MAX``, so the backup is refused structurally: no permissions, no
+    uid, and the case cannot turn into a skip in a root CI leg.
+    """
+    proj = tmp_path / "proj-bak"
     proj.mkdir()
     (proj / "rule.md").write_text("Be helpful.\n", encoding="utf-8")
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    out = ro / "spec.json"
+    out = tmp_path / ("s" * 250)
     out.write_text('{"stale": true}\n', encoding="utf-8")
-    _make_unwritable(ro)
-    try:
-        code = cli.main(_argv(as_json, "init", str(proj), "--out", str(out),
-                              "--model", "echo"))
-        _assert_refusal(capsys, as_json, path=out)
-        assert code == 2
-    finally:
-        os.chmod(ro, 0o700)
+    assert cli.main(_argv(as_json, "init", str(proj), "--out", str(out),
+                          "--model", "echo")) == 2
+    _assert_refusal(capsys, as_json, path=out)
 
 
 @pytest.mark.parametrize("as_json", MODES)

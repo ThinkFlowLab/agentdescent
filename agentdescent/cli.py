@@ -666,10 +666,8 @@ def _demo_offline_algorithms() -> Tuple[str, ...]:
     return demo_mod.OFFLINE_ALGORITHMS
 
 
-def cmd_demo(a: argparse.Namespace) -> int:
-    """Build a complete example and run it, so the first thing seen works."""
-    import tempfile
-
+def _demo_algorithm(a: argparse.Namespace) -> Optional[str]:
+    """Resolve `demo --algorithm` / `--kind` before any directory exists."""
     from . import algorithms
     from . import demo as demo_mod
 
@@ -693,27 +691,52 @@ def cmd_demo(a: argparse.Namespace) -> int:
         demo_mod.resolve_demo_kind(algo, getattr(a, "kind", None))
     except ValueError as e:
         raise SpecError(str(e)) from None
+    return algo
+
+
+def cmd_demo(a: argparse.Namespace) -> int:
+    """Build a complete example and run it, so the first thing seen works."""
+    import shutil
+    import tempfile
+
+    # #906: validate first, so a refused demo leaves no directory behind.
+    algo = _demo_algorithm(a)
     root = os.path.abspath(os.path.expanduser(a.dir)) if a.dir else tempfile.mkdtemp(
         prefix="agentdescent-demo-")
     os.makedirs(root, exist_ok=True)
+    # A bare demo's root lives only for this run. `--dir` is the user keeping
+    # it; `--json` hands the path to a host that reads it after exit.
+    keep = bool(a.dir) or bool(getattr(a, "json", False))
+    try:
+        return _run_demo(a, root, keep, algo)
+    finally:
+        if not keep:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def _run_demo(a: argparse.Namespace, root: str, keep: bool,
+              algo: Optional[str]) -> int:
+    from . import demo as demo_mod
+
     try:
         spec_dict = demo_mod.build(root, algorithm=algo, kind=getattr(a, "kind", None))
     except ValueError as e:
         raise SpecError(str(e)) from None
     kind = spec_dict["kind"]
+    where = root if keep else f"{root} (removed at exit)"
 
     as_json = getattr(a, "json", False)
     if not as_json:
         if kind == "text":
             prompt_path = os.path.join(root, "prompt.txt")
-            print(f"A text prompt that totals a CSV column, in {root}")
+            print(f"A text prompt that totals a CSV column, in {where}")
             print(f"  prompt.txt   ->  {open(prompt_path).read().strip()!r}   "
                   f"(wrong: `id` is a row number)")
             print("  cases.jsonl  ->  12 prompts with embedded CSVs and known totals")
         elif kind == "skill_library":
             csv_rules = os.path.join(root, "csv-total", "references", "rules.md")
             date_rules = os.path.join(root, "date-parse", "references", "rules.md")
-            print(f"A two-skill library (csv-total + date-parse), in {root}")
+            print(f"A two-skill library (csv-total + date-parse), in {where}")
             print(f"  csv-total/references/rules.md   ->  "
                   f"{open(csv_rules).read().strip()!r}   (wrong: `id` is a row number)")
             print(f"  date-parse/references/rules.md  ->  "
@@ -722,7 +745,7 @@ def cmd_demo(a: argparse.Namespace) -> int:
         else:
             skill = os.path.join(root, demo_mod.DEMO_SKILL)
             rules = os.path.join(skill, "references", "rules.md")
-            print(f"A skill that totals a column of a CSV, in {root}")
+            print(f"A skill that totals a column of a CSV, in {where}")
             print(f"  {demo_mod.DEMO_SKILL}/references/rules.md  ->  "
                   f"{open(rules).read().strip()!r}   (wrong: `id` is a row number)")
             print("  cases.jsonl                        ->  12 CSVs with known totals")
@@ -5113,7 +5136,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("demo", help="build a complete example and run it, offline")
-    s.add_argument("--dir", help="where to build it (default: a temp directory)")
+    s.add_argument("--dir", help="where to build it, and keep it "
+                   "(default: a temp directory, removed at exit)")
     s.add_argument("--kind", choices=("skill_dir", "text", "skill_library"),
                    help="demo fixture (default: skill_dir, or text when "
                         "--algorithm is a text-only card)")

@@ -66,6 +66,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
+from .manifest import redact as _redact
 from .replay_fidelity import ReplayFidelity
 
 __all__ = [
@@ -215,7 +216,11 @@ class Trajectory:
             "worker_id": self.worker_id,
             "events": [e.to_dict() for e in self.events],
             "ts": self.ts,
-            "replay": None if self.replay is None else self.replay.to_dict(),
+            # Redacted like the manifest's copy (#952): the store writes this
+            # dict to disk, and a credential that the manifest redacts must not
+            # survive verbatim in the trajectory record.
+            "replay": (None if self.replay is None
+                       else _redact(self.replay.to_dict())),
         }
 
     @classmethod

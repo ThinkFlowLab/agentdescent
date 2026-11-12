@@ -281,6 +281,11 @@ class ReplayLab:
                                     delta=delta, cost=cost, detail=detail)
 
     def leave_one_out(self, trace: ReplayTrace) -> CounterfactualReport:
+        # Guarded here and not only through `counterfactual()`: an empty trace
+        # never reaches that call, and it used to return a report from an
+        # ineligible manifest -- the gate has to hold on every entry point
+        # (#952 Security review).
+        self._require_replayable()
         base = self.baseline(trace)
         results = []
         for step in trace.steps:

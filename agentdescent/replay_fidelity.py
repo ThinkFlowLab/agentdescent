@@ -54,15 +54,19 @@ __all__ = [
     "rng_digest",
 ]
 
-#: Environment variable names whose **values** may affect a run and whose
-#: *hashes* are therefore worth recording. Chosen for determinism, not
-#: convenience: the hash seed changes dict/set iteration, ``PYTHONPATH`` decides
-#: which code is imported at all, the locale changes sorting and number
-#: formatting, ``TZ`` changes timestamps a prompt may contain, and the thread
-#: counts change floating-point reduction order in numeric workloads. Nothing
-#: provider- or credential-shaped belongs here -- and
-#: :meth:`EnvironmentFingerprint.capture` refuses such a name even if a caller
-#: passes it explicitly, so a future edit to this tuple cannot leak one.
+#: Environment variable names whose **presence** may affect a run, and which are
+#: therefore recorded as names. Chosen for determinism, not convenience: the
+#: hash seed changes dict/set iteration, ``PYTHONPATH`` decides which code is
+#: imported at all, the locale changes sorting and number formatting, ``TZ``
+#: changes timestamps a prompt may contain, and the thread counts change
+#: floating-point reduction order in numeric workloads.
+#:
+#: Names only, never values -- not even hashed (Security review, #952). A
+#: four-entry dictionary recovered a ``TZ`` value offline from the old sha256
+#: digests, and any candidate value confirms by ``sha256()``, so a digest of a
+#: value is value material. :meth:`EnvironmentFingerprint.capture` also
+#: intersects the caller's list with this tuple, so no caller can widen it, and
+#: still drops credential-shaped names.
 REPLAY_ENV_ALLOWLIST: Tuple[str, ...] = (
     "LANG",
     "LC_ALL",
@@ -122,9 +126,16 @@ def _digest_field(value: Any, label: str) -> str:
 
 
 def _names(names: Iterable[str]) -> Tuple[str, ...]:
-    """Allowlisted names minus anything credential-shaped, sorted and unique."""
+    """The allowlist, minus anything credential-shaped, sorted and unique.
+
+    The intersection is the point: a caller may narrow the set (pass one name)
+    but never widen it, so ``capture(env={"SESSION": tok}, env_names=("SESSION",))``
+    drops the name instead of recording anything derived from the token.
+    """
+    allowed = set(REPLAY_ENV_ALLOWLIST)
     cleaned = {n for n in names
-               if isinstance(n, str) and n and not _SECRET_NAME.search(n)}
+               if isinstance(n, str) and n in allowed
+               and not _SECRET_NAME.search(n)}
     return tuple(sorted(cleaned))
 
 
@@ -132,8 +143,9 @@ def _names(names: Iterable[str]) -> Tuple[str, ...]:
 class EnvironmentFingerprint:
     """The environment a run happened in, as far as it is safe to record it.
 
-    ``env_hashes`` maps an allowlisted variable **name** to the sha256 of its
-    value; the value itself is never stored. ``missing_env`` names allowlisted
+    ``env_names`` is the sorted allowlist of variables that were **present**,
+    and ``env_count`` is how many there were (Security review, #952: names and a
+    count, never values, hashed or otherwise). ``missing_env`` names allowlisted
     variables that were unset, so two shells that differ only by an absent
     variable are still distinguishable. Tool versions are the caller's claim (the
     engine does not shell out): pass the versions it actually resolved.
@@ -143,8 +155,13 @@ class EnvironmentFingerprint:
     python: str
     platform: str
     tools: Mapping[str, str] = field(default_factory=dict)
-    env_hashes: Mapping[str, str] = field(default_factory=dict)
+    env_names: Tuple[str, ...] = ()
     missing_env: Tuple[str, ...] = ()
+
+    @property
+    def env_count(self) -> int:
+        """How many allowlisted variables were present."""
+        return len(self.env_names)
 
     @classmethod
     def capture(
@@ -159,20 +176,19 @@ class EnvironmentFingerprint:
     ) -> "EnvironmentFingerprint":
         """Fingerprint this process (or the explicit values a caller supplies)."""
         environ = os.environ if env is None else env
-        hashes: Dict[str, str] = {}
+        present = []
         missing = []
         for name in _names(env_names):
-            if name not in environ:
-                missing.append(name)
-                continue
-            hashes[name] = _sha(str(environ[name]))
+            # Presence only: the value is never read, so it cannot be stored,
+            # hashed into a recoverable digest, or confirmed against a candidate.
+            (present if name in environ else missing).append(name)
         return cls(
             cwd=os.path.abspath(cwd if cwd is not None else os.getcwd()),
             python=python if python is not None else _platform.python_version(),
             platform=(platform_string if platform_string is not None
                       else _platform.platform()),
             tools=dict(tools or {}),
-            env_hashes=hashes,
+            env_names=tuple(present),
             missing_env=tuple(missing),
         )
 
@@ -182,7 +198,8 @@ class EnvironmentFingerprint:
             "python": self.python,
             "platform": self.platform,
             "tools": dict(self.tools),
-            "env_hashes": dict(self.env_hashes),
+            "env_names": list(self.env_names),
+            "env_count": self.env_count,
             "missing_env": list(self.missing_env),
         }
 
@@ -193,7 +210,7 @@ class EnvironmentFingerprint:
             python=str(d.get("python", "")),
             platform=str(d.get("platform", "")),
             tools=dict(d.get("tools") or {}),
-            env_hashes=dict(d.get("env_hashes") or {}),
+            env_names=tuple(d.get("env_names") or ()),
             missing_env=tuple(d.get("missing_env") or ()),
         )
 
@@ -206,9 +223,10 @@ class EnvironmentFingerprint:
         for tool in sorted(set(self.tools) | set(other.tools)):
             if self.tools.get(tool) != other.tools.get(tool):
                 changed.append(f"environment:tool:{tool}")
-        for var in sorted(set(self.env_hashes) | set(other.env_hashes)):
-            if self.env_hashes.get(var) != other.env_hashes.get(var):
-                changed.append(f"environment:env:{var}")
+        if self.env_count != other.env_count:
+            changed.append("environment:env_count")
+        for var in sorted(set(self.env_names) ^ set(other.env_names)):
+            changed.append(f"environment:env:{var}")
         for var in sorted(set(self.missing_env) | set(other.missing_env)):
             if (var in self.missing_env) != (var in other.missing_env):
                 changed.append(f"environment:missing:{var}")

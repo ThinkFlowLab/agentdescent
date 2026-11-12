@@ -5076,7 +5076,7 @@ EnvironmentFingerprint(
     python: str,
     platform: str,
     tools: Mapping[str, str] = <factory>,
-    env_hashes: Mapping[str, str] = <factory>,
+    env_names: Tuple[str, ...] = (),
     missing_env: Tuple[str, ...] = ()
 ) -> None
 ```
@@ -5570,7 +5570,7 @@ How a rollout becomes candidate changes.
 
 ### `REPLAY_ENV_ALLOWLIST`
 
-Environment variable names whose **values** may affect a run and whose *hashes* are therefore worth recording. Chosen for determinism, not convenience: the hash seed changes dict/set iteration, `PYTHONPATH` decides which code is imported at all, the locale changes sorting and number formatting, `TZ` changes timestamps a prompt may contain, and the thread counts change floating-point reduction order in numeric workloads. Nothing provider- or credential-shaped belongs here -- and `capture` refuses such a name even if a caller passes it explicitly, so a future edit to this tuple cannot leak one.
+Environment variable names whose **presence** may affect a run, and which are therefore recorded as names. Chosen for determinism, not convenience: the hash seed changes dict/set iteration, `PYTHONPATH` decides which code is imported at all, the locale changes sorting and number formatting, `TZ` changes timestamps a prompt may contain, and the thread counts change floating-point reduction order in numeric workloads. Names only, never values -- not even hashed (Security review, #952). A four-entry dictionary recovered a `TZ` value offline from the old sha256 digests, and any candidate value confirms by `sha256()`, so a digest of a value is value material. `capture` also intersects the caller's list with this tuple, so no caller can widen it, and still drops credential-shaped names.
 
 ### `ROUTE_SEED`
 

@@ -58,6 +58,13 @@ def redact(value: Any) -> Any:
     if isinstance(value, str):
         text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1<redacted>", value)
         text = re.sub(r"(?i)(api[_-]?key=)[^&\s]+", r"\1<redacted>", text)
+        # `--token=…` / `secret=…` / `password=…` (the replay record carries DSNs
+        # and command lines, #952): the generic shapes above miss a value whose
+        # alphabet includes '-', so key=value on a credential-shaped name is the
+        # rule that actually covers them.
+        text = re.sub(
+            r"(?i)\b(token|secret|password|passwd|api[_-]?key|access[_-]?key|auth)"
+            r"=([^&\s]+)", r"\1=<redacted>", text)
         text = re.sub(r"\bsk-[A-Za-z0-9]{6,}\b", "<redacted>", text)
         return text
     return value
@@ -222,7 +229,11 @@ def build_manifest(spec: Any, *, data_paths: Sequence[str] = (),
     else:
         replay_eligible = replay.eligible
         replay_notes = replay.notes()
-        replay_record = replay.to_dict()
+        # Redacted like `model_config` / `extra` above: the record carries tool
+        # command lines and paths, and a token that appears `"<redacted>"` in one
+        # serialized form and verbatim in another is worse than no redaction --
+        # it reads as safe (#952 Security review).
+        replay_record = redact(replay.to_dict())
     return RunManifest(
         manifest_id=_sha(_canonical(fields)), spec_hash=spec_hash,
         data_hash=data_hash, model_hash=model_hash,

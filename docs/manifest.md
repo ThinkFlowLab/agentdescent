@@ -59,10 +59,11 @@ manifest.replay_notes      # what is missing, in words
 ```
 
 - **Environment** is `EnvironmentFingerprint`: cwd, interpreter, OS, the tool
-  versions the caller resolved, and the **sha256 of the values** of an allowlisted
-  set of variables — `PYTHONHASHSEED`, `PYTHONPATH`, `LANG`, `LC_ALL`, `TZ`,
-  `OMP_NUM_THREADS`. Values are never stored, and a name that looks like a
-  credential is refused even when a caller passes it explicitly.
+  versions the caller resolved, and the **names** of the allowlisted environment
+  variables that were present plus their count -- `PYTHONHASHSEED`, `PYTHONPATH`,
+  `LANG`, `LC_ALL`, `TZ`, `OMP_NUM_THREADS`. No value material is stored, hashed
+  or otherwise; a caller cannot widen the allowlist, and a name that looks like a
+  credential is refused even when passed explicitly.
 - **RNG** is one `RngRecord` per interaction boundary; `rng_digest()` refuses to
   build one from neither a seed nor a state summary, because "captured nothing"
   must not be recorded as if it were captured.

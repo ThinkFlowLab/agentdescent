@@ -6,8 +6,9 @@ counterfactual claim made from such a record overstates what is reconstructible,
 and a "same run" comparison can silently change the environment underneath the
 score. These tests pin the contract that closes that gap:
 
-* the environment fingerprint stores *hashes* of allowlisted variables, never
-  values, and refuses a secret-shaped name even when a caller asks for it;
+* the environment fingerprint stores the allowlisted *names* that were present
+  and their count -- never a value, hashed or not -- refuses a secret-shaped
+  name even when a caller asks for it, and lets no caller widen the allowlist;
 * an RNG boundary digest needs a seed or a state summary -- no guessing;
 * a record with an uncaptured source is not eligible, and says what it missed;
 * a manifest without a capture is ``replay_eligible=False`` with a reason and
@@ -18,7 +19,9 @@ score. These tests pin the contract that closes that gap:
   was not reconstructed, and leaves ``baseline`` (not a claim) working.
 """
 
+import hashlib
 import json
+import re
 
 import pytest
 
@@ -67,47 +70,100 @@ def _trace(*weights, trace_id="t"):
 # -- the capture itself ------------------------------------------------------
 
 
-def test_environment_values_are_stored_only_as_hashes():
+def test_the_environment_is_recorded_as_names_and_a_count_only():
     fingerprint = _fingerprint()
-    assert set(fingerprint.env_hashes) == {"LANG", "PYTHONHASHSEED"}
-    assert all(len(v) == 64 and v.isalnum() for v in fingerprint.env_hashes.values())
-    assert "0" not in fingerprint.env_hashes.values()
-    assert fingerprint.env_hashes["PYTHONHASHSEED"] != fingerprint.env_hashes["LANG"]
+    assert fingerprint.env_names == ("LANG", "PYTHONHASHSEED")
+    assert fingerprint.env_count == 2
+    # No value material anywhere in the serialized fingerprint: no 64-hex
+    # digest of a value (the old shape) and no literal value either.
+    dumped = json.dumps(fingerprint.to_dict(), sort_keys=True)
+    assert "C.UTF-8" not in dumped
+    assert not re.search(r"[0-9a-f]{64}", dumped)
 
 
-def test_the_same_environment_fingerprints_identically_and_a_change_is_named():
+def test_a_value_change_is_no_longer_detected_only_a_name_change_is():
+    """The accepted tradeoff (#952): the fingerprint is names + count.
+
+    A value change cannot be detected without recording value material, so it
+    is not detected. A name appearing or disappearing still is.
+    """
     one = _fingerprint()
     assert EnvironmentFingerprint.capture(
         cwd="/work", tools={"pytest": "9.2.0"},
         env={"PYTHONHASHSEED": "0", "LANG": "C.UTF-8"},
         platform_string="Linux-test", python="3.10.12") == one
-    moved = _fingerprint(PYTHONHASHSEED="1")
-    assert moved.diff(one) == ("environment:env:PYTHONHASHSEED",)
+    assert _fingerprint(PYTHONHASHSEED="1").diff(one) == ()
+    moved = _fingerprint(TZ="UTC")
+    assert "environment:env:TZ" in moved.diff(one)
+    assert "environment:env_count" in moved.diff(one)
 
 
-def test_a_secret_value_can_never_appear_in_the_manifest(tmp_path):
+def test_a_secret_value_can_never_appear_in_any_replay_artifact(tmp_path):
+    """The sentinel is an **allowlisted** name, so nothing refuses it by name.
+
+    Today's older test planted the token under a *refused* name and would pass
+    even with the value leaking through a different path. Here `LANG` is on the
+    allowlist and present: the only reason the sentinel can be absent is that no
+    writer keeps value material.
+    """
     token = "sk-live-939-do-not-store"
-    env = {"OPENAI_API_KEY": token, "PYTHONHASHSEED": "0", "LANG": "C.UTF-8"}
-    # Not allowlisted -> never read.
+    env = {"PYTHONHASHSEED": "0", "LANG": token}
     fingerprint = EnvironmentFingerprint.capture(
-        cwd="/work", tools={}, env=env, platform_string="Linux-test",
-        python="3.10.12")
-    assert "OPENAI_API_KEY" not in fingerprint.env_hashes
-    # ...and not even when a caller puts it on the list explicitly.
-    refused = EnvironmentFingerprint.capture(
         cwd="/work", tools={}, env=env,
-        env_names=("OPENAI_API_KEY", "PYTHONHASHSEED"),
         platform_string="Linux-test", python="3.10.12")
-    assert "OPENAI_API_KEY" not in refused.env_hashes
-    assert set(refused.env_hashes) == {"PYTHONHASHSEED"}
+    assert fingerprint.env_names == ("LANG", "PYTHONHASHSEED")
+    assert token not in json.dumps(fingerprint.to_dict(), sort_keys=True)
 
+    # Not allowlisted -> dropped; and a caller passing it explicitly cannot
+    # widen the allowlist either.
+    widened = EnvironmentFingerprint.capture(
+        cwd="/work", tools={}, env={**env, "SESSION": token},
+        env_names=("SESSION", "LANG", "PYTHONHASHSEED"),
+        platform_string="Linux-test", python="3.10.12")
+    assert "SESSION" not in widened.env_names
+    assert widened.env_names == ("LANG", "PYTHONHASHSEED")
+
+    # A tool version string is caller-supplied text and the fingerprint keeps it
+    # verbatim; the manifest's redaction is the layer that removes a credential
+    # from it, so plant the token there and assert over the writers below.
+    tool_fingerprint = EnvironmentFingerprint.capture(
+        cwd="/work", tools={"api_key": token}, env=env,
+        platform_string="Linux-test", python="3.10.12")
     spec, data = _spec(tmp_path)
+    replay = ReplayFidelity.capture(
+        environment=tool_fingerprint,
+        rng=(RngRecord("start", rng_digest(seed="0")),))
     manifest = build_manifest(
         spec, data_paths=[str(data)], code_version="1",
         model_config={"model": "m", "api_key": token},
-        replay=ReplayFidelity.capture(
-            environment=_fingerprint(), rng=(RngRecord("start", rng_digest(seed="0")),)))
-    assert token not in json.dumps(manifest.to_dict(), sort_keys=True)
+        replay=replay)
+    trajectory = Trajectory(artifact_id="a", task_id="t", env_fingerprint="env",
+                            rendered="r", output="ok", reward=1.0, replay=replay)
+    # Every writer the replay path goes through, named from the code:
+    # RunManifest.to_dict(), the record it embeds, Trajectory.to_dict(), and
+    # TrajectoryStore's on-disk JSON (it dumps `payload.to_dict()`).
+    artifacts = [json.dumps(manifest.to_dict(), sort_keys=True),
+                 json.dumps(manifest.replay, sort_keys=True),
+                 json.dumps(trajectory.to_dict(), sort_keys=True)]
+    store = TrajectoryStore(str(tmp_path / "traj"))
+    assert store.record(trajectory)
+    written = "".join(p.read_text(encoding="utf-8")
+                      for p in (tmp_path / "traj").rglob("*") if p.is_file())
+    artifacts.append(written)
+    # The digest half is the one that fails at 3f2afa06: the value was stored as
+    # a sha256, so a literal-only assertion would pass while the leak stood.
+    sentinel_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    for text in artifacts:
+        assert token not in text
+        # The specific leak Security demonstrated: a sha256 of the value is a
+        # recoverable confirmation oracle even after the value is removed.
+        assert sentinel_digest not in text
+        # And no fingerprint-shaped digest of *any* environment value: the
+        # replay record must not carry an `env_hashes` map at all.
+        record = json.loads(text)
+        replay = record.get("replay") or {}
+        env = replay.get("environment") or {}
+        assert "env_hashes" not in env
 
 
 def test_an_rng_boundary_needs_a_seed_or_a_state_summary():
@@ -215,6 +271,20 @@ def test_a_counterfactual_is_refused_when_the_manifest_is_not_replay_eligible(tm
         lab.shapley(trace)
 
 
+def test_leave_one_out_is_refused_even_when_the_trace_has_no_steps(tmp_path):
+    """The guard cannot live only inside `counterfactual()` (#952).
+
+    An empty trace never reaches that call, so before the explicit guard this
+    returned a report built from a manifest that captured nothing.
+    """
+    spec, data = _spec(tmp_path)
+    lab = ReplayLab(_sum, manifest=build_manifest(
+        spec, data_paths=[str(data)], code_version="1"))
+    with pytest.raises(ReplayNotEligible) as refused:
+        lab.leave_one_out(ReplayTrace("empty", ()))
+    assert "not reconstructed" in str(refused.value)
+
+
 def test_an_eligible_manifest_allows_the_counterfactual(tmp_path):
     spec, data = _spec(tmp_path)
     lab = ReplayLab(_sum, manifest=build_manifest(
@@ -241,10 +311,10 @@ def test_replay_check_accepts_the_same_run_and_names_a_changed_environment():
     assert replay_check(captured, same) == ReplayCheck(ok=True)
     moved = Trajectory(artifact_id="a", task_id="t", env_fingerprint="env",
                        rendered="r", output="ok", reward=1.0,
-                       replay=_fidelity(PYTHONHASHSEED="1"))
+                       replay=_fidelity(TZ="UTC"))
     report = replay_check(captured, moved)
     assert report.ok is False
-    assert "environment:env:PYTHONHASHSEED" in report.changed
+    assert "environment:env:TZ" in report.changed
 
 
 def test_replay_check_reports_a_changed_verdict():

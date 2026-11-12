@@ -215,12 +215,15 @@ def test_cli_apply_install_to_local_collision_and_dot_slash_path(
     assert "./codex" in cap.err
     assert not (fake_home / ".codex" / "skills").exists()
 
-    # Explicit ./opencode never resolves to the OpenCode host root even if absent.
+    # Explicit ./opencode never resolves to the OpenCode host root even if absent,
+    # and passing --home for a path destination notes that --home was ignored.
     rc = main(["apply", "--from", str(evolved), "--install-to", "./opencode",
                "--home", str(fake_home), "--dry-run"])
     assert rc == 0
-    out2 = json.loads(capsys.readouterr().out)
+    cap2 = capsys.readouterr()
+    out2 = json.loads(cap2.out)
     assert out2["dest"] == str(work / "opencode")
+    assert "--home" in cap2.err
     assert not (fake_home / ".config" / "opencode").exists()
 
 
@@ -322,10 +325,37 @@ def test_resolve_apply_dest_host_to_parity_and_empty_home_refused(
     with pytest.raises(ValueError, match="unknown host"):
         host_skills_dir("emacs", home=str(fake_home))
 
+    # Tilde expansion + trailing slash normpath comparison against a resolved host.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    assert resolve_apply_dest("~/.codex/skills/", "codex") == str(codex_dir)
+    with pytest.raises(runstore.RunStoreError, match="disagree"):
+        resolve_apply_dest("~/.codex/other/", "codex")
+
     evolved = tmp_path / "evolved"
     (evolved / "alpha").mkdir(parents=True)
     (evolved / "alpha" / "SKILL.md").write_text("---\nname: alpha\n---\n")
     assert main(["apply", "--from", str(evolved), "--install-to", "codex",
                  "--home", "", "--dry-run"]) == 2
+
+
+def test_cli_apply_json_error_payload(tmp_path, monkeypatch, capsys):
+    """apply --json emits structured error JSON cleanly on CLI failures."""
+    from agentdescent.cli import main
+
+    evolved = tmp_path / "evolved"
+    (evolved / "alpha").mkdir(parents=True)
+    (evolved / "alpha" / "SKILL.md").write_text("---\nname: alpha\n---\n")
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(["--json", "apply", "--from", str(evolved), "--install-to", "grok-bot"])
+    assert rc == 2
+    cap = capsys.readouterr()
+    err_obj = json.loads(cap.out)
+    assert err_obj["ok"] is False
+    assert "ask Grok Bot to save" in err_obj["error"]
+    assert cap.err == ""
+
 
 

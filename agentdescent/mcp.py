@@ -670,7 +670,8 @@ class Tools:
         try:
             payload, notes, _ = apply_with_target(
                 run_id, to=to, install_to=install_to, source=source,
-                store=self.store, home=home, dry_run=dry_run, backup=backup)
+                store=self.store, home=home, dry_run=dry_run, backup=backup,
+                cli_flags=False)
             if notes:
                 existing = payload.get("notes")
                 payload["notes"] = (

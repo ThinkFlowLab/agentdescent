@@ -2575,7 +2575,7 @@ class GrokBotInstallError(runstore.RunStoreError):
     """Raised when ``--install-to`` targets ``grok-bot`` (read-only user skills)."""
 
 
-def _resolve_install_to(value: str, *, home: Optional[str]) -> Tuple[str, Optional[str]]:
+def _resolve_install_to(value: str, *, home: Optional[str]) -> Tuple[str, Optional[str], bool]:
     """Map a bare known host name/alias to its user skills root when unambiguous."""
     from .integrations import HOSTS, _resolve_home, canonical_host, host_skills_dir
 
@@ -2583,9 +2583,14 @@ def _resolve_install_to(value: str, *, home: Optional[str]) -> Tuple[str, Option
     if canonical in HOSTS:
         # Preserve local relative-path semantics if a same-named entry exists in cwd (#935).
         if os.path.lexists(value):
+            if home is not None:
+                try:
+                    _resolve_home(home)
+                except ValueError as e:
+                    raise runstore.RunStoreError(str(e)) from None
             return value, (
                 f"note: local path {value!r} exists in cwd; treating --install-to "
-                f"{value!r} as a path (pass ./{value} to silence)")
+                f"{value!r} as a path (pass ./{value} to silence)"), False
         try:
             skills_dir = host_skills_dir(canonical, home=home)
         except ValueError as e:
@@ -2594,13 +2599,13 @@ def _resolve_install_to(value: str, *, home: Optional[str]) -> Tuple[str, Option
             raise GrokBotInstallError(
                 "grok-bot does not allow direct writes ($AGENTDESCENT_GROK_BOT_SKILLS "
                 "is read-only); ask Grok Bot to save each SKILL.md as a user skill")
-        return skills_dir, f"install-to {value} -> {skills_dir}"
+        return skills_dir, f"install-to {value} -> {skills_dir}", True
     if home is not None:
         try:
             _resolve_home(home)
         except ValueError as e:
             raise runstore.RunStoreError(str(e)) from None
-    return value, None
+    return value, None, False
 
 
 def resolve_apply_dest(to: Optional[str], install_to: Optional[str], *,
@@ -2609,8 +2614,10 @@ def resolve_apply_dest(to: Optional[str], install_to: Optional[str], *,
     """Combine ``--to`` and ``--install-to``, resolving host names/aliases (#823, #935)."""
     resolved_install = None
     note = None
+    resolved_host = False
     if install_to:
-        resolved_install, note = _resolve_install_to(install_to, home=home)
+        resolved_install, note, resolved_host = _resolve_install_to(
+            install_to, home=home)
     elif home is not None:
         from .integrations import _resolve_home
         try:
@@ -2622,8 +2629,13 @@ def resolve_apply_dest(to: Optional[str], install_to: Optional[str], *,
                 os.path.expanduser(resolved_install)):
             raise runstore.RunStoreError(
                 f"--to {to!r} and --install-to {install_to!r} disagree; pass one")
-    if note and notes is not None:
-        notes.append(note)
+    if notes is not None:
+        if note:
+            notes.append(note)
+        if home is not None and not resolved_host:
+            notes.append(
+                "note: --home only applies when --install-to resolves to a host; "
+                "ignored for path destination")
     return resolved_install if install_to else to
 
 
@@ -2702,12 +2714,15 @@ def _grok_bot_apply_message(*, run_id: Optional[str] = None,
 def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
                       install_to: Optional[str] = None, source: Optional[str] = None,
                       store: Optional[str] = None, home: Optional[str] = None,
-                      dry_run: bool = False, backup: bool = True
+                      dry_run: bool = False, backup: bool = True,
+                      cli_flags: bool = True
                       ) -> Tuple[Dict[str, Any], List[str], str]:
     """Shared CLI + MCP entry point for ``apply`` (#823, #935)."""
     notes: List[str] = []
     if source and run_id:
-        raise runstore.RunStoreError("pass a run_id or from PATH, not both")
+        raise runstore.RunStoreError(
+            "pass a run_id or --from PATH, not both"
+            if cli_flags else "pass a run_id or from PATH, not both")
     try:
         dest = resolve_apply_dest(to, install_to, home=home, notes=notes)
     except GrokBotInstallError:
@@ -2717,12 +2732,16 @@ def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
     if source:
         if not dest:
             raise runstore.RunStoreError(
-                "from needs to/install_to PATH (where to install the artifact)")
+                "--from needs --to/--install-to PATH (where to install the artifact)"
+                if cli_flags
+                else "from needs to/install_to PATH (where to install the artifact)")
         return (apply_from_payload(source, to=dest, dry_run=dry_run, backup=backup),
                 notes, source)
     if not run_id:
         raise runstore.RunStoreError(
-            "apply needs a run_id, or --from PATH --to/--install-to PATH")
+            "apply needs a run_id, or --from PATH --to/--install-to PATH"
+            if cli_flags
+            else "apply needs a run_id, or from PATH and to/install_to PATH")
     return (apply_payload(run_id, to=dest, store=store, dry_run=dry_run, backup=backup),
             notes, f"run {run_id}")
 

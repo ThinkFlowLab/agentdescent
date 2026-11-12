@@ -699,27 +699,21 @@ def demo_payload(
                 f"{list(demo_mod.OFFLINE_ALGORITHMS)}. Run it for real with "
                 f"`agentdescent algorithms run {algo} <path> <cases.jsonl>` "
                 f"(`agentdescent algorithms show {algo}` for its parameters)")
-
-    resolved_kind = None
-    if kind is not None:
-        resolved_kind = resolve_kind(kind)
-        if resolved_kind not in ("text", "skill_dir"):
-            raise SpecError(
-                f"demo: kind {resolved_kind!r} has no offline fixture "
-                f"(offline kinds: ['skill_dir', 'text']); "
-                f"cards that need a real model go through `algorithm_spec`")
-        if algo is not None:
-            expected = ("text" if algo in demo_mod.OFFLINE_TEXT_ALGORITHMS
-                        else "skill_dir")
-            if resolved_kind != expected:
-                raise SpecError(
-                    f"demo: algorithm {algo!r} runs on the {expected} fixture, "
-                    f"not kind {resolved_kind!r}")
+    try:
+        demo_mod.resolve_demo_kind(algo, kind)
+    except ValueError as e:
+        # Keep the #905 MCP contract: a bad --kind is actionable from a host
+        # too, so name the offline fixtures beside the resolver's message.
+        raise SpecError(f"{e} (offline kinds: ['skill_dir', 'text', "
+                        "'skill_library'])") from None
 
     root = (os.path.abspath(os.path.expanduser(directory)) if directory
             else tempfile.mkdtemp(prefix="agentdescent-demo-"))
     os.makedirs(root, exist_ok=True)
-    spec_dict = demo_mod.build(root, algorithm=algo, kind=resolved_kind)
+    try:
+        spec_dict = demo_mod.build(root, algorithm=algo, kind=kind)
+    except ValueError as e:
+        raise SpecError(str(e)) from None
     used_kind = spec_dict["kind"]
 
     spec = EvolveSpec.from_dict(spec_dict)
@@ -731,7 +725,10 @@ def demo_payload(
     init = getattr(result, "initial_reward", None)
     learned = demo_mod.learned_summary(result.state, kind=used_kind)
     ok = result.final_reward >= 1.0
-    target = "<your-prompt.txt>" if used_kind == "text" else "<your-skill-dir>"
+    # #902: one list feeds both the human footer and --json.next, and with
+    # --algorithm NAME the "your own run" steps keep the algorithm just shown.
+    target = {"text": "<your-prompt.txt>",
+              "skill_library": "<your-skill-library>"}.get(used_kind, "<your-skill-dir>")
     if algo:
         own_steps = [
             f"agentdescent algorithms run {algo} {target} <your-cases.jsonl> "
@@ -742,6 +739,12 @@ def demo_payload(
     elif used_kind == "text":
         own_steps = [
             f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json",
+            "agentdescent doctor",
+            "agentdescent plan spec.json",
+        ]
+    elif kind == "skill_library":
+        own_steps = [
+            f"agentdescent init {target} --kind skill_library --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
             "agentdescent plan spec.json",
         ]
@@ -797,6 +800,15 @@ def _print_demo_human(payload: Dict[str, Any], *, store: Optional[str] = None) -
         print(f"  prompt.txt   ->  {open(prompt_path).read().strip()!r}   "
               f"(wrong: `id` is a row number)")
         print("  cases.jsonl  ->  12 prompts with embedded CSVs and known totals")
+    elif kind == "skill_library":
+        csv_rules = os.path.join(root, "csv-total", "references", "rules.md")
+        date_rules = os.path.join(root, "date-parse", "references", "rules.md")
+        print(f"A two-skill library (csv-total + date-parse), in {root}")
+        print(f"  csv-total/references/rules.md   ->  "
+              f"{open(csv_rules).read().strip()!r}   (wrong: `id` is a row number)")
+        print(f"  date-parse/references/rules.md  ->  "
+              f"{open(date_rules).read().strip()!r}   (wrong: date tasks ask for year)")
+        print("  cases.jsonl                      ->  12 tasks (CSV totals + date years)")
     else:
         skill = os.path.join(root, demo_mod.DEMO_SKILL)
         rules = os.path.join(skill, "references", "rules.md")
@@ -805,8 +817,9 @@ def _print_demo_human(payload: Dict[str, Any], *, store: Optional[str] = None) -
               f"{open(rules).read().strip()!r}   (wrong: `id` is a row number)")
         print("  cases.jsonl                        ->  12 CSVs with known totals")
     print("  the agent is a local program, so this costs nothing and needs no key")
-    print("  note: this is a smoke trajectory; for multi-round library edits see")
-    print("        python -m examples.skill_library_evolution  (#847)")
+    if kind != "skill_library":
+        print("  note: this is a smoke trajectory; for multi-round library edits see")
+        print("        agentdescent demo --kind skill_library")
     if algo:
         print(f"  algorithm: {algo}   (`agentdescent algorithms show {algo}`)")
     print()
@@ -852,6 +865,17 @@ The prompt on disk is untouched -- an evolved artifact only lands when you say s
 Your own run is the same shape with a real model instead of the offline pair:
 
 {own}""")
+    elif kind == "skill_library":
+        print(f"""
+The library on disk is untouched -- an evolved artifact only lands when you say so:
+
+  agentdescent show  {run_id}          the diff
+  agentdescent apply {run_id} --dry-run  what it would write
+
+Your own run is the same spec with three things changed -- your library, your
+cases.jsonl, and a real agent instead of the offline one:
+
+{own}""")
     else:
         print(f"""
 The skill on disk is untouched -- an evolved artifact only lands when you say so:
@@ -869,6 +893,7 @@ def cmd_demo(a: argparse.Namespace) -> int:
     """Build a complete example and run it, so the first thing seen works."""
     payload = demo_payload(
         getattr(a, "algorithm", None),
+        kind=getattr(a, "kind", None),
         directory=getattr(a, "dir", None),
         store=a.store,
     )
@@ -1325,10 +1350,10 @@ def write_starter_spec(
                 if spec["kind"] == "skill_library":
                     # #864 / #846: demo is skill_dir smoke; name the library card path.
                     report.append(("next",
-                                   "(`agentdescent demo --algorithm archive_selection` "
-                                   "is an offline skill_dir smoke; for this library "
-                                   "Path A card use --algorithm archive_selection — "
-                                   "see docs/quickstart-skill.md)"))
+                                   "(`agentdescent demo --kind skill_library` is "
+                                   "the offline library demo; `demo --algorithm "
+                                   "archive_selection` is a one-skill smoke of the "
+                                   "same card — see docs/quickstart-skill.md)"))
                 else:
                     report.append(("next", "(`agentdescent demo` runs a complete example, "
                                    "offline, to copy from)"))
@@ -3409,6 +3434,159 @@ def cmd_hgm(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_github(a: argparse.Namespace) -> int:
+    """``agentdescent github`` -- publish a proposal branch/PR or read a PR."""
+    from .github_surface import (
+        GitHubConfig, GitHubError, github_review, github_status, load_proposal,
+        publish_proposal,
+    )
+
+    action = getattr(a, "github_cmd", None)
+    try:
+        config = GitHubConfig(
+            a.owner, a.repo, base=a.base, token_env=a.token_env)
+        if action == "publish":
+            payload = publish_proposal(
+                config, load_proposal(a.proposal), dry_run=not a.apply)
+        elif action == "status":
+            payload = github_status(config, a.pr)
+        elif action == "review":
+            resolved = tuple(part.strip() for part in
+                             (getattr(a, "resolved", "") or "").split(",")
+                             if part.strip())
+            payload = github_review(config, a.pr, resolved_ids=resolved)
+        else:
+            raise GitHubError("github needs publish, status or review")
+    except (GitHubError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "publish":
+            print(f"dry_run: {payload['dry_run']}  branch: {payload['branch']}  "
+                  f"base: {payload['base']}")
+            for path in payload.get("files") or ():
+                print(f"file: {path}")
+            if payload.get("url"):
+                print(f"pull request: #{payload['pull_request']}  {payload['url']}")
+            if payload.get("head"):
+                print(f"head: {payload['head']}")
+            for step in payload.get("next") or ():
+                print(f"next: {step}")
+        elif action == "review":
+            counts = payload["reviews"]
+            print(f"#{payload['pull_request']}  {payload['title']}  "
+                  f"state={payload['state']}  draft={payload['draft']}")
+            print(f"reviews: approved={counts['approved']} "
+                  f"changes={counts['changes_requested']}  "
+                  f"checks={payload['checks_state']}")
+            for row in payload["constraints"]:
+                print(f"constraint: {row['severity']} {row['kind']} "
+                      f"({row['source']}) {row['text']}")
+            readiness = payload["merge_readiness"]
+            print(f"ready: {readiness['ready']}  "
+                  f"requires_human_click: {readiness['requires_human_click']}")
+            for blocker in readiness["blockers"]:
+                print(f"blocker: {blocker}")
+        else:
+            print(f"#{payload['pull_request']}  {payload['title']}  "
+                  f"state={payload['state']}  draft={payload['draft']}")
+            print(f"head={payload['head']}  base={payload['base']}  "
+                  f"mergeable={payload['mergeable']}")
+            for check in payload["checks"]:
+                print(f"check: {check['name']}  {check['status']}  "
+                      f"{check['conclusion']}")
+    return 0
+
+
+def cmd_harness(a: argparse.Namespace) -> int:
+    """``agentdescent harness`` -- inspect or enforce a harness manifest."""
+    from .harness_manifest import HarnessManifestError, load_manifest
+    from .surface_common import load_json
+
+    action = getattr(a, "harness_cmd", None)
+    try:
+        manifest = load_manifest(a.spec)
+        if action == "manifest":
+            payload = manifest.to_dict()
+            payload["tree"] = manifest.tree_kwargs()
+        elif action == "check":
+            changes = load_json(a.changes, name="changes")
+            payload = manifest.check(changes)
+        else:
+            raise HarnessManifestError("harness needs manifest or check")
+    except (HarnessManifestError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "manifest":
+            print(f"components: {len(payload['components'])}  "
+                  f"max_files: {payload['max_files']}  "
+                  f"max_lines: {payload['max_lines']}")
+            for row in payload["components"]:
+                print(f"{row['name']}  {row['responsibility']}  "
+                      f"editable={row['editable']}  frozen={row['frozen']}  "
+                      f"paths={','.join(row['paths'])}")
+            print(f"editable: {','.join(payload['tree']['editable'])}")
+            print(f"frozen: {','.join(payload['tree']['frozen'])}")
+        else:
+            print(f"ok: {payload['ok']}  files: {payload['files']}  "
+                  f"lines: {payload['lines']}")
+            for violation in payload["violations"]:
+                print(f"violation: {violation}")
+    if action == "check":
+        return 0 if payload["ok"] else 1
+    return 0
+
+
+def cmd_skills(a: argparse.Namespace) -> int:
+    """``agentdescent skills`` -- report, audit or search a skill bank."""
+    from .skill_bank import SkillBank, SkillBankError
+
+    action = getattr(a, "skills_cmd", None)
+    try:
+        bank = SkillBank(a.store)
+        if action == "report":
+            payload = bank.report()
+        elif action == "audit":
+            payload = bank.audit(
+                min_uses=a.min_uses, min_lift=a.min_lift, apply=a.apply)
+        elif action == "search":
+            payload = bank.search(a.query, k=a.k)
+        else:
+            raise SkillBankError("skills needs report, audit or search")
+    except (SkillBankError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "report":
+            counts = payload["counts"]
+            print(f"store: {payload['store']}  skills: {counts['skills']}  "
+                  f"active: {counts['active']}  quarantined: "
+                  f"{counts['quarantined']}  retired: {counts['retired']}")
+            print(f"baseline: {payload['baseline']:.3f}")
+            for row in payload["best"]:
+                print(f"best: {row['skill_id']}  lift={row['lift']:+.3f}  "
+                      f"uses={row['uses']}")
+            for row in payload["worst"]:
+                print(f"worst: {row['skill_id']}  lift={row['lift']:+.3f}  "
+                      f"uses={row['uses']}")
+        elif action == "audit":
+            print(f"baseline: {payload['baseline']:.3f}  "
+                  f"applied: {payload['applied']}")
+            for row in payload["actions"]:
+                lift = "-" if row["lift"] is None else f"{row['lift']:+.3f}"
+                print(f"{row['skill_id']}  {row['status']}  {row['action']}  "
+                      f"lift={lift}  uses={row['uses']}")
+        else:
+            print(f"query: {payload['query']}  hits: {len(payload['hits'])}")
+            for hit in payload["hits"]:
+                print(f"{hit['score']:.4f}  {hit['skill_id']}")
+    return 0
+
+
 def cmd_audit(a: argparse.Namespace) -> int:
     """``agentdescent audit <run_id> --archive PATH`` -- trace one adoption
     through its evidence rings."""
@@ -4767,10 +4945,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("demo", help="build a complete example and run it, offline")
     s.add_argument("--dir", help="where to build it (default: a temp directory)")
+    s.add_argument("--kind", choices=("skill_dir", "text", "skill_library"),
+                   help="demo fixture (default: skill_dir, or text when "
+                        "--algorithm is a text-only card)")
     s.add_argument("--algorithm", metavar="NAME",
                    help="run the demo with this named algorithm offline "
-                        "(skill_dir: archive_selection; text: gepa, dgm, ace, "
-                        "skillopt, rrsi; evoskill is refused — needs a real model). "
+                        "(skill_dir / skill_library: archive_selection; text: "
+                        "gepa, dgm, ace, skillopt, rrsi; evoskill is refused — "
+                        "needs a real model). "
                         "Currently: " + ", ".join(_demo_offline_algorithms()))
     s.set_defaults(fn=cmd_demo)
 
@@ -4961,6 +5143,70 @@ def build_parser() -> argparse.ArgumentParser:
     sp = hgm_sub.add_parser("report", help="per-node clade evidence")
     sp.add_argument("--tree", required=True, help="HGM tree JSON")
     sp.set_defaults(fn=cmd_hgm)
+    s = sub.add_parser(
+        "github", help="publish a proposal branch/PR or read a PR")
+    github_sub = s.add_subparsers(dest="github_cmd", required=True)
+    sp = github_sub.add_parser(
+        "publish", help="publish a proposal JSON as a branch, PR and check")
+    sp.add_argument("--proposal", required=True, help="proposal JSON file")
+    sp.add_argument("--owner", required=True, help="repository owner")
+    sp.add_argument("--repo", required=True, help="repository name")
+    sp.add_argument("--base", default="main", help="base branch (default main)")
+    sp.add_argument("--token-env", default="AGENTDESCENT_GITHUB_TOKEN",
+                    dest="token_env",
+                    help="environment variable holding the token")
+    sp.add_argument("--apply", action="store_true",
+                    help="perform the writes; without it the command is a plan")
+    sp.set_defaults(fn=cmd_github)
+    sp = github_sub.add_parser(
+        "review", help="read reviews, review constraints and merge readiness")
+    sp.add_argument("--pr", type=int, required=True, help="pull request number")
+    sp.add_argument("--owner", required=True)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--base", default="main")
+    sp.add_argument("--token-env", default="AGENTDESCENT_GITHUB_TOKEN",
+                    dest="token_env")
+    sp.add_argument("--resolved", default="",
+                    help="comma-separated review/comment ids known to be resolved")
+    sp.set_defaults(fn=cmd_github)
+
+    sp = github_sub.add_parser("status", help="read a PR and its check runs")
+    sp.add_argument("--pr", type=int, required=True, help="pull request number")
+    sp.add_argument("--owner", required=True)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--base", default="main")
+    sp.add_argument("--token-env", default="AGENTDESCENT_GITHUB_TOKEN",
+                    dest="token_env")
+    sp.set_defaults(fn=cmd_github)
+    s = sub.add_parser(
+        "harness", help="inspect or enforce a harness component manifest")
+    harness_sub = s.add_subparsers(dest="harness_cmd", required=True)
+    sp = harness_sub.add_parser("manifest", help="show components and FileTree globs")
+    sp.add_argument("--spec", required=True, help="harness manifest JSON")
+    sp.set_defaults(fn=cmd_harness)
+    sp = harness_sub.add_parser("check", help="validate edits against the contract")
+    sp.add_argument("--spec", required=True, help="harness manifest JSON")
+    sp.add_argument("--changes", required=True,
+                    help="JSON mapping of path -> content (or a path list)")
+    sp.set_defaults(fn=cmd_harness)
+    s = sub.add_parser(
+        "skills", help="report, audit or search a durable skill bank")
+    skills_sub = s.add_subparsers(dest="skills_cmd", required=True)
+    sp = skills_sub.add_parser("report", help="statuses, baseline and best/worst lifts")
+    sp.add_argument("--store", required=True, help="skill-bank JSON snapshot")
+    sp.set_defaults(fn=cmd_skills)
+    sp = skills_sub.add_parser("audit", help="quarantine skills below the lift bar")
+    sp.add_argument("--store", required=True)
+    sp.add_argument("--min-uses", type=int, default=5, dest="min_uses")
+    sp.add_argument("--min-lift", type=float, default=0.0, dest="min_lift")
+    sp.add_argument("--apply", action="store_true",
+                    help="persist quarantine decisions (default: report only)")
+    sp.set_defaults(fn=cmd_skills)
+    sp = skills_sub.add_parser("search", help="retrieve active skills by text")
+    sp.add_argument("--store", required=True)
+    sp.add_argument("--query", required=True)
+    sp.add_argument("--k", type=int, default=5)
+    sp.set_defaults(fn=cmd_skills)
 
 
 

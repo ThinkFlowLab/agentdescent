@@ -112,8 +112,10 @@ nav:
     - Adaptive compute: compute-policy.md
     - Capability foundry: capability-foundry.md
     - Continual experience: continual-experience.md
+    - Skill bank lifecycle: skill-bank.md
   - Product surfaces:
     - Release a candidate: release.md
+    - GitHub proposal publisher: github.md
     - Trajectory evidence: traces.md
     - Governed harness change: governed-harness.md
     - Tenant cycle: tenant.md
@@ -155,6 +157,7 @@ nav:
     - Cross-run consolidation: consolidation.md
     - Harness composition: harness-composition.md
     - Skill compilation: skill-compilation.md
+    - Harness manifest: harness-manifest.md
     - Portfolio governance: portfolio.md
     - Portfolio evolution — evolve the spend rule: portfolio-evolve.md
     - Self-improvement loop: self-improve.md

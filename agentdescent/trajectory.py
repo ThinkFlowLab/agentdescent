@@ -66,6 +66,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
+from .replay_fidelity import ReplayFidelity
+
 __all__ = [
     "PURPOSE_EVAL", "PURPOSE_PROBE", "PURPOSE_ROLLOUT", "PURPOSE_SELF_VERIFY",
     "PURPOSES", "RECORD_TEXT_ENV", "Trajectory", "TrajectoryEvent",
@@ -169,6 +171,30 @@ class Trajectory:
     rendered_truncated: bool = False
     #: Filled by the store on write; the identity hash. Empty before then.
     trace_id: str = ""
+    #: What a replay of this evaluation would need that the record above does
+    #: not carry: the RNG seed/state digests at interaction boundaries, the
+    #: environment fingerprint (cwd, tool versions, hashed allowlisted env
+    #: names) and any hidden state that was summarised -- plus the sources that
+    #: could not be captured at all. ``None`` means fidelity was never captured,
+    #: which reads as ``replay_eligible=False``: a consumer must refuse a
+    #: counterfactual over it rather than compare two scores taken in
+    #: (possibly) different environments. Not part of the identity triple: the
+    #: identity is what an evaluation *is*, the fidelity is what could be
+    #: reconstructed about it afterwards.
+    replay: Optional[ReplayFidelity] = None
+
+    @property
+    def replay_eligible(self) -> bool:
+        """Whether this record can support a replay/counterfactual claim."""
+        return bool(self.replay is not None and self.replay.eligible)
+
+    @property
+    def replay_notes(self) -> Tuple[str, ...]:
+        """Why it cannot, in words; empty when it can."""
+        if self.replay is None:
+            return ("replay fidelity was not captured: rng, environment and "
+                    "hidden state are unknown",)
+        return self.replay.notes()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -189,6 +215,7 @@ class Trajectory:
             "worker_id": self.worker_id,
             "events": [e.to_dict() for e in self.events],
             "ts": self.ts,
+            "replay": None if self.replay is None else self.replay.to_dict(),
         }
 
     @classmethod
@@ -210,6 +237,8 @@ class Trajectory:
             ts=float(d.get("ts", 0.0)),
             rendered_truncated=bool(d.get("rendered_truncated", False)),
             trace_id=d.get("trace_id", ""),
+            replay=(None if d.get("replay") is None
+                    else ReplayFidelity.from_dict(d["replay"])),
         )
 
 
@@ -454,6 +483,7 @@ class TrajectoryStore:
             ts=trajectory.ts or time.time(),
             rendered_truncated=truncated,
             trace_id=f"{trajectory.artifact_id}:{key}",
+            replay=trajectory.replay,
         )
 
     # -- reading -------------------------------------------------------------

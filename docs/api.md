@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-604 public names across 121 modules.
+613 public names across 122 modules.
 
 ---
 
@@ -5246,6 +5246,10 @@ Short stable ``evolve()`` contract to teach first; the long tail is advanced (Po
 
 A minimal Elo rating over pairwise matches (K-factor 32).
 
+### `EnvironmentFingerprint`
+
+The environment a run happened in, as far as it is safe to record it.
+
 ### `EvaluationReport`
 
 The verifier/oracle comparison for one artifact.
@@ -5490,6 +5494,10 @@ What a `ProposalPolicy` is given for one rollout.
 
 How a rollout becomes candidate changes.
 
+### `REPLAY_ENV_ALLOWLIST`
+
+—
+
 ### `ROUTE_SEED`
 
 The shipped route rule: answer directly unless the task is hard and the budget allows a search. Deliberately conservative -- it refuses to search when the budget is low, which is exactly the decision an evolved rule can improve on (searching hard tasks pays more than the budget it costs).
@@ -5530,9 +5538,21 @@ A callable named rather than sent: `"module:attribute"` plus config.
 
 A reference could not be resolved, and why -- never a bare ImportError.
 
+### `ReplayCheck`
+
+The result of comparing a captured run with its replay.
+
 ### `ReplayExample`
 
 One replayed past example: the task it came from, its recorded outcome, and the rolling statistics that decide how curious the artifact still is.
+
+### `ReplayFidelity`
+
+Everything a replay needs that the manifest's input hashes do not cover.
+
+### `ReplayNotEligible`
+
+A counterfactual was asked for over a run that cannot be replayed.
 
 ### `Result`
 
@@ -5553,6 +5573,10 @@ First-match risk rules with a fail-closed default.
 ### `RiskRule`
 
 One ordered rule; every supplied condition must match.
+
+### `RngRecord`
+
+One RNG seed/state digest at an interaction boundary.
 
 ### `RolloutSpec`
 
@@ -5778,6 +5802,10 @@ Run the harness(es) for a domain, record the outcomes, pick a winner.
 
 Fraction of validation n-grams that also occur in the training text.
 
+### `content_digest`
+
+A sha256 digest of any JSON-able summary.
+
 ### `cost_adjusted_reward`
 
 `quality - lam * (cost / baseline)`, clipped to `[0, 1]`.
@@ -5973,6 +6001,14 @@ Attack `value` by mutating the seed tasks outward and scoring each mutation. Ret
 ### `red_team_evolve`
 
 Evolve, attack the result, retrain on the failures it found.
+
+### `replay_check`
+
+Whether `replayed` reproduces `captured` -- or refuses to say.
+
+### `rng_digest`
+
+A digest of an RNG seed and/or a state summary at one boundary.
 
 ### `rollback_plan`
 

@@ -1420,6 +1420,10 @@ The vocabulary of `category`.
 | `APPROVAL_REJECTED` | `'approval-rejected'` |
 | `NOISE_FLOOR` | `'noise-floor'` |
 | `COST_RULE` | `'cost-rule'` |
+| `PROBES_UNAVAILABLE` | `'probes-unavailable'` |
+| `NO_TARGET_TRANSFER` | `'no-target-transfer'` |
+| `ARCHIVED_REGRESSION` | `'archived-regression'` |
+| `FALSIFICATION_MOVED` | `'falsification-moved'` |
 
 ### `MergeReport(...)`
 

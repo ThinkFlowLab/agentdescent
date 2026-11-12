@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-604 public names across 121 modules.
+605 public names across 121 modules.
 
 ---
 
@@ -3420,6 +3420,7 @@ PromotionRequest(
     metamorphic: Optional[MetamorphicReport] = None,
     verifier: Optional[EnsembleReport] = None,
     calibration: Optional[CalibrationReport] = None,
+    review_cost: Optional[ReviewCost] = None,
     metadata: Mapping[str, Any] = <factory>
 ) -> None
 ```
@@ -3446,13 +3447,33 @@ PromotionRules(
     allow_contaminated: bool = False,
     min_effect: float = 0.0,
     min_tasks: int = 2,
-    max_risk: float = 1.0
+    max_risk: float = 1.0,
+    max_review_cost: float = 0.0,
+    max_review_minutes: float = 0.0
 ) -> None
 ```
 
 ### `ProofEvidence(certificate: ProofCertificate, verification: ProofVerification) -> None`
 
 A proof certificate plus the verification that actually checked it.
+
+### `ReviewCost(...)`
+
+What reviewing one proposed diff costs a human (#950).
+
+```python
+ReviewCost(
+    files_changed: int,
+    lines_changed: int,
+    blast_radius: float = 0.2,
+    risk: Optional[float] = None,
+    evidence_items: int = 0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `estimate(...)` | Build a cost from the diff's measured shape. |
 
 ### `promote(request: PromotionRequest, policy: Optional[PromotionRules] = None) -> PromotionDecision`
 

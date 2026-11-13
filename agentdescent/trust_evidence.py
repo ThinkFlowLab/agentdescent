@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -44,7 +45,7 @@ from .sequential import SequentialReport, sequential_test
 from .stats_eval import bootstrap_ci, is_significant, paired_gain
 from .verifier_ensemble import EnsembleReport, VerifierEnsemble
 
-__all__ = ["TrustEvidence", "build_trust_evidence"]
+__all__ = ["RunHealth", "TrustEvidence", "build_trust_evidence"]
 
 
 def _finite(value: Any, name: str) -> float:
@@ -78,6 +79,130 @@ def _artifact_metadata(artifact_changed: Optional[bool],
 
 
 @dataclass(frozen=True)
+class RunHealth:
+    """How much of a run produced a real answer (#993).
+
+    ``failed_tasks`` never produced an answer, so they are not scored as zero:
+    the gain is the mean over the tasks that answered. Above ``threshold`` the
+    run fails its gate, because a run that mostly did not measure is not
+    evidence of an improvement.
+    """
+
+    attempted: int
+    failed_tasks: Tuple[str, ...] = ()
+    threshold: float = 0.2
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempted, bool) or not isinstance(self.attempted, int):
+            raise ValueError("run health attempted must be an int")
+        if self.attempted < 1:
+            raise ValueError("run health attempted must be at least 1")
+        failed = tuple(str(task) for task in (self.failed_tasks or ()))
+        if len(set(failed)) != len(failed):
+            raise ValueError("run health failed_tasks must not repeat a task")
+        if len(failed) > self.attempted:
+            raise ValueError("run health failed_tasks exceeds attempted")
+        threshold = _finite(self.threshold, "run health threshold")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("run health threshold must be in [0, 1]")
+        object.__setattr__(self, "failed_tasks", failed)
+        object.__setattr__(self, "threshold", threshold)
+
+    @property
+    def failed(self) -> int:
+        return len(self.failed_tasks)
+
+    @property
+    def failure_rate(self) -> float:
+        return self.failed / self.attempted
+
+    @property
+    def censored(self) -> bool:
+        """True when the run is too broken to read as evidence."""
+        return self.failure_rate > self.threshold
+
+    def to_dict(self) -> dict:
+        return {"attempted": self.attempted, "failed": self.failed,
+                "failure_rate": self.failure_rate, "threshold": self.threshold,
+                "failed_tasks": list(self.failed_tasks)}
+
+
+def _run_health(value: Any) -> RunHealth:
+    if isinstance(value, RunHealth):
+        return value
+    if not isinstance(value, Mapping):
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+    if not isinstance(value, Mapping):
+        raise ValueError("run health must be a mapping or a RunHealth")
+    allowed = {"attempted", "failed_tasks", "threshold", "failed",
+               "failure_rate"}
+    unknown = sorted(str(key) for key in set(value) - allowed)
+    if unknown:
+        raise ValueError(
+            f"unknown run health field(s): {', '.join(unknown)}")
+    if "attempted" not in value:
+        raise ValueError("run health needs attempted")
+    attempted = value["attempted"]
+    if isinstance(attempted, bool) or not isinstance(attempted, int) \
+            or attempted < 1:
+        raise ValueError("run health attempted must be an int of at least 1")
+    failed_tasks = tuple(str(task) for task in (value.get("failed_tasks") or ()))
+    # ``to_dict`` emits the count and the rate, so reading them back is legal;
+    # a count that disagrees with the task ids is not. Without this the caller
+    # could hand ``failed: 14`` with no ids, have it rewritten to zero failures
+    # and be told the run is healthy -- a silently rewritten number.
+    if "failed" in value and value["failed"] != len(failed_tasks):
+        raise ValueError(
+            "run health failed count does not match failed_tasks")
+    if "failure_rate" in value:
+        rate = _finite(value["failure_rate"], "run health failure_rate")
+        if not math.isclose(rate, len(failed_tasks) / attempted,
+                            rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                "run health failure_rate does not match failed_tasks")
+    return RunHealth(
+        attempted=attempted,
+        failed_tasks=failed_tasks,
+        threshold=value.get("threshold", 0.2))
+
+
+_ARTIFACT_NOTE_TEXT = ("artifact unchanged, so the eval delta is evaluation "
+                       "noise, not learning")
+#: The separator belongs to the composition, not to the sentence: a detail that
+#: starts with the note (an empty original) has none, and a pattern that
+#: required one would leave the second copy behind on the next rebuild.
+_ARTIFACT_NOTE = re.compile(r"(?:;\s*)?" + re.escape(_ARTIFACT_NOTE_TEXT))
+_HEALTH_NOTE = re.compile(r"(?:;\s*)?run health: .*?task\(s\)")
+
+
+def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
+    """Recompute the gate over the tasks that answered, not the failures."""
+    failed = set(health.failed_tasks)
+    answered = {task: delta for task, delta in result.per_task.items()
+                if str(task) not in failed}
+    n = len(answered)
+    delta = (sum(answered.values()) / n) if n else 0.0
+    interval = bootstrap_ci({task: 0.0 for task in answered}, answered)
+    censored = health.censored or n == 0
+    # ``replace`` on a bundle re-appends the note; strip the previous copy and
+    # nothing else, so a note another field appended (the artifact one) stays.
+    # The separator is optional in the pattern because the note can lead the
+    # detail; ``strip`` drops the one the removal leaves behind.
+    detail = _HEALTH_NOTE.sub("", result.detail).strip("; ")
+    health_note = (f"run health: {health.failed} of "
+                   f"{health.attempted} tasks failed at the provider or harness "
+                   f"(rate {health.failure_rate:.2f} vs threshold "
+                   f"{health.threshold:.2f}); gain is the mean over {n} answered "
+                   f"task(s)")
+    detail = f"{detail}; {health_note}" if detail else health_note
+    return replace(result, n=n, delta=delta, ci=(interval.lo, interval.hi),
+                   per_task=answered,
+                   passed=result.passed and not censored, detail=detail)
+
+
+@dataclass(frozen=True)
 class TrustEvidence:
     """The reports one paired evaluation produced, ready for `promote()`."""
 
@@ -96,6 +221,7 @@ class TrustEvidence:
     #: caller did not compare them, so the bundle keeps the behaviour it had
     #: before this field existed.
     artifact_changed: Optional[bool] = None
+    run_health: Optional[RunHealth] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -111,16 +237,32 @@ class TrustEvidence:
             # noise, so it can neither be reported as gain nor pass an eval
             # gate. Zeroing here covers every construction path, including a
             # caller that builds the bundle directly from its own EvalResult.
+            detail = _ARTIFACT_NOTE.sub(
+                "", self.eval_result.detail).strip("; ")
             object.__setattr__(self, "eval_result", replace(
                 self.eval_result, delta=0.0, passed=False,
-                detail=(self.eval_result.detail +
-                        "; artifact unchanged, so the eval delta is evaluation "
-                        "noise, not learning").lstrip("; ")))
+                detail=(f"{detail}; {_ARTIFACT_NOTE_TEXT}" if detail
+                        else _ARTIFACT_NOTE_TEXT)))
         if self.risk is not None:
             risk = _finite(self.risk, "risk")
             if not 0.0 <= risk <= 1.0:
                 raise ValueError("risk must be in [0, 1]")
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        metadata = dict(self.metadata or {})
+        object.__setattr__(self, "metadata", metadata)
+        health = self.run_health
+        if health is None and metadata.get("run_health") is not None:
+            health = _run_health(metadata["run_health"])
+        elif health is not None:
+            health = _run_health(health)
+        if health is not None:
+            # Every construction path gets this, ``dataclasses.replace`` too.
+            object.__setattr__(self, "run_health", health)
+            if metadata.get("run_health") != health.to_dict():
+                metadata["run_health"] = health.to_dict()
+            updated = _drop_failed_tasks(self.eval_result, health)
+            if self.artifact_changed is False:
+                updated = replace(updated, delta=0.0, passed=False)
+            object.__setattr__(self, "eval_result", updated)
 
     @property
     def noise_only(self) -> bool:
@@ -177,6 +319,8 @@ class TrustEvidence:
         if self.artifact_changed is not None:
             body["artifact_changed"] = self.artifact_changed
             body["noise_only"] = self.noise_only
+        if self.run_health is not None:
+            body["run_health"] = self.run_health.to_dict()
         return body
 
 

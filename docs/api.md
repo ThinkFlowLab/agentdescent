@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-615 public names across 122 modules.
+616 public names across 122 modules.
 
 ---
 
@@ -3598,6 +3598,10 @@ OptionReport(
 
 Build the evaluation, canary, statistical, Goodhart, metamorphic, verifier and calibration reports from one paired run. &nbsp;·&nbsp; `agentdescent.trust_evidence` &nbsp;·&nbsp; [guide](trust-evidence.md)
 
+### `RunHealth(attempted: int, failed_tasks: Tuple[str, ...] = (), threshold: float = 0.2) -> None`
+
+How much of a run produced a real answer (#993).
+
 ### `TrustEvidence(...)`
 
 The reports one paired evaluation produced, ready for `promote()`.
@@ -3616,6 +3620,7 @@ TrustEvidence(
     risk: Optional[float] = None,
     approved: Optional[bool] = None,
     artifact_changed: Optional[bool] = None,
+    run_health: Optional[RunHealth] = None,
     metadata: Mapping[str, Any] = <factory>
 ) -> None
 ```

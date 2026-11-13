@@ -8,9 +8,15 @@ evidence the reviewer had already moved past.
 
 The rule now: for one tip, the newest report by time across comments and
 reviews together decides. It must be a PASS; any other newest report at that
-tip voids every earlier PASS there until a new PASS is written. A report that
-names a different tip is still judged against that other tip, so a follow-up in
-an older tip's thread never leaks onto the current head.
+tip voids every earlier PASS there until a new PASS is written. A Verifier
+report that names a different tip is still judged against that other tip.
+
+A verdict-less report has no thread identity: the collector reads comment and
+review bodies only, with no reply or thread ids, so such a report attaches to
+the tip that reviewer most recently named. When that is the head it supersedes
+the head's PASS even if the prose is about an earlier tip. That direction is
+deliberately conservative - a report the gate cannot place is treated as a
+report at the tip it can place it on, never as silence.
 
 The first test is the shape seen live at PR #782: a PASS at
 ``b0fcd1589d46f14523164f6274d56c2c2300becb`` followed the next day by a
@@ -107,12 +113,26 @@ def test_a_pass_written_after_the_follow_up_restores_the_green():
     assert rg.decide(HEAD, "HugoXK", [passed, follow_up, second_pass], POLICY)["ok"]
 
 
-def test_a_follow_up_after_an_old_tip_pass_never_lands_on_the_current_head():
+def test_a_follow_up_whose_last_named_tip_is_older_does_not_count_at_the_head():
     old_pass = c(report("PASS", tip=OLD), at="2026-11-10T02:06:09Z")
     follow_up = c(FOLLOW_UP_782, at="2026-11-11T01:56:00Z")
     r = rg.decide(HEAD, "HugoXK", [old_pass, follow_up], POLICY)
     assert not r["ok"]
     assert "not the tip" in r["reason"] and "superseded" not in r["reason"]
+
+
+def test_prose_about_an_earlier_tip_voids_the_head_pass_it_follows():
+    # The conservative direction, pinned: the collector has no thread ids, so a
+    # follow-up attaches to the tip this reviewer last named. Here that is the
+    # head, and the follow-up voids the head's PASS even though its prose is
+    # about OLD. Deliberate, not accidental: silence would release a merge on a
+    # reviewer who is still writing at this PR.
+    old_pass = c(report("PASS", tip=OLD), at="2026-11-10T02:00:00Z")
+    head_pass = c(report("PASS", tip=HEAD), at="2026-11-10T03:00:00Z")
+    follow_up = c("A note on the earlier tip: I still think that FAIL was wrong.", at="2026-11-11T01:00:00Z")
+    r = rg.decide(HEAD, "HugoXK", [old_pass, head_pass, follow_up], POLICY)
+    assert not r["ok"]
+    assert "no verdict" in r["reason"] and "superseded" in r["reason"]
 
 
 def test_an_old_tip_pass_still_fails_on_its_own_tip_after_a_follow_up():

@@ -9,9 +9,13 @@
   - it is not the PR author's own report, unless the author is in ``selfReview``;
   - it carries the Verifier block (see .claude/skills/review-pr/SKILL.md) with a
     ``Tip SHA:`` that is the head being judged and a ``Verdict:``;
-  - a reviewer's report with no Verifier block counts too, at the tip the same
-    thread last named: a follow-up there is a report about that tip, so it
-    supersedes the reports before it rather than disappearing (#928);
+  - a reviewer's report with no Verifier block counts too, at the tip that
+    reviewer most recently named: a comment or a review body carries no thread
+    identity, so the follow-up attaches to that tip and supersedes the reports
+    before it there rather than disappearing (#928). When the reviewer's last
+    named tip is the head, the follow-up supersedes the head's PASS even if its
+    prose is about an earlier tip - the conservative direction, since the
+    collector has no thread ids to tell the two apart;
   - a PASS without a ``Ran:`` entry or without a ``Not run:`` line still
     counts, but is marked ``weak: no Ran:/Not run:`` so it is never invisible.
 The newest report at this tip decides, verdict or not, so a later FAIL, a
@@ -121,10 +125,14 @@ def decide(head: str, author: str, reports: List[Dict[str, Any]], policy: Dict[s
     """reports: [{login, body, at, kind}] from the comments and review bodies of one PR.
 
     Reports are read in time order, comments and reviews together. A reviewer's
-    report with no Verifier block belongs to the tip that thread last named, so
-    a follow-up there takes part in the ordering instead of vanishing; that is
-    what lets a newer withdrawal, requirement or question void an older PASS
-    (#928). Anything else that names no tip is not a report and is ignored."""
+    report with no Verifier block attaches to the tip that reviewer most recently
+    named, because a comment or review body carries no thread identity, so a
+    follow-up takes part in the ordering instead of vanishing; that is what lets
+    a newer withdrawal, requirement or question void an older PASS (#928). If
+    the last named tip is the head, a verdict-less follow-up supersedes the
+    head's PASS even when its prose is about an earlier tip: with no thread ids
+    in the collector, a report that cannot be placed is read conservatively.
+    Anything else that names no tip is not a report and is ignored."""
     head_sha = str(head or "").lower()
     author_login = str(author or "").lower()
     reviewers = {str(l).lower() for l in policy.get("reviewers", [])}
@@ -134,14 +142,15 @@ def decide(head: str, author: str, reports: List[Dict[str, Any]], policy: Dict[s
 
     # Equal timestamps keep the API order (oldest first), so the later comment wins.
     ordered = sorted(enumerate(reports), key=lambda p: (_ts(p[1].get("at")), p[0]))
-    thread_tip: Optional[str] = None  # the tip the reviewer's thread is on
+    thread_tip: Optional[str] = None  # the tip the reviewer most recently named
     for _, r in ordered:
         parsed = parse_report(r.get("body"))
         login = _login(r)
         allowed = login in reviewers and (login != author_login or author_login in self_review)
         if not parsed["tip"] and not parsed["verdict"]:
-            # A follow-up, not a Verifier block: it is about the tip the thread
-            # last named, and being newer it supersedes what came before there.
+            # A follow-up, not a Verifier block: the body carries no thread id,
+            # so it attaches to the tip this reviewer last named and, being
+            # newer, supersedes what came before there.
             if not allowed or not thread_tip:
                 continue
             judged.append({"login": r.get("login"), "verdict": None, "tip": thread_tip, "at": r.get("at"),

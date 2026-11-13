@@ -107,6 +107,37 @@ def test_an_unchanged_artifact_reports_no_gain_even_with_health():
     assert evidence.eval_result.delta == 0.0
     assert evidence.eval_result.passed is False
     assert evidence.eval_result.detail.count("run health") == 1
+    assert evidence.eval_result.detail.count("artifact unchanged") == 1
+
+
+def test_a_health_count_without_its_ids_is_a_caller_error():
+    with pytest.raises(ValueError):
+        replace(_raw(14), metadata={"run_health": {"attempted": TASKS,
+                                                  "failed": 14}})
+    with pytest.raises(ValueError):
+        replace(_raw(14), metadata={"run_health": {"attempted": TASKS,
+                                                  "failed": 14,
+                                                  "failed_tasks": []}})
+    with pytest.raises(ValueError):
+        replace(_raw(14), metadata={"run_health": {"attempted": TASKS,
+                                                  "failure_rate": 0.35}})
+
+
+def test_a_health_record_from_to_dict_round_trips():
+    evidence = _evidence(failed_tasks=_failed_ids(14))
+    rebuilt = replace(_raw(14), metadata={
+        "run_health": evidence.run_health.to_dict()})
+
+    assert rebuilt.run_health == evidence.run_health
+    assert rebuilt.eval_result.passed is False
+
+
+def test_a_failure_rate_at_the_threshold_is_not_censored():
+    evidence = _evidence(failed_tasks=_failed_ids(8))
+
+    assert evidence.run_health.failure_rate == 0.2
+    assert evidence.run_health.censored is False
+    assert evidence.eval_result.passed is True
 
 
 def test_malformed_run_health_is_a_caller_error():

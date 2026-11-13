@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -143,10 +144,31 @@ def _run_health(value: Any) -> RunHealth:
             f"unknown run health field(s): {', '.join(unknown)}")
     if "attempted" not in value:
         raise ValueError("run health needs attempted")
+    attempted = value["attempted"]
+    if isinstance(attempted, bool) or not isinstance(attempted, int) \
+            or attempted < 1:
+        raise ValueError("run health attempted must be an int of at least 1")
+    failed_tasks = tuple(str(task) for task in (value.get("failed_tasks") or ()))
+    # ``to_dict`` emits the count and the rate, so reading them back is legal;
+    # a count that disagrees with the task ids is not. Without this the caller
+    # could hand ``failed: 14`` with no ids, have it rewritten to zero failures
+    # and be told the run is healthy -- a silently rewritten number.
+    if "failed" in value and value["failed"] != len(failed_tasks):
+        raise ValueError(
+            "run health failed count does not match failed_tasks")
+    if "failure_rate" in value:
+        rate = _finite(value["failure_rate"], "run health failure_rate")
+        if not math.isclose(rate, len(failed_tasks) / attempted,
+                            rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                "run health failure_rate does not match failed_tasks")
     return RunHealth(
-        attempted=value["attempted"],
-        failed_tasks=tuple(value.get("failed_tasks") or ()),
+        attempted=attempted,
+        failed_tasks=failed_tasks,
         threshold=value.get("threshold", 0.2))
+
+
+_HEALTH_NOTE = re.compile(r"; run health: .*?task\(s\)")
 
 
 def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
@@ -158,8 +180,9 @@ def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
     delta = (sum(answered.values()) / n) if n else 0.0
     interval = bootstrap_ci({task: 0.0 for task in answered}, answered)
     censored = health.censored or n == 0
-    # ``replace`` on a bundle that already has the note keeps one copy.
-    detail = result.detail.split("; run health: ")[0]
+    # ``replace`` on a bundle re-appends the note; strip the previous copy and
+    # nothing else, so a note another field appended (the artifact one) stays.
+    detail = _HEALTH_NOTE.sub("", result.detail)
     detail = (f"{detail}; run health: {health.failed} of "
               f"{health.attempted} tasks failed at the provider or harness "
               f"(rate {health.failure_rate:.2f} vs threshold "

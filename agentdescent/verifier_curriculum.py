@@ -26,6 +26,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .admission import AdmissionReport, admission_report
 from .advantage import _ForwardsInstall
 from .policies import AcceptDecision, MergeContext
 
@@ -161,13 +162,18 @@ class VerifierAgreement(_ForwardsInstall):
     ``configure`` hook -- the wrapper can only make acceptance stricter. On an
     audit, an oracle regression is refused whatever the verifier says, and a
     verifier-only gain is refused with category ``oracle-disagrees``.
+
+    ``rejected_sample_rate`` audits the rejected stratum by the same seeded
+    rule (``:rejected`` suffix, off by default: it costs oracle calls).
     """
 
     def __init__(self, audit_tasks: Sequence[Any], verifier: Scorer, oracle: Scorer,
                  *, inner: Optional[Any] = None, sample_rate: float = 0.2,
-                 seed: int = 0) -> None:
+                 rejected_sample_rate: float = 0.0, seed: int = 0) -> None:
         if not 0.0 <= sample_rate <= 1.0:
             raise ValueError("sample_rate must be in [0, 1]")
+        if not 0.0 <= rejected_sample_rate <= 1.0:
+            raise ValueError("rejected_sample_rate must be in [0, 1]")
         from .defaults import DefaultAcceptance
 
         self.audit_tasks = tuple(audit_tasks)
@@ -175,7 +181,12 @@ class VerifierAgreement(_ForwardsInstall):
         self.oracle = oracle
         self.inner = inner if inner is not None else DefaultAcceptance()
         self.sample_rate = float(sample_rate)
+        self.rejected_sample_rate = float(rejected_sample_rate)
         self.seed = int(seed)
+        self._n_accepted = 0
+        self._n_rejected = 0
+        self._accepted_confirmed: List[float] = []
+        self._rejected_missed: List[float] = []
 
     def _mean(self, scorer: Scorer, artifact: Any) -> float:
         if not self.audit_tasks:
@@ -183,14 +194,31 @@ class VerifierAgreement(_ForwardsInstall):
         return sum(float(scorer(artifact, task)) for task in self.audit_tasks
                    ) / len(self.audit_tasks)
 
+    def admission_report(self) -> AdmissionReport:
+        """The audited decisions of both strata as one admission report."""
+        return admission_report(
+            n_accepted=self._n_accepted, n_rejected=self._n_rejected,
+            rejected_sample_rate=self.rejected_sample_rate, seed=self.seed,
+            accepted_confirmed=self._accepted_confirmed,
+            rejected_missed=self._rejected_missed)
+
     def accept(self, ctx: MergeContext) -> AcceptDecision:
         decision = (self.inner.accept(ctx) if hasattr(self.inner, "accept")
                     else self.inner(ctx))
         if not decision.accept:
+            self._n_rejected += 1
+            diff = getattr(ctx, "diff", None)  # same draw, other stratum
+            key = f"{self.seed}:{getattr(diff, 'diff_id', '')}:rejected"
+            if (self.audit_tasks
+                    and random.Random(key).random() <= self.rejected_sample_rate):
+                base_o = self._mean(self.oracle, ctx.artifact)
+                cand_o = self._mean(self.oracle, ctx.candidate)
+                self._rejected_missed.append(1.0 if cand_o > base_o else 0.0)
             return decision
         diff = getattr(ctx, "diff", None)
         key = f"{self.seed}:{getattr(diff, 'diff_id', '')}"
         if random.Random(key).random() > self.sample_rate or not self.audit_tasks:
+            self._n_accepted += 1
             return decision
         base_v = self._mean(self.verifier, ctx.artifact)
         cand_v = self._mean(self.verifier, ctx.candidate)
@@ -199,14 +227,18 @@ class VerifierAgreement(_ForwardsInstall):
         verifier_gain = cand_v - base_v
         oracle_gain = cand_o - base_o
         if oracle_gain < 0.0:
+            self._n_rejected += 1              # refused by the audit, not admitted
             return AcceptDecision(
                 False, "oracle-regression",
                 f"oracle {base_o:.3f} -> {cand_o:.3f} on the audit set",
                 observed_delta=0.0)
         if verifier_gain > 0.0 and oracle_gain <= 0.0:
+            self._n_rejected += 1
             return AcceptDecision(
                 False, "oracle-disagrees",
                 f"verifier {base_v:.3f} -> {cand_v:.3f} but oracle "
                 f"{base_o:.3f} -> {cand_o:.3f}",
                 observed_delta=0.0)
+        self._n_accepted += 1
+        self._accepted_confirmed.append(1.0 if oracle_gain > 0.0 else 0.0)
         return decision

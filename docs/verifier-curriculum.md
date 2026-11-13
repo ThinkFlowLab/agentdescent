@@ -48,6 +48,11 @@ oracle regression on the audit set is refused whatever the verifier says; a
 verifier-only gain is `oracle-disagrees`. The audit draw is seeded from the diff
 id, so it does not depend on merge order.
 
+Auditing accepted commits measures precision and nothing else, so
+`rejected_sample_rate` audits the rejected stratum too and `admission_report()`
+adds a lower confidence bound on its recall; `require_verifier_admission=True`
+defers on a missing or incomplete report and fails closed on a `reject`.
+
 Both pieces take `(artifact, task) -> float` callables, so they work with the
 shipped verifier, a model judge, or a deterministic fixture. They are deliberately
 separate from `meta_audit`: that store records sampled truth for a *run*, while

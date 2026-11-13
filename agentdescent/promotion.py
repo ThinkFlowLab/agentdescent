@@ -142,6 +142,7 @@ class PromotionRules:
     require_goodhart: bool = False
     require_metamorphic: bool = False
     require_verifier: bool = False
+    require_verifier_admission: bool = False
     require_calibration: bool = False
     allow_contaminated: bool = False
     min_effect: float = 0.0
@@ -158,7 +159,8 @@ class PromotionRules:
                      "require_canary", "require_proof", "require_admission",
                      "require_approval", "require_goodhart",
                      "require_metamorphic", "require_verifier",
-                     "require_calibration", "allow_contaminated"):
+                     "require_verifier_admission", "require_calibration",
+                     "allow_contaminated"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
         if _finite(self.min_effect, "min_effect") < 0:
@@ -182,7 +184,8 @@ def _policy_payload(policy: "PromotionRules") -> Dict[str, Any]:
     verifies after the upgrade. The ledger verifies with this same payload.
     """
     payload = asdict(policy)
-    for name in ("max_review_cost", "max_review_minutes"):
+    for name in ("max_review_cost", "max_review_minutes",
+                 "require_verifier_admission"):
         if not getattr(policy, name):
             payload.pop(name, None)
     return payload
@@ -543,6 +546,18 @@ def promote(request: PromotionRequest,
         reasons.append(
             f"verifier ensemble rejected the candidate "
             f"(score {report.score:.3g})")
+
+    if policy.require_verifier_admission:
+        admission = getattr(report, "admission", None)
+        if admission is None:                   # no report is no admission either
+            missing.append("verifier admission")
+        elif admission.precision is None or admission.recall_bound is None:
+            deferred.append(f"verifier admission is incomplete: {admission.reason}")
+        elif admission.recommendation == "reject":
+            hard_fail = True
+            reasons.append(f"verifier admission failed: {admission.reason}")
+        elif admission.recommendation != "admit":
+            deferred.append(f"verifier admission: {admission.reason}")
 
     report = request.calibration
     if report is None:

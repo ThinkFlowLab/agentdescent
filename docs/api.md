@@ -3458,6 +3458,7 @@ PromotionRules(
     require_goodhart: bool = False,
     require_metamorphic: bool = False,
     require_verifier: bool = False,
+    require_verifier_admission: bool = False,
     require_calibration: bool = False,
     allow_contaminated: bool = False,
     min_effect: float = 0.0,

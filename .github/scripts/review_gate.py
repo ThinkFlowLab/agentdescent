@@ -9,11 +9,19 @@
   - it is not the PR author's own report, unless the author is in ``selfReview``;
   - it carries the Verifier block (see .claude/skills/review-pr/SKILL.md) with a
     ``Tip SHA:`` that is the head being judged and a ``Verdict:``;
+  - a reviewer's report with no Verifier block counts too, at the tip that
+    reviewer most recently named: a comment or a review body carries no thread
+    identity, so the follow-up attaches to that tip and supersedes the reports
+    before it there rather than disappearing (#928). When the reviewer's last
+    named tip is the head, the follow-up supersedes the head's PASS even if its
+    prose is about an earlier tip - the conservative direction, since the
+    collector has no thread ids to tell the two apart;
   - a PASS without a ``Ran:`` entry or without a ``Not run:`` line still
     counts, but is marked ``weak: no Ran:/Not run:`` so it is never invisible.
-The newest qualifying report that names this tip decides, so a later FAIL at
-the same tip vetoes an earlier PASS. A new commit moves the tip and every old
-report stops counting.
+The newest report at this tip decides, verdict or not, so a later FAIL, a
+withdrawal, an added requirement or an open question at the same tip voids an
+earlier PASS until a new PASS is written. A new commit moves the tip and every
+old report stops counting.
 
 The PR is read only through the GitHub API; no PR code is checked out or run.
 Exits 0 on a PASS at the tip, 1 otherwise (the workflow step is neutral).
@@ -114,7 +122,17 @@ def _ts(at: Optional[str]) -> float:
 
 
 def decide(head: str, author: str, reports: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
-    """reports: [{login, body, at, kind}] from the comments and review bodies of one PR."""
+    """reports: [{login, body, at, kind}] from the comments and review bodies of one PR.
+
+    Reports are read in time order, comments and reviews together. A reviewer's
+    report with no Verifier block attaches to the tip that reviewer most recently
+    named, because a comment or review body carries no thread identity, so a
+    follow-up takes part in the ordering instead of vanishing; that is what lets
+    a newer withdrawal, requirement or question void an older PASS (#928). If
+    the last named tip is the head, a verdict-less follow-up supersedes the
+    head's PASS even when its prose is about an earlier tip: with no thread ids
+    in the collector, a report that cannot be placed is read conservatively.
+    Anything else that names no tip is not a report and is ignored."""
     head_sha = str(head or "").lower()
     author_login = str(author or "").lower()
     reviewers = {str(l).lower() for l in policy.get("reviewers", [])}
@@ -122,23 +140,39 @@ def decide(head: str, author: str, reports: List[Dict[str, Any]], policy: Dict[s
     reasons: List[str] = []
     judged: List[Dict[str, Any]] = []
 
-    for r in reports:
+    # Equal timestamps keep the API order (oldest first), so the later comment wins.
+    ordered = sorted(enumerate(reports), key=lambda p: (_ts(p[1].get("at")), p[0]))
+    thread_tip: Optional[str] = None  # the tip the reviewer most recently named
+    for _, r in ordered:
         parsed = parse_report(r.get("body"))
+        login = _login(r)
+        allowed = login in reviewers and (login != author_login or author_login in self_review)
         if not parsed["tip"] and not parsed["verdict"]:
-            continue  # not a Verifier report
+            # A follow-up, not a Verifier block: the body carries no thread id,
+            # so it attaches to the tip this reviewer last named and, being
+            # newer, supersedes what came before there.
+            if not allowed or not thread_tip:
+                continue
+            judged.append({"login": r.get("login"), "verdict": None, "tip": thread_tip, "at": r.get("at"),
+                           "kind": r.get("kind"), "parsed": parsed, "follow_up": True,
+                           "counts": head_sha.startswith(thread_tip)})
+            continue
         entry = {"login": r.get("login"), "verdict": parsed["verdict"], "tip": parsed["tip"], "at": r.get("at"),
                  "kind": r.get("kind"), "parsed": parsed, "counts": False}
         judged.append(entry)
-        if not parsed["tip"]:
+        if parsed["tip"]:
+            if allowed:
+                thread_tip = parsed["tip"]
+        else:
             reasons.append(f"{_where(r)}: no Tip SHA")
             continue
         if not head_sha.startswith(parsed["tip"]):
             reasons.append(f"{_where(r)}: names {parsed['tip'][:SHORT]}, not the tip {head_sha[:SHORT]}")
             continue
-        if _login(r) == author_login and author_login not in self_review:
+        if login == author_login and author_login not in self_review:
             reasons.append(f"{_where(r)}: the pull request's own author is not a reviewer (not in selfReview)")
             continue
-        if _login(r) not in reviewers:
+        if login not in reviewers:
             reasons.append(f"{_where(r)}: not a reviewer listed in .github/agent/review-policy.json")
             continue
         entry["counts"] = True
@@ -151,12 +185,15 @@ def decide(head: str, author: str, reports: List[Dict[str, Any]], policy: Dict[s
             reason = "; ".join(reasons) if reasons else f"no Verifier report names the tip {head_sha[:SHORT]}"
         return {"ok": False, "verdict": None, "by": None, "tip": None, "reason": reason, "judged": judged}
 
-    # Newest wins; equal timestamps keep the API order (oldest first), so the later comment wins.
-    last = sorted(enumerate(counting), key=lambda p: (_ts(p[1]["at"]), p[0]))[-1][1]
+    last = counting[-1]  # judged is in time order
     parsed = last["parsed"]
     base = {"verdict": last["verdict"], "by": last["login"], "tip": last["tip"], "judged": judged}
+    if last["verdict"] is None:
+        return dict(base, ok=False, weak=None,
+                    reason=f"{last['login']}'s newer {last['kind']} at this tip carries no verdict, "
+                           "so the earlier PASS is superseded")
     if last["verdict"] != "PASS":
-        return dict(base, ok=False, weak=None, reason=f"{last['login']} says {last['verdict'] or 'nothing'} at this tip")
+        return dict(base, ok=False, weak=None, reason=f"{last['login']} says {last['verdict']} at this tip")
     # An evidence-less PASS still counts - the owner's agent writes one - but it is
     # marked so the missing Ran:/Not run: stays visible in the result and the report.
     weak = None if (parsed["ran"] and parsed["hasNotRun"]) else WEAK

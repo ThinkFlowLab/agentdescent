@@ -1,0 +1,171 @@
+"""``init --agent`` is honored or refused, never silently swapped (#456)."""
+
+import json
+
+import pytest
+
+from agentdescent import cli
+
+
+@pytest.fixture
+def ws(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "prompt.txt").write_text("Answer.")
+    skill = tmp_path / "my-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# x")
+    return tmp_path
+
+
+def _init(*argv):
+    return cli.main(["init", *argv, "--out", "spec.json"])
+
+
+@pytest.mark.parametrize("ref", ["host_model", "claude"])
+def test_text_keeps_explicit_plain_agent(ws, ref):
+    assert _init("prompt.txt", "--kind", "text", "--agent", ref) == 0
+    spec = json.loads((ws / "spec.json").read_text())
+    assert spec["agent"] == {"ref": ref}
+
+
+def test_text_default_unchanged_without_agent(ws):
+    assert _init("prompt.txt", "--kind", "text") == 0
+    spec = json.loads((ws / "spec.json").read_text())
+    # Without --agent, kind=text keeps its default: the key-aware model block
+    # init writes (#451), here with OPENAI_API_KEY set and no --model.
+    assert spec["agent"] == {"ref": "openai_compatible", "model": cli.PLACEHOLDER_MODEL}
+
+
+def test_text_explicit_openai_compatible_keeps_model(ws):
+    assert _init("prompt.txt", "--kind", "text", "--agent", "openai_compatible") == 0
+    spec = json.loads((ws / "spec.json").read_text())
+    assert spec["agent"]["ref"] == "openai_compatible"
+    assert spec["agent"]["model"]
+
+
+@pytest.mark.parametrize("ref", ["opencode", "claude_code", "agentdescent.agents:codex"])
+def test_text_refuses_workspace_agent(ws, capsys, ref):
+    assert _init("prompt.txt", "--kind", "text", "--agent", ref) == 2
+    assert not (ws / "spec.json").exists()
+    err = capsys.readouterr().err
+    assert "kind='text'" in err and ref in err
+
+
+@pytest.mark.parametrize("ref", ["host_model", "openai_compatible"])
+def test_skill_dir_refuses_plain_agent(ws, capsys, ref):
+    assert _init(str(ws / "my-skill"), "--agent", ref) == 2
+    assert not (ws / "spec.json").exists()
+    assert "WorkspaceAgent" in capsys.readouterr().err
+
+
+def test_skill_dir_keeps_workspace_agent(ws):
+    assert _init(str(ws / "my-skill"), "--agent", "opencode") == 0
+    assert json.loads((ws / "spec.json").read_text())["agent"] == {"ref": "opencode"}
+
+
+def test_custom_ref_is_not_second_guessed(ws):
+    assert _init("prompt.txt", "--kind", "text", "--agent", "mypkg.models:mine") == 0
+    assert json.loads((ws / "spec.json").read_text())["agent"] == {"ref": "mypkg.models:mine"}
+
+
+def test_policy_slot_keeps_explicit_agent(ws):
+    assert _init("selection", "--kind", "policy_slot", "--agent", "host_model") == 0
+    assert json.loads((ws / "spec.json").read_text())["agent"] == {"ref": "host_model"}
+
+
+@pytest.mark.parametrize("raw,canonical,target,kind", [
+    ("claude-code", "claude_code", "my-skill", []),
+    ("CLAUDE_CODE", "claude_code", "my-skill", []),
+    ("cli-agent", "cli_agent", "my-skill", []),
+    ("openai-compatible", "openai_compatible", "prompt.txt", ["--kind", "text"]),
+    ("Host-Model", "host_model", "prompt.txt", ["--kind", "text"]),
+])
+def test_agent_hyphen_case_aliases_fold(ws, raw, canonical, target, kind):
+    # Same case / "-" / "_" fold as --kind and algorithm params (#884).
+    path = "prompt.txt" if target == "prompt.txt" else str(ws / target)
+    assert _init(path, *kind, "--agent", raw) == 0
+    assert json.loads((ws / "spec.json").read_text())["agent"]["ref"] == canonical
+
+
+def test_algorithms_run_folds_host_spelling(ws):
+    rc = cli.main(["algorithms", "run", "archive_selection", str(ws / "my-skill"),
+                   "--agent", "claude-code", "--out", "spec.json"])
+    # Plan may still fail later (no cases / placeholder model). The alias must
+    # no longer be refused before write; the spec stores the canonical ref.
+    assert (ws / "spec.json").exists()
+    assert json.loads((ws / "spec.json").read_text())["agent"]["ref"] == "claude_code"
+    assert rc in (0, 2)
+
+
+def test_text_refuses_folded_workspace_host_spelling(ws, capsys):
+    # Folding must not bypass the kind mismatch gate (#456).
+    assert _init("prompt.txt", "--kind", "text", "--agent", "claude-code") == 2
+    assert not (ws / "spec.json").exists()
+    err = capsys.readouterr().err
+    assert "kind='text'" in err and "claude_code" in err
+
+
+@pytest.mark.parametrize("ref", ["grok-bot", "bogus"])
+def test_unknown_agent_refused_before_writing(ws, capsys, ref):
+    # A name `plan` can never resolve used to be written anyway, with an
+    # error listing policy classes as agents (#745). Hyphen/case aliases of
+    # a real worker now fold (#884); leftover unknowns still refuse first.
+    (ws / "spec.json").write_text('{"keep": 1}')
+    assert _init(str(ws / "my-skill"), "--agent", ref) == 2
+    assert json.loads((ws / "spec.json").read_text()) == {"keep": 1}
+    assert not list(ws.glob("spec.json.bak-*"))
+    err = capsys.readouterr().err
+    assert f"--agent {ref}: not a known agent" in err
+    assert "claude_code" in err and "opencode" in err
+    assert "Beam" not in err and "DefaultFusion" not in err
+    assert "did you mean `--agent claude_code`" not in err
+
+
+@pytest.mark.parametrize("ref", ["claude_code", "dsh", "codex", "cli_agent", "echo"])
+def test_known_agent_refs_still_accepted(ws, ref):
+    target = "prompt.txt" if ref == "echo" else str(ws / "my-skill")
+    kind = ["--kind", "text"] if ref == "echo" else []
+    assert _init(target, *kind, "--agent", ref) == 0
+    assert json.loads((ws / "spec.json").read_text())["agent"]["ref"] == ref
+
+
+@pytest.mark.parametrize("ref,worker", [("deepseek-harness", "dsh"), ("DeepSeek_Harness", "dsh"),
+                                        ("claudecode", "claude_code"), ("open-code", "opencode")])
+def test_install_host_alias_points_at_worker(ws, capsys, ref, worker):
+    # `install` folds these aliases to a host whose worker ref differs (#752).
+    assert _init(str(ws / "my-skill"), "--agent", ref) == 2
+    assert not (ws / "spec.json").exists()
+    assert f"did you mean `--agent {worker}`?" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("ref", ["grok-bot", "grok", "Grok_Bot"])
+def test_grok_bot_host_explains_no_worker(ws, capsys, ref):
+    rc = cli.main(["algorithms", "run", "ace", str(ws / "prompt.txt"),
+                   "--agent", ref, "--out", "spec.json"])
+    assert rc == 2
+    assert not (ws / "spec.json").exists()
+    err = capsys.readouterr().err
+    assert f"--agent {ref}: not a known agent" in err
+    assert "install host with no worker CLI" in err
+    assert "openai_compatible" in err and "did you mean" not in err
+
+
+def test_plain_unknown_agent_gets_no_host_hint(ws, capsys):
+    assert _init(str(ws / "my-skill"), "--agent", "bogus") == 2
+    err = capsys.readouterr().err
+    assert "install host" not in err and "did you mean" not in err
+
+
+@pytest.mark.parametrize("raw,canonical", [
+    ("claude-code", "claude_code"),
+    ("CLAUDE_CODE", "claude_code"),
+    ("openai-compatible", "openai_compatible"),
+    ("cli-agent", "cli_agent"),
+    ("deepseek-harness", "deepseek-harness"),
+    ("mypkg.models:mine", "mypkg.models:mine"),
+    ("claude_code", "claude_code"),
+])
+def test_fold_agent_ref(raw, canonical):
+    assert cli.fold_agent_ref(raw) == canonical
+

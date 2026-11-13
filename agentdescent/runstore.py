@@ -1,0 +1,1177 @@
+"""Where a run lives when the caller is not waiting for it.
+
+A run started from an agent session outlives the tool call that started it: MCP
+tool calls time out in seconds, hosts restart their servers between sessions, and
+an evolution takes minutes to hours. So a run is a **directory** plus a
+**detached process**, and every question about it is answered from the
+directory::
+
+    ~/.agentdescent/runs/<run_id>/
+        spec.json        what was asked (an EvolveSpec)
+        status.json      state, round, best reward, calls, pid -- rewritten atomically
+        rounds.jsonl     one RoundInfo per line, as they complete
+        result.json      EvolutionResult.save() when the run ends
+        tree/            the evolved directory, materialised (directory kinds)
+        ledger/          the git ledger; repo_path= to evolve(), which is what resume is
+        ledger/trajectories/  one record per rollout (task, output, reward) unless
+                         the spec sets record_rollouts: false; `show` reads it
+        log.txt          stdout + stderr of the detached process
+
+Three decisions, and why:
+
+**A process, not a thread.** The MCP server that starts a run is itself a child
+of the host and dies with it. A thread would take the run down; a process with
+its own session (``start_new_session``) does not, and its process group is also
+what :func:`cancel` signals, so the worker agents it spawned die with it.
+
+**Status is written atomically, from the ``on_round`` hook.** A reader can arrive
+at any moment, so the file is replaced (``os.replace``), never appended in
+place. The hook is the engine's own progress seam; nothing here polls the engine.
+
+**Resume is the ledger.** ``evolve(repo_path=<run>/ledger)`` resumes a ledger
+that exists, so re-launching the same spec on the same directory continues the
+run. Nothing is serialised beyond what the engine already persists.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import warnings
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, Iterator, List, Optional, Sequence
+
+from .evolution import EvolutionResult, RoundInfo
+
+__all__ = [
+    "STATES",
+    "serve_http",
+    "RunDir",
+    "RunStatus",
+    "RunStoreError",
+    "cancel",
+    "create",
+    "execute",
+    "get",
+    "launch",
+    "list_runs",
+    "require_budget_pair",
+    "resume",
+    "root",
+]
+
+STATES = ("created", "running", "done", "failed", "cancelled")
+
+_ENV_ROOT = "AGENTDESCENT_HOME"
+
+
+class RunStoreError(RuntimeError):
+    """A run directory that is missing, malformed, or in the wrong state."""
+
+
+#: Raised when ``budget_usd`` / ``--budget`` is set without a per-call price.
+#: Shared by CLI, MCP, ``launch``, and ``execute`` so the message never drifts.
+_BUDGET_NEEDS_PRICE = (
+    "budget_usd needs usd_per_call: the engine counts calls, "
+    "and a tool-using agent's price per call is not known in advance"
+)
+
+
+def require_budget_pair(budget_usd: Optional[float],
+                        usd_per_call: Optional[float]) -> None:
+    """Refuse a dollar budget that has no per-call price.
+
+    Must run **before** :func:`create` / :func:`launch`: otherwise a detach or
+    MCP ``start`` reports success, then ``status`` only shows the generic
+    "process ended without reporting" while the real reason sits in ``log.txt``.
+    """
+    if budget_usd is not None and not usd_per_call:
+        raise RunStoreError(_BUDGET_NEEDS_PRICE)
+
+
+def root() -> str:
+    """``$AGENTDESCENT_HOME/runs`` or ``~/.agentdescent/runs``.
+
+    Outside the repository on purpose: an installed package may be read-only, and
+    a run store inside a checkout would be committed by accident."""
+    home = os.environ.get(_ENV_ROOT) or "~/.agentdescent"
+    # Expanded and absolute (#402): a host config's `env` is not shell-expanded,
+    # so `AGENTDESCENT_HOME=~/x` arrives with a literal `~`.
+    return os.path.join(_normalise(home), "runs")
+
+
+def _normalise(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def store_path(store: Optional[str] = None) -> str:
+    """The run store a call with ``store=`` actually uses: ``~`` expanded, absolute.
+
+    A literal ``~`` reaches us whenever no shell expands it (an MCP host config's
+    ``args``/``env``, a quoted ``--store '~/st'``). Normalising only in
+    :class:`RunDir` made ``create`` write under ``$HOME`` while ``list_runs``
+    looked in ``./~`` and found nothing (#402)."""
+    return _normalise(store) if store else root()
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunStatus:
+    """The one file a host polls. Small on purpose: it is read once a round."""
+
+    run_id: str
+    state: str = "created"
+    round: int = 0
+    rounds: Optional[int] = None
+    best_reward: Optional[float] = None
+    last_reward: Optional[float] = None
+    #: Held-out reward of the seed before round 0 (#708). ``None`` until the
+    #: run finishes scoring it, or when seed scoring failed / predates the field.
+    initial_reward: Optional[float] = None
+    #: Reward on the test split the run carved out with ``test_frac`` (#843).
+    #: ``None`` for a run with no split, or one whose test scoring failed -- so
+    #: ``show`` can say "select set only" instead of inventing a number. Never
+    #: read by a merge decision.
+    test_reward: Optional[float] = None
+    committed: int = 0
+    #: ``propose`` calls that raised, summed over the rounds so far (#395), and
+    #: the first such exception as ``Type: message``. Non-zero with
+    #: ``committed == 0`` is a reflector that was never heard, not a run whose
+    #: proposals the gate declined.
+    propose_errors: int = 0
+    propose_error: Optional[str] = None
+    calls: int = 0
+    #: Work started but not yet finished: actor invocations, and the merge step
+    #: (``phase="merge"``). Non-zero means work is in flight even when ``calls``
+    #: is still 0 or has stopped moving (long first propose #358; a reflective
+    #: merge blocked on a model #380).
+    pending_calls: int = 0
+    #: Live phase while ``pending_calls`` is non-zero (``propose`` / ``run`` /
+    #: ``merge``). Cleared when nothing is pending.
+    phase: Optional[str] = None
+    rollouts: int = 0
+    #: Total tokens consumed (prompt + completion), when the agent reports
+    #: them. 0 for an opaque `run`/`propose` with no `usage=` shared — which is
+    # why it is an int and not Optional: "not reported" and "reported zero"
+    # read the same here, and neither is a state a person acts on.
+    tokens: int = 0
+    usd: Optional[float] = None
+    pid: Optional[int] = None
+    started: Optional[float] = None
+    updated: Optional[float] = None
+    finished: Optional[float] = None
+    stop_reason: Optional[str] = None
+    error: Optional[str] = None
+    kind: Optional[str] = None
+    target: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "RunStatus":
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    def alive(self) -> bool:
+        """Whether the recorded pid is still a live process (POSIX).
+
+        A zombie is not alive: ``kill(pid, 0)`` succeeds on one, so on Linux the
+        state letter in ``/proc/<pid>/stat`` is checked as well."""
+        if self.pid is None:
+            return False
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            with open(f"/proc/{self.pid}/stat") as fh:
+                return fh.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+        except OSError:
+            return True
+
+
+def _write_json(path: str, payload: Any) -> None:
+    """Replace ``path`` atomically; leave no sibling ``*.tmp`` on failure.
+
+    Encode first so a serializer refusal never creates a file. Write the
+    bytes to a unique sibling and ``os.replace``; always remove the sibling
+    in ``finally`` so a dump/replace error (or a raised ``default=str``)
+    cannot leave an orphan for a host that globs the run directory.
+    """
+    # Encode before touching the filesystem — same contract as checkpoint /
+    # FileCache / Ledger writes. ``default=str`` keeps Path/UUID notes
+    # round-trippable; ``OSError`` from the write still propagates.
+    blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(blob)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _read_json(path: str) -> Any:
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+
+def _finite_or_none(value: Any) -> Any:
+    """Replace a non-finite float with ``None``; leave everything else alone.
+
+    ``json.dumps`` with the default ``allow_nan=True`` emits the literal tokens
+    ``NaN`` / ``Infinity``, which Python's decoder accepts but browsers'
+    ``JSON.parse`` and ``jq`` refuse. A status payload that cannot be parsed
+    is a run the panel cannot show.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _sanitize_jsonable(obj: Any) -> Any:
+    """Walk a JSON-shaped tree and replace non-finite floats with ``None``."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_jsonable(v) for v in obj]
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# the run directory
+# ---------------------------------------------------------------------------
+
+
+#: One re-entrant lock per status file, shared by every `RunDir` for the same
+#: path in this process. `update_status` is a read-modify-replace of the whole
+#: JSON document, and async / multi-worker runs call it from actor threads
+#: (``Usage.on_change``) concurrently with ``on_round``; unserialized, a
+#: delayed write can restore stale ``round`` / ``calls`` / ``pending_calls``.
+_STATUS_LOCKS: Dict[str, "threading.RLock"] = {}
+_STATUS_LOCKS_GUARD = threading.Lock()
+
+
+def _status_lock(path: str) -> "threading.RLock":
+    key = os.path.abspath(path)
+    with _STATUS_LOCKS_GUARD:
+        lock = _STATUS_LOCKS.get(key)
+        if lock is None:
+            lock = _STATUS_LOCKS[key] = threading.RLock()
+        return lock
+
+
+@dataclass
+class RunDir:
+    """One run's directory and the files in it."""
+
+    path: str
+
+    def __post_init__(self) -> None:
+        # Absolute, always (#400). The detached launcher runs with this directory
+        # as its cwd and is handed `log_path` / `--run-dir` as arguments, so a
+        # relative `--store` made `./store/<id>/log.txt` resolve under the run
+        # directory and `resume` died before the run started.
+        self.path = os.path.abspath(os.path.expanduser(self.path))
+
+    @property
+    def run_id(self) -> str:
+        return os.path.basename(self.path.rstrip(os.sep))
+
+    def _file(self, name: str) -> str:
+        return os.path.join(self.path, name)
+
+    # -- files ---------------------------------------------------------------
+
+    @property
+    def spec_path(self) -> str:
+        return self._file("spec.json")
+
+    @property
+    def status_path(self) -> str:
+        return self._file("status.json")
+
+    @property
+    def rounds_path(self) -> str:
+        return self._file("rounds.jsonl")
+
+    @property
+    def result_path(self) -> str:
+        return self._file("result.json")
+
+    @property
+    def tree_path(self) -> str:
+        return self._file("tree")
+
+    @property
+    def ledger_path(self) -> str:
+        return self._file("ledger")
+
+    @property
+    def audit_path(self) -> str:
+        """Where a spec's ``audit`` block writes, by default.
+
+        Derived rather than configured, so the ``audit_*`` tools can find a
+        run's audit from its id. A run that writes its audit somewhere only the
+        caller knows is a run whose audit nobody reads.
+        """
+        return self._file("audit.jsonl")
+
+    @property
+    def log_path(self) -> str:
+        return self._file("log.txt")
+
+    @property
+    def trajectories_path(self) -> str:
+        """Where the engine keeps this run's rollout records (#452)."""
+        return os.path.join(self.ledger_path, "trajectories")
+
+    @property
+    def candidates_path(self) -> str:
+        """The diffs the merger measured, one JSON object per line (#452).
+
+        Beside ``rounds.jsonl``, not under the ledger: a rejected candidate is
+        derived data, and putting it in git history would balloon every commit
+        and replay transcripts onto every branch.
+        """
+        return self._file("candidates.jsonl")
+
+    # -- reads ---------------------------------------------------------------
+
+    def spec_dict(self) -> Dict[str, Any]:
+        return _read_json(self.spec_path)
+
+    def status(self) -> RunStatus:
+        try:
+            st = RunStatus.from_dict(_read_json(self.status_path))
+        except FileNotFoundError:
+            raise RunStoreError(f"{self.run_id}: no status.json; not a run directory") from None
+        # A process that died without writing a terminal state -- killed, OOM,
+        # machine rebooted -- must not read as "running" forever.
+        if st.state == "running" and not st.alive():
+            st.state = "failed"
+            st.error = (st.error
+                        or _error_from_log(self.log_path)
+                        or "process ended without reporting (killed, or the machine went away)")
+            st.finished = st.finished or st.updated
+            _write_json(self.status_path, st.to_dict())
+        return st
+
+    def rounds(self) -> List[Dict[str, Any]]:
+        """Every well-formed round, in file order.
+
+        A torn or corrupt line (kill mid-write, hand edit, non-JSON token) is
+        skipped rather than raised: one bad line must not hide every other
+        round from ``status``, MCP, or the loopback panel. Empty / whitespace
+        lines are ignored the same way. The file is read as bytes and decoded
+        per line, so a tear inside a multi-byte character costs that one line
+        rather than raising ``UnicodeDecodeError`` for the whole file.
+        """
+        try:
+            with open(self.rounds_path, "rb") as fh:
+                out: List[Dict[str, Any]] = []
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        row = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    if isinstance(row, dict):
+                        out.append(row)
+                return out
+        except FileNotFoundError:
+            return []
+
+    def result(self) -> Optional[EvolutionResult]:
+        if not os.path.exists(self.result_path):
+            return None
+        return EvolutionResult.load(self.result_path)
+
+    def log_tail(self, lines: int = 40) -> str:
+        try:
+            with open(self.log_path, encoding="utf-8", errors="replace") as fh:
+                return "".join(fh.readlines()[-lines:])
+        except FileNotFoundError:
+            return ""
+
+    # -- writes --------------------------------------------------------------
+
+    def status_lock(self) -> "threading.RLock":
+        """Re-entrant lock serializing this run's status read-modify-writes
+        within the process. Hold it around reading live values (``Usage``)
+        *and* the :meth:`update_status` that stores them, so a slower writer
+        cannot overwrite a newer snapshot with older numbers."""
+        return _status_lock(self.status_path)
+
+    def update_status(self, **changes: Any) -> RunStatus:
+        with self.status_lock():
+            try:
+                st = RunStatus.from_dict(_read_json(self.status_path))
+            except FileNotFoundError:
+                st = RunStatus(run_id=self.run_id)
+            for k, v in changes.items():
+                setattr(st, k, v)
+            st.updated = time.time()
+            _write_json(self.status_path, st.to_dict())
+            return st
+
+    def append_round(self, info: RoundInfo) -> None:
+        """Append one round as a single strict-JSON line.
+
+        Non-finite floats become ``null`` and ``allow_nan=False`` so the line
+        never carries the non-portable ``NaN`` / ``Infinity`` tokens that
+        break the status panel's ``JSON.parse``. Encode before opening the
+        file so a serializer refusal cannot leave a torn partial line. If the
+        file ends in a fragment with no newline (a process killed mid-write),
+        a newline goes first so the fragment stays its own skipped line
+        instead of swallowing this round on resume.
+        """
+        payload = _sanitize_jsonable(asdict(info))
+        data = (json.dumps(payload, default=str, allow_nan=False)
+                + "\n").encode("utf-8")
+        with open(self.rounds_path, "ab+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() > 0:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    data = b"\n" + data
+            fh.write(data)
+
+    def append_candidates(self, records: Sequence[Dict[str, Any]]) -> None:
+        """Append rejected-candidate records as strict-JSON lines (#452)."""
+        if not records:
+            return
+        payload = _sanitize_jsonable(list(records))
+        data = "".join(json.dumps(r, default=str, allow_nan=False) + "\n"
+                       for r in payload).encode("utf-8")
+        with open(self.candidates_path, "ab+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() > 0:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    data = b"\n" + data
+            fh.write(data)
+
+
+#: How many rejected candidates one round contributes, and how much of each
+#: diff/field is kept. Diagnosis needs the shape of the edit, not a transcript.
+CANDIDATES_PER_ROUND = 5
+CANDIDATE_DIFF_CHARS = 1200
+CANDIDATE_FIELD_CHARS = 300
+
+
+def _candidate_text(value: Any, limit: int = CANDIDATE_FIELD_CHARS) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def candidate_records(reports: Sequence[Any], round_index: int) -> List[Dict[str, Any]]:
+    """The rejected candidates in one round's merge reports, bounded (#452).
+
+    ``MergeReport.candidate_diff`` is the diff the merger actually measured; a
+    rejection used to leave only a counter. Files and a short diff are enough to
+    tell "the reflector proposed nothing useful" from "scoring is too strict".
+    """
+    out: List[Dict[str, Any]] = []
+    for rep in reports:
+        if len(out) >= CANDIDATES_PER_ROUND:
+            break
+        if getattr(rep, "committed_version", None) is not None:
+            continue
+        diff = getattr(rep, "candidate_diff", None)
+        if diff is None:
+            continue
+        ops = getattr(diff, "ops", None) or {}
+        try:
+            entries = list(ops.items())
+        except AttributeError:
+            entries = []
+        files = sorted(str(path) for path, _ in entries)[:20]
+        parts = []
+        for path, value in entries[:10]:
+            if value is None:
+                parts.append(f"- {path} (deleted)")
+            else:
+                parts.append(f"~ {path}:\n{_candidate_text(value, 400)}")
+        out.append({
+            "round": round_index,
+            "artifact_id": getattr(rep, "artifact_id", ""),
+            "diff_id": getattr(diff, "diff_id", ""),
+            "outcome": getattr(rep, "category", "") or "rejected",
+            "reason": _candidate_text(getattr(rep, "reason", "")),
+            "files": files,
+            "diff": _candidate_text("\n".join(parts), CANDIDATE_DIFF_CHARS),
+            "rationale": _candidate_text(getattr(diff, "rationale", "")),
+            "gated_reward": getattr(rep, "prob_improve", None),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the store
+# ---------------------------------------------------------------------------
+
+
+def _new_id() -> str:
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+
+def create(spec_dict: Dict[str, Any], *, run_id: Optional[str] = None,
+           store: Optional[str] = None) -> RunDir:
+    """Make a run directory and write the spec and an initial status. Runs nothing."""
+    base = store_path(store)
+    if os.path.exists(base) and not os.path.isdir(base):
+        raise RunStoreError(f"cannot create run store {base}: not a directory")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError as e:
+        # A read-only HOME, a container without a writable home, or a mistyped
+        # --store used to escape as a raw traceback (#907).
+        raise RunStoreError(
+            f"cannot create run store {base}: {e.strerror or e}") from e
+    rid = run_id or _new_id()
+    rd = RunDir(os.path.join(base, rid))
+    if os.path.exists(rd.path):
+        raise RunStoreError(f"run {rid!r} already exists")
+    try:
+        os.makedirs(rd.path)
+    except OSError as e:
+        raise RunStoreError(
+            f"cannot create run directory {rd.path}: {e.strerror or e}") from e
+    _write_json(rd.spec_path, spec_dict)
+    rd.update_status(state="created", kind=spec_dict.get("kind"),
+                     target=spec_dict.get("target"),
+                     rounds=(spec_dict.get("evolve") or {}).get("rounds"))
+    return rd
+
+
+def get(run_id: str, *, store: Optional[str] = None) -> RunDir:
+    base = store_path(store)
+    rd = RunDir(os.path.join(base, run_id))
+    if not os.path.isdir(rd.path):
+        raise RunStoreError(f"no run {run_id!r} under {base}")
+    return rd
+
+
+def list_runs(*, store: Optional[str] = None) -> List[RunStatus]:
+    """Every run's status, newest first."""
+    base = store_path(store)
+    if not os.path.isdir(base):
+        return []
+    out: List[RunStatus] = []
+    for name in sorted(os.listdir(base), reverse=True):
+        rd = RunDir(os.path.join(base, name))
+        if os.path.exists(rd.status_path):
+            try:
+                out.append(rd.status())
+            except (RunStoreError, ValueError):
+                continue
+    return out
+
+
+def _python() -> str:
+    return sys.executable or "python"
+
+
+def _child_pythonpath() -> str:
+    """Make sure the child can import *this* copy of the package.
+
+    Installed, this is a no-op; from a checkout (`pytest` puts the repo root on
+    `sys.path`, `pip` did not) the detached child has neither, and would die on
+    its first import with nothing in the store to say why."""
+    import agentdescent
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(agentdescent.__file__)))
+    existing = os.environ.get("PYTHONPATH", "")
+    return here if not existing else f"{here}{os.pathsep}{existing}"
+
+
+#: The intermediate that makes the run a grandchild. The parent waits for this
+#: one-liner and never for the run, so the run is re-parented to init and reaped
+#: there: a child the parent never `wait()`s for is a zombie, and a zombie still
+#: answers `kill(pid, 0)`, which read as "running" forever.
+_BOOTSTRAP = (
+    "import subprocess,sys\n"
+    "log=open(sys.argv[1],'a')\n"
+    "p=subprocess.Popen(sys.argv[2:],stdin=subprocess.DEVNULL,stdout=log,"
+    "stderr=subprocess.STDOUT,start_new_session=True)\n"
+    "print(p.pid)\n"
+)
+
+
+def _error_from_log(log_path: str) -> Optional[str]:
+    """Best-effort failure reason from a detached child's ``log.txt``.
+
+    Prefers a line the CLI already printed as ``error: …``; otherwise the last
+    non-empty line (often the exception after a traceback). Returns ``None`` when
+    the log is missing or empty so the caller can keep its generic fallback.
+    """
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    for line in reversed(lines):
+        if line.lower().startswith("error:"):
+            return line.split(":", 1)[1].strip()[:2000] or line[:2000]
+    return lines[-1][:2000]
+
+
+def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
+           usd_per_call: Optional[float] = None,
+           env: Optional[Dict[str, str]] = None) -> RunStatus:
+    """Start the run as a **detached** process and return at once.
+
+    The run is ``python -m agentdescent.cli run --run-dir <path>``, started by a
+    short-lived intermediate so it is a grandchild: in its own session (so it
+    survives the parent -- an MCP server the host restarts -- and so
+    :func:`cancel` can signal the whole group) and re-parented to init (so it is
+    reaped when it ends instead of lingering as a zombie that still looks alive).
+    Its stdout and stderr go to ``log.txt``.
+    """
+    require_budget_pair(budget_usd, usd_per_call)
+    st = rd.status()
+    if st.state == "running" and st.alive():
+        raise RunStoreError(f"{rd.run_id} is already running (pid {st.pid})")
+    argv = [_python(), "-m", "agentdescent.cli", "run", "--run-dir", rd.path]
+    if budget_usd is not None:
+        argv += ["--budget", str(budget_usd)]
+    if usd_per_call is not None:
+        argv += ["--usd-per-call", str(usd_per_call)]
+    child_env = {**os.environ, "PYTHONPATH": _child_pythonpath(), **(env or {})}
+    boot = subprocess.run([_python(), "-c", _BOOTSTRAP, rd.log_path, *argv],
+                          capture_output=True, text=True, cwd=rd.path, env=child_env)
+    if boot.returncode != 0 or not boot.stdout.strip().isdigit():
+        raise RunStoreError(f"could not start the run: {boot.stderr.strip()[:500]}")
+    pid = int(boot.stdout.strip())
+    return rd.update_status(state="running", pid=pid, started=time.time(),
+                            finished=None, error=None, stop_reason=None)
+
+
+def resume(run_id: str, *, store: Optional[str] = None, **launch_kwargs: Any) -> RunStatus:
+    """Re-launch a run on its existing ledger. The engine picks up where it stopped."""
+    rd = get(run_id, store=store)
+    st = rd.status()
+    if st.state == "running" and st.alive():
+        raise RunStoreError(f"{run_id} is still running (pid {st.pid})")
+    return launch(rd, **launch_kwargs)
+
+
+def cancel(run_id: str, *, store: Optional[str] = None, grace: float = 5.0) -> RunStatus:
+    """SIGTERM the run's process group, then SIGKILL what is left after ``grace``.
+
+    The group, not the pid: ``runners._sh`` gives every worker its own session so
+    a timeout can kill *its* children, but the run process itself is the parent of
+    the agent CLIs it spawns directly, and a cancel that left eight ``claude -p``
+    processes running would not be a cancel.
+    """
+    rd = get(run_id, store=store)
+    st = rd.status()
+    if st.pid is None or not st.alive():
+        if st.state == "running":
+            st = rd.update_status(state="cancelled", finished=time.time())
+        return st
+    pgid = None
+    try:
+        pgid = os.getpgid(st.pid)
+    except (ProcessLookupError, PermissionError, AttributeError):
+        pass
+    _signal(st.pid, pgid, signal.SIGTERM)
+    deadline = time.time() + grace
+    while time.time() < deadline and st.alive():
+        time.sleep(0.1)
+    if st.alive():
+        _signal(st.pid, pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    return rd.update_status(state="cancelled", finished=time.time(),
+                            stop_reason="cancelled")
+
+
+def _signal(pid: int, pgid: Optional[int], sig: int) -> None:
+    try:
+        if pgid is not None and hasattr(os, "killpg"):
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# the body of the detached process
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _plain_cli_warnings() -> Iterator[None]:
+    """Print AgentDescent package warnings as one plain line (#414, #654).
+
+    The default format is ``<file>:<line>: Category: <text>`` plus the source
+    line that raised it (``return evolve(self.tasks, ...)``), which means
+    nothing to a CLI user. Warnings raised from the ``agentdescent`` package
+    become ``warning: <text>`` instead. ``EarlyStopWarning`` is suppressed on
+    the terminal entirely: it only repeats ``EvolutionResult.error``, which the
+    status/summary line already shows (the error remains in ``status.json`` /
+    ``result.json``). Library callers of ``evolve()`` that skip this context
+    keep the default ``warnings`` format.
+    """
+    from .evolution import EarlyStopWarning
+
+    previous = warnings.formatwarning
+
+    def _from_package(filename: str) -> bool:
+        parts = os.path.normpath(filename).replace("\\", "/").split("/")
+        return "agentdescent" in parts
+
+    def fmt(message, category, filename, lineno, line=None):  # type: ignore[no-untyped-def]
+        if isinstance(message, EarlyStopWarning) or (
+                isinstance(category, type) and issubclass(category, EarlyStopWarning)):
+            return ""
+        if _from_package(filename):
+            return f"warning: {message}\n"
+        return previous(message, category, filename, lineno, line)
+
+    warnings.formatwarning = fmt
+    try:
+        yield
+    finally:
+        warnings.formatwarning = previous
+
+
+# Back-compat alias for the #414 name.
+_plain_held_out_warning = _plain_cli_warnings
+
+
+def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
+            usd_per_call: Optional[float] = None) -> EvolutionResult:
+    """Run the spec in ``rd`` **in this process**, keeping the directory current.
+
+    This is what the detached child calls; it is also usable directly for a
+    foreground run (``agentdescent evolve`` without ``--detach``). The engine's
+    ``on_round`` hook writes ``status.json`` and ``rounds.jsonl``; the ledger
+    lives under the run so a later :func:`resume` continues it; the result and
+    the materialised tree are written at the end whatever the outcome.
+    """
+    from .agents import Usage
+    from .evolvespec import EvolveSpec, compose
+    from .filetree import materialize
+
+    # Refuse before marking running: a missing usd_per_call must not look like a
+    # live run that later "ended without reporting".
+    try:
+        require_budget_pair(budget_usd, usd_per_call)
+    except RunStoreError as e:
+        rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
+        raise
+
+    spec = EvolveSpec.from_dict(rd.spec_dict())
+    usage = Usage()
+
+    def _progress() -> None:
+        # Mid-call rewrite so CLI/MCP status shows work in flight (#358).
+        # Advisory: a write failure must not take the actor down with it.
+        # Values are read under the status lock so concurrent callbacks from
+        # actor threads store snapshots in order, never an older one last.
+        try:
+            with rd.status_lock():
+                rd.update_status(calls=usage.calls,
+                                 pending_calls=usage.pending,
+                                 phase=usage.phase)
+        except Exception:
+            pass
+
+    usage.on_change = _progress
+    rd.update_status(state="running", pid=os.getpid(), started=time.time(),
+                     kind=spec.kind, target=spec.target)
+    best: List[float] = []
+
+    def on_round(info: RoundInfo) -> None:
+        rd.append_round(info)
+        # Non-finite rewards are a failed measurement, not a score: tracking
+        # them makes ``max(best)`` order-dependent (``max([1.0, nan])`` is
+        # 1.0 but ``max([nan, 1.0])`` is nan) and poisons status.json for
+        # the panel. Budget already skips them (#243); the store must too.
+        reward = _finite_or_none(info.held_out_reward)
+        if reward is not None:
+            best.append(reward)
+        with rd.status_lock():
+            _store_round(info, reward)
+
+    candidate_round = [0]
+
+    def on_reports(reports: Sequence[Any]) -> None:
+        # Keep what the merger measured and rejected, so a run that learned
+        # nothing can say *what* it proposed (#452). Same privacy knob as the
+        # rollout records: `record_rollouts: false` writes neither file.
+        records = candidate_records(reports, candidate_round[0])
+        candidate_round[0] += 1
+        if records:
+            rd.append_candidates(records)
+
+    def _store_round(info: RoundInfo, reward: Optional[float]) -> None:
+        changes: Dict[str, Any] = dict(
+            round=info.round + 1, last_reward=reward,
+            best_reward=max(best) if best else None, calls=usage.calls,
+            pending_calls=usage.pending, phase=usage.phase)
+        st = rd.status()
+        # `committed` is per round and accumulates; `rollouts` is already a
+        # running total ("Rollouts completed by the end of this round,
+        # cumulative" -- RoundInfo), so adding it summed a sum. Measured on a
+        # 630-round run: 1,270 calls and a reported 397,530 rollouts, which is
+        # 630x631 -- the triangular number, growing quadratically with rounds.
+        # A number in `status` is read by a person deciding whether to cancel.
+        changes["committed"] = st.committed + info.committed
+        if info.propose_errors:
+            changes["propose_errors"] = st.propose_errors + info.propose_errors
+            if st.propose_error is None:
+                changes["propose_error"] = info.propose_error
+        changes["rollouts"] = info.rollouts
+        # RoundInfo.tokens is the same running-total shape as rollouts; the
+        # meter sums prompt + completion, so this is the spend so far.
+        changes["tokens"] = info.tokens
+        if usd_per_call is not None:
+            changes["usd"] = round(usage.calls * usd_per_call, 4)
+        rd.update_status(**changes)
+
+    overrides: Dict[str, Any] = {}
+    if budget_usd is not None:
+        def stop_when(info: RoundInfo) -> bool:
+            # Asked between rounds, where max_calls is; the run overshoots by at
+            # most one round and reports the spend it actually incurred.
+            return usage.calls * usd_per_call >= budget_usd
+
+        overrides["stop_when"] = stop_when
+    # Keep the rollouts so `show` can say why the reward is what it is (#452).
+    # The engine's own store lands under the ledger (`ledger/trajectories/`,
+    # outside the ledger's git index). A spec that already chose where (or
+    # whether) to record in its `evolve` block keeps that choice.
+    if (spec.record_rollouts and "record_trajectories" not in spec.evolve
+            and "trajectory_store" not in spec.evolve and spec.kind != "policy_slot"):
+        overrides["record_trajectories"] = True
+    if spec.record_rollouts and spec.kind != "policy_slot":
+        # `show` reads the merger's rejected candidates back from this (#452).
+        overrides["on_reports"] = on_reports
+    try:
+        comp = compose(spec, usage=usage, on_round=on_round, repo_path=rd.ledger_path,
+                       **overrides)
+        rd.update_status(rounds=comp.kwargs.get("rounds"), notes=comp.notes,
+                         usd=None if usd_per_call is None else 0.0)
+        with _plain_cli_warnings():
+            result = comp.run()
+    except BaseException as e:  # noqa: BLE001 - the child must report before dying
+        rd.update_status(state="failed", finished=time.time(),
+                         pending_calls=0, phase=None,
+                         error=f"{type(e).__name__}: {e}"[:2000])
+        raise
+    result.save(rd.result_path)
+    if comp.tree is not None:
+        shutil.rmtree(rd.tree_path, ignore_errors=True)
+        materialize(result.state, rd.tree_path)
+    final = _finite_or_none(result.final_reward)
+    initial = _finite_or_none(getattr(result, "initial_reward", None))
+    rd.update_status(
+        state="failed" if result.error else "done", finished=time.time(),
+        stop_reason=result.stop_reason, error=result.error,
+        best_reward=max(best) if best else final,
+        last_reward=final, initial_reward=initial,
+        test_reward=_finite_or_none(getattr(result, "test_reward", None)),
+        calls=usage.calls, pending_calls=0, phase=None,
+        usd=None if usd_per_call is None else round(usage.calls * usd_per_call, 4))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# A read-only view over HTTP, for a host's UI to embed
+# ---------------------------------------------------------------------------
+
+#: Where ``agentdescent serve`` listens. Loopback only and read-only: the run
+#: store holds a spec, a diff and a reward curve, and anything that can reach
+#: this port can already read those files. Nothing here mutates a run -- start,
+#: cancel and apply stay on the CLI and the MCP server, where the user is.
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8787
+
+#: How often ``GET /api/runs/<id>/events`` checks ``rounds.jsonl`` for a new
+#: line. The stream is a local read model, not a message bus: polling a small
+#: append-only file is cheaper than wiring a thread-safe pub/sub just for this
+#: endpoint, and it keeps the server read-only. Tests pass a smaller value.
+EVENT_POLL_SECONDS = 0.5
+
+#: How long an idle stream waits before writing a ``: keep-alive`` comment.
+#: A module constant rather than a literal so a test can exercise the branch;
+#: proxies and browsers otherwise drop a connection that says nothing for a
+#: while, and the client would silently stop following a run with long rounds.
+EVENT_KEEPALIVE_SECONDS = 15.0
+
+
+def _run_id_in(rest: str) -> Optional[str]:
+    """The run id in the path after ``/api/runs/``, or ``None`` if it is not one.
+
+    A run id indexes a directory under the store, so a separator or a dot entry
+    is a traversal attempt. Both endpoints that take an id use this one check so
+    the SSE route and the JSON route cannot drift apart.
+    """
+    if not rest or "/" in rest or rest in (".", ".."):
+        return None
+    return rest
+
+
+_PANEL_HTML = """<!doctype html>
+<meta charset="utf-8"><title>AgentDescent runs</title>
+<style>
+ :root { color-scheme: light dark; --fg:#1a1a1a; --dim:#6b7280; --line:#e5e7eb; --ok:#15803d; --bad:#b91c1c; --run:#1d4ed8; }
+ @media (prefers-color-scheme: dark) { :root { --fg:#e5e7eb; --dim:#9ca3af; --line:#374151; --ok:#4ade80; --bad:#f87171; --run:#60a5fa; } }
+ body { font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; color: var(--fg); margin: 0; padding: 12px; }
+ h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; }
+ table { border-collapse: collapse; width: 100%; }
+ th { text-align: left; font-weight: 500; color: var(--dim); font-size: 11px; padding: 0 8px 4px 0; }
+ td { padding: 5px 8px 5px 0; border-top: 1px solid var(--line); vertical-align: top; }
+ .id { font-family: ui-monospace, monospace; font-size: 11px; }
+ .target { color: var(--dim); word-break: break-all; }
+ .done { color: var(--ok); } .failed, .cancelled { color: var(--bad); } .running { color: var(--run); }
+ .num { font-variant-numeric: tabular-nums; }
+ .empty { color: var(--dim); }
+</style>
+<h1>AgentDescent runs <span id="n" class="empty"></span></h1>
+<div id="out" class="empty">loading...</div>
+<script>
+const fmt = (v, d) => (v === null || v === undefined) ? d : v;
+async function tick() {
+  let runs;
+  try { runs = await (await fetch('api/runs', {cache: 'no-store'})).json(); }
+  catch (e) { document.getElementById('out').textContent = 'cannot reach the run store'; return; }
+  document.getElementById('n').textContent = runs.length ? '(' + runs.length + ')' : '';
+  if (!runs.length) { document.getElementById('out').innerHTML = '<p class="empty">No runs yet.</p>'; return; }
+  const rows = runs.map(r => {
+    const rounds = r.rounds ? (r.round + '/' + r.rounds) : String(r.round);
+    const best = r.best_reward === null || r.best_reward === undefined ? '-' : r.best_reward.toFixed(3);
+    const usd = r.usd === null || r.usd === undefined ? '' : ' $' + r.usd.toFixed(2);
+    return '<tr><td class="id">' + r.run_id + '</td>' +
+           '<td class="' + r.state + '">' + r.state + '</td>' +
+           '<td class="num">' + rounds + '</td>' +
+           '<td class="num">' + best + '</td>' +
+           '<td class="num">' + fmt(r.calls, 0) + usd + '</td>' +
+           '<td class="target">' + fmt(r.kind, '?') + ': ' + fmt(r.target, '?') + '</td></tr>';
+  }).join('');
+  document.getElementById('out').innerHTML =
+    '<table><tr><th>run</th><th>state</th><th>round</th><th>best</th><th>calls</th><th>target</th></tr>'
+    + rows + '</table>';
+}
+tick(); setInterval(tick, 4000);
+</script>
+"""
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    """Whether ``origin`` is a page served from this machine's loopback.
+
+    The check is on the *host* of the parsed origin, never a prefix match:
+    ``http://127.0.0.1.evil.com`` starts with the right characters and is a
+    remote site.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    return (parsed.hostname or "").lower() in ("127.0.0.1", "::1", "localhost")
+
+
+def _http_handler(store: Optional[str], event_poll: float):
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "agentdescent"
+
+        def _send(self, code: int, body: bytes, content_type: str) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            # A host's panel runs on another loopback port (dsh web is :3080),
+            # so it needs CORS to read the list -- but `*` would let any page
+            # the user happens to visit read their run store off localhost.
+            # So the Origin is echoed back only when it is itself loopback,
+            # which no remote page can claim.
+            origin = self.headers.get("Origin")
+            if origin and _is_loopback_origin(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, code: int, payload: Any) -> None:
+            # Sanitize before dump: a NaN in status/rounds would make
+            # ``allow_nan=False`` raise, and with ``allow_nan=True`` the
+            # browser's JSON.parse would refuse the body.
+            body = json.dumps(_sanitize_jsonable(payload), default=str,
+                              allow_nan=False).encode()
+            self._send(code, body, "application/json")
+
+        def _events(self, run_id: str) -> None:
+            """Stream this run's status and new rounds as Server-Sent Events.
+
+            The JSON endpoint answers "what is the state now"; a panel or a
+            platform needs "tell me when the next round lands" without polling.
+            The stream is read-only and poll-based: ``rounds.jsonl`` is appended
+            by the run's own process, so no in-process event bus is needed and
+            the server keeps its single read-only boundary.
+
+            Event ids are the 0-based append ordinal in ``rounds.jsonl``, so a
+            reconnecting client can send ``Last-Event-ID`` and resume after the
+            last event it saw.
+            """
+            try:
+                rd = get(run_id, store=store)
+            except RunStoreError as e:
+                return self._json(404, {"error": str(e)})
+
+            last_id = -1
+            raw_id = self.headers.get("Last-Event-ID")
+            if raw_id:
+                try:
+                    last_id = max(-1, int(raw_id))
+                except ValueError:
+                    last_id = -1
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            # A reverse proxy that buffers would hold every event until the
+            # response ends, which for a live run is never.
+            self.send_header("X-Accel-Buffering", "no")
+            origin = self.headers.get("Origin")
+            if origin and _is_loopback_origin(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+            self.end_headers()
+
+            def emit(event: str, payload: Any,
+                     event_id: Optional[int] = None) -> None:
+                if event_id is not None:
+                    self.wfile.write(f"id: {event_id}\n".encode())
+                self.wfile.write(f"event: {event}\n".encode())
+                body = json.dumps(_sanitize_jsonable(payload), default=str,
+                                  allow_nan=False)
+                self.wfile.write(("data: " + body + "\n\n").encode())
+                self.wfile.flush()
+
+            try:
+                # The client should reconnect after a dropped stream; the
+                # event ids make that resume rather than replay.
+                self.wfile.write(b"retry: 1000\n\n")
+                self.wfile.flush()
+                state = rd.status()
+                emit("status", state.to_dict())
+                last_state = state.state
+                last_keepalive = time.monotonic()
+                while True:
+                    state = rd.status()
+                    if state.state != last_state:
+                        emit("status", state.to_dict())
+                        last_state = state.state
+                    for seq, row in enumerate(rd.rounds()):
+                        if seq > last_id:
+                            emit("round", row, seq)
+                            last_id = seq
+                    if state.state in ("done", "failed", "cancelled"):
+                        self.close_connection = True
+                        return
+                    if time.monotonic() - last_keepalive >= EVENT_KEEPALIVE_SECONDS:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        last_keepalive = time.monotonic()
+                    time.sleep(event_poll)
+            except (BrokenPipeError, ConnectionResetError):
+                # The panel closed the tab; that is a normal end for a stream.
+                return
+
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path in ("/", "/index.html"):
+                return self._send(200, _PANEL_HTML.encode(), "text/html; charset=utf-8")
+            if path == "/api/runs":
+                return self._json(200, [s.to_dict() for s in list_runs(store=store)])
+            if path.startswith("/api/runs/"):
+                rest = path[len("/api/runs/"):]
+                if rest.endswith("/events"):
+                    run_id = _run_id_in(rest[:-len("/events")])
+                    if run_id is None:
+                        return self._json(400, {"error": "bad run id"})
+                    return self._events(run_id)
+                run_id = _run_id_in(rest)
+                if run_id is None:
+                    return self._json(400, {"error": "bad run id"})
+                try:
+                    rd = get(run_id, store=store)
+                    return self._json(200, {**rd.status().to_dict(), "rounds": rd.rounds()})
+                except RunStoreError as e:
+                    return self._json(404, {"error": str(e)})
+            self._json(404, {"error": "not found"})
+
+        def log_message(self, *args: Any) -> None:
+            """Silent: this runs under a host that owns the console."""
+
+    return Handler
+
+
+def serve_http(*, host: str = DEFAULT_HTTP_HOST, port: int = DEFAULT_HTTP_PORT,
+               store: Optional[str] = None, serve_forever: bool = True,
+               event_poll: float = EVENT_POLL_SECONDS):
+    """Serve the run store read-only on loopback, for a host UI to embed.
+
+    ``GET /`` is a small self-refreshing page, ``GET /api/runs`` the list,
+    ``GET /api/runs/<id>`` one run with its rounds, and
+    ``GET /api/runs/<id>/events`` a Server-Sent Events stream of status changes
+    and new rounds. Returns the server so a caller (a test) can drive it; with
+    ``serve_forever`` it blocks.
+
+    ``event_poll`` is how often the stream checks ``rounds.jsonl``; it is a
+    wall-clock knob for a local read model, not a result knob.
+    """
+    from http.server import ThreadingHTTPServer
+
+    if event_poll <= 0:
+        raise ValueError("event_poll must be positive")
+    httpd = ThreadingHTTPServer((host, port), _http_handler(store, event_poll))
+    if serve_forever:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+    return httpd

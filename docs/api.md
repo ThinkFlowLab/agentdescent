@@ -1,0 +1,6217 @@
+# API reference
+
+Every name `agentdescent` exports, grouped by the module it comes from.
+**Generated** from the package's own signatures and docstrings by
+`python -m tools.gen_api_docs` — `tests/test_api_reference.py` fails if this
+page and the code disagree, so a signature here is the signature you get.
+
+A signature too long for its heading is printed in full below it, one
+parameter per line, followed by a table of what each one does — type,
+default, and the docstring's own prose. `*required*` in the default column
+means the parameter has none.
+
+Each section links to the page that explains *why* the module is shaped the
+way it is; this page is the *what*.
+
+617 public names across 122 modules.
+
+---
+
+## The loop
+
+`evolve()`, the artifact, the actor, and what a run returns. &nbsp;·&nbsp; `agentdescent.evolution` &nbsp;·&nbsp; [guide](evolution.md)
+
+### `Agent`
+
+Convenience actor: bundles running a task and proposing an improvement.
+
+### `EvolutionResult(...)`
+
+```python
+EvolutionResult(
+    state: Dict[str, str],
+    rendered: str,
+    final_reward: float,
+    history: List[RoundInfo],
+    ledger_log: List[str],
+    initial_reward: Optional[float] = None,
+    test_reward: Optional[float] = None,
+    test_tasks: int = 0,
+    select_tasks: int = 0,
+    error: Optional[str] = None,
+    stop_reason: str = 'rounds',
+    forced_refreshes: int = 0,
+    stragglers: int = 0,
+    resumed: int = 0,
+    retired_workers: int = 0,
+    audit_drained: int = 0,
+    replay: Optional[Dict[str, Any]] = None,
+    curriculum: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    lineages: Optional[List[Dict[str, Any]]] = None,
+    usage: Usage = <factory>,
+    wallclock: float = 0.0,
+    rollouts: int = 0,
+    rollout_seconds: float = 0.0,
+    eval_seconds: float = 0.0,
+    merge_seconds: float = 0.0,
+    merge_gate_seconds: float = 0.0,
+    worker_starved_seconds: float = 0.0,
+    evals_skipped: int = 0,
+    bounded_scans_cut: int = 0,
+    stale_considered: int = 0,
+    stale_discarded: int = 0,
+    redispatched: int = 0,
+    duplicates_dropped: int = 0,
+    cas_conflicts: int = 0,
+    critic_checked: int = 0,
+    critic_rejected: int = 0,
+    cache_hits: int = 0,
+    cache_misses: int = 0,
+    trajectories_recorded: int = 0,
+    trajectories_dedup: int = 0,
+    trajectory_write_seconds: float = 0.0,
+    trajectory_write_failures: int = 0,
+    trajectories_path: Optional[str] = None,
+    invariant_checked: int = 0,
+    invariant_rejections: int = 0,
+    sandbox_wait_s: float = 0.0,
+    sandbox_setup_s: float = 0.0,
+    sandboxes_created: int = 0,
+    sandboxes_reused: int = 0,
+    sandbox_failures: int = 0,
+    fusion_trials: List['FusionTrial'] = <factory>,
+    budget: Optional[Dict[str, Any]] = None,
+    policy_digest: str = ''
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `cost_summary() -> str` | One line: what the run cost. Complements `outcomes()`, which says why it went as it did. |
+| `cost_to_quality(target: float) -> Optional[int]` | Rollouts spent up to the first round that reached `target`. |
+| `duplicate_rate() -> float` | Cache hits as a fraction of lookups -- work that did *not* have to be redone. In one process this is memoisation working; across processes it is the figure that says how much a shared cache would be worth. |
+| `fusion_stats() -> 'FusionStats'` | How often merging beat the best single diff -- and how badly it lost. |
+| `gate_share() -> float` | How much of the merger's busy time went to evaluation, in `[0, 1]`. |
+| `load(path: str) -> 'EvolutionResult'` | Read back a result written by `save`. |
+| `merger_occupancy() -> float` | Merger busy time over wall-clock. Above ~0.8 it is the critical path. |
+| `outcomes() -> Dict[str, int]` | Merge outcomes for the whole run, by category -- *why* it went as it did. |
+| `save(path: str) -> None` | Write the evolved artifact and its run summary to a JSON file. |
+| `stale_rate() -> float` | Discarded evidence as a fraction of evidence considered; 0.0 if none. |
+| `time_to_quality(target: float) -> Optional[float]` | Wall-clock at the first round whose held-out reward reached `target`. |
+| `write_to(...)` | Install a file-tree artifact back into a real directory. |
+
+### `EvolvingArtifact(...)`
+
+An `Evolvable`: flat state + a strategy.
+
+```python
+EvolvingArtifact(
+    id: str,
+    state: Optional[Dict[str, str]] = None,
+    version: int = 1,
+    blast_radius: float = 0.2,
+    runtime: Optional['_Runtime'] = None,
+    strategy: Optional[Strategy] = None,
+    contract: Optional[Contract] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `cheap_eval(evidence: EvidenceCard) -> float` | Score this artifact on the trajectories an evidence card carries. |
+| `evidence_eval(evidence: EvidenceCard) -> float` | Score this artifact on the trajectories an evidence card carries. |
+| `full_eval(task_set: Sequence[Task]) -> Dict[str, float]` | Score on a task set. No longer part of the `Evolvable` protocol -- the engine reaches ground truth through the verifier's `eval_fn` -- and kept because it is a convenient thing for a caller to have. |
+| `score(tasks: Sequence[Task]) -> float` | Mean reward over `tasks`, evaluated concurrently. |
+| `score_bounded(tasks: Sequence[Task], floor: float) -> float` | Mean reward, abandoned once it **provably** cannot exceed `floor`. |
+
+### `FusionStats(...)`
+
+The fusion tournament's record, with every denominator it needs.
+
+```python
+FusionStats(
+    trials: int = 0,
+    contested: int = 0,
+    unranked: int = 0,
+    single_candidate: int = 0,
+    contradiction: int = 0,
+    nothing_to_fuse: int = 0,
+    dominant_single: int = 0,
+    synthesis_failed: int = 0,
+    synthesized_wins: int = 0,
+    fused_wins: int = 0,
+    single_wins: int = 0,
+    neither: int = 0,
+    ties: int = 0,
+    mean_gain: float = 0.0,
+    negative: int = 0,
+    mean_loss: float = 0.0,
+    worst_loss: float = 0.0,
+    below_baseline: int = 0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `summary() -> str` | One line, and it says when there is nothing to report. |
+
+### `LLMAgent(...)`
+
+Adapt a `Completion` (from `agents`) into an `Agent`.
+
+```python
+LLMAgent(
+    complete: Completion,
+    solve_template: str = 'You are executing an artifact defined below.\n\n{artifact}\n\nApply it to this input and output ONLY the result, nothing else.\n\nInput:\n{prompt}',
+    propose_template: str = "The artifact just failed a task (score {reward:.2f} out of 1.0).\n\nArtifact so far:\n{artifact}\n\nTask input:\n{prompt}\n\nIt produced:\n{output}\n{expected}\nPropose exactly ONE concise, general rule (a single imperative sentence) to improve the artifact for this and similar cases. State the rule in general terms -- it will be applied to other tasks, so do NOT mention this task's specific values or answer. Output only the rule text, or NONE if no rule would help.",
+    show_meta: bool = True,
+    meta_chars: int = 600,
+    _empty_replies: int = 0
+) -> None
+```
+
+### `ProposalContractError`
+
+`propose` returned something that is not text (or `None`).
+
+### `RewardContractError`
+
+The caller's `reward` returned something outside the documented contract.
+
+### `RoundInfo(...)`
+
+```python
+RoundInfo(
+    round: int,
+    held_out_reward: float,
+    n_items: int,
+    committed: int,
+    rejected: int,
+    reasons: Dict[str, int] = <factory>,
+    elapsed_s: float = 0.0,
+    rollouts: int = 0,
+    calls: int = 0,
+    tokens: int = 0,
+    considered: int = 0,
+    discarded_stale: int = 0,
+    conflicts_dropped: int = 0,
+    fused: int = 0,
+    propose_errors: int = 0,
+    propose_error: Optional[str] = None
+) -> None
+```
+
+### `Task(id: str, prompt: str, meta: Dict[str, Any] = <factory>) -> None`
+
+One unit of work the artifact is evaluated on.
+
+### `claude_agent(model: str = 'claude-opus-4-8', max_tokens: int = 1024) -> LLMAgent`
+
+Convenience: `LLMAgent(claude(model))` (provider code lives in `agents`).
+
+### `evolve(...)`
+
+Evolve an artifact. Provide either `agent` (with `solve`/`propose`) or the `run` / `propose` callables directly.
+
+```python
+evolve(
+    tasks: Sequence[Task],
+    reward: Reward,
+    *,
+    agent: Optional[Agent] = None,
+    run: Optional[Run] = None,
+    propose: Optional[Propose] = None,
+    strategy: Optional[Strategy] = None,
+    parallel: Optional['ParallelStrategy'] = None,
+    task_sampler: Optional['TaskSampler'] = None,
+    initial_state: Optional[Dict[str, str]] = None,
+    blast_radius: float = 0.2,
+    artifact_id: str = 'artifact',
+    rounds: int = 15,
+    n_workers: int = 4,
+    max_concurrency: int = 1,
+    refresh_interval: int = 1,
+    round_timeout: Optional[float] = None,
+    target_reward: Optional[float] = None,
+    patience: Optional[int] = None,
+    max_worker_errors: int = 3,
+    eval_concurrency: int = 8,
+    asynchronous: bool = False,
+    async_ratio: int = 3,
+    resync_on_commit: bool = True,
+    pipelined_gate: bool = False,
+    gate_workers: int = 2,
+    max_seconds: Optional[float] = None,
+    max_rollouts: Optional[int] = None,
+    max_calls: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    stop_on_diminishing_returns: bool = False,
+    efficiency_floor: float = 0.25,
+    call_budget: Optional['CallBudget'] = None,
+    self_verify: bool = True,
+    held_out_frac: float = 0.4,
+    test_frac: float = 0.0,
+    repo_path: Optional[str] = None,
+    checkpointing: bool = False,
+    agg_config: Optional[AggregatorConfig] = None,
+    staleness_policy: Optional[StalenessPolicy] = None,
+    aggregator_factory: Optional[AggregatorFactory] = None,
+    oracle_budget: int = 200,
+    cheap_eval_tasks: Optional[int] = None,
+    fusion_tournament: Optional[bool] = None,
+    solved_threshold: float = 0.999,
+    shuffle: bool = False,
+    seed: int = 0,
+    on_round: Optional[Callable[['RoundInfo'], None]] = None,
+    on_reports: Optional[Callable[[Sequence[Any]], None]] = None,
+    stop_when: Optional[Callable[['RoundInfo'], bool]] = None,
+    verbose: bool = False,
+    usage: Optional[Usage] = None,
+    policies: Optional['Policies'] = None,
+    allocator: Optional[Any] = None,
+    record_trajectories: bool = False,
+    trajectory_store: Optional['TrajectoryStore'] = None,
+    contract: Optional[Contract] = None,
+    extra_artifacts: Optional[Dict[str, 'EvolvingArtifact']] = None,
+    population_islands: int = 0,
+    budget: Optional['BudgetSettings'] = None,
+    runtime: Optional['RuntimeSettings'] = None,
+    observability: Optional['ObservabilitySettings'] = None
+) -> EvolutionResult
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `tasks` | `Sequence[Task]` | *required* | The work the artifact is evaluated on. Split into train / held-out **by position** -- the last `held_out_frac` of the sequence is held out, in the order given. At least 4 are required and ids must be unique. |
+| `reward` | `Reward` | *required* | `(task, output) -> [0, 1]`. Scores in `[0, 1]`; the engine treats `>= solved_threshold` as a pass (no proposal is requested). |
+| `agent` | `Optional[Agent]` | `None` | An object with `solve` + `propose`. Provide this **or** `run` and `propose`; both signatures are checked before the first rollout. |
+| `run` | `Optional[Run]` | `None` | `run(rendered, task) -> output` and `propose(rendered, task, output, reward) -> str \| None`. |
+| `propose` | `Optional[Propose]` | `None` | As `run`. |
+| `strategy` | `Optional[Strategy]` | `None` | How the artifact is represented and how a proposal becomes a `Diff`. |
+| `parallel` | `Optional['ParallelStrategy']` | `None` | How a round's tasks are partitioned across workers. `DataParallel` (default) shards them; `TensorParallel(n_sections, keys=, route=)` also gives each worker a disjoint **section of the artifact** and rejects out-of-section edits -- counted as `section-violation` in `outcomes`. The pairing is validated before the first rollout: a strategy with no declared key space (`AppendRules`) or fewer keys than sections is refused rather than silently dropping most of its proposals. `PipelineParallel` raises (see above). |
+| `task_sampler` | `Optional['TaskSampler']` | `None` | **Which** task a worker rolls out next, from its shard. Defaults to `RoundRobin`; use `DifficultyWeighted` to spend rollouts on tasks that still carry a learning signal. |
+| `initial_state` | `Optional[Dict[str, str]]` | `None` | Seed the artifact instead of starting from `strategy.initial()`. Ignored when resuming an existing `repo_path`. |
+| `blast_radius` | `float` | `0.2` | Governance layer, in `[0, 1]` (see above). |
+| `artifact_id` | `str` | `'artifact'` | Name of the evolving artifact; becomes a filename, so it must match `[A-Za-z0-9_.-]+`. |
+| `rounds` | `int` | `15` | Number of round barriers to run. Sync-only. `evolve(asynchronous=True)` no longer reinterprets this as a rollout budget (#809) — pass `max_rollouts=` or call `async_evolve`. |
+| `n_workers` | `int` | `4` | Workers per round (`>= 1`). |
+| `max_concurrency` | `int` | `1` | How many of them actually run at once (see above). |
+| `refresh_interval` | `int` | `1` | How many rounds a worker keeps its ledger snapshot before taking the round's fresh one. `1` (default) is what this loop always did: every worker proposes against the current head, so a diff's staleness `eta` is **0 by construction** -- and that made `staleness_policy=` a knob with nothing to decide on this path (measured over an 8-round run: all 15 staleness decisions saw `eta=0` and returned ACCEPT, so Full, Guarded and Reflective were indistinguishable). Above `1`, workers hold a spread of versions -- the refresh is staggered by worker id -- so their diffs arrive with a spread of `eta` and the staleness policy, the `alpha` tolerances in `agg_config` and the `all-stale` outcome all become reachable synchronously. Costs no extra ledger read: a worker either adopts the snapshot the round already took, or keeps the older one it has. Ignored under `asynchronous=True`, where the lag budget is `async_ratio`. |
+| `round_timeout` | `Optional[float]` | `None` | Seconds a round will wait for its concurrent workers before giving up on the slow ones. `None` (default) waits forever, which is what you want when every rollout is bounded -- but a single hung rollout then stalls the run, because the aggregator is a barrier. Abandoned work keeps running in the background (Python cannot cancel a thread) and is simply not waited for; it is reported when `verbose`. Only applies when `max_concurrency > 1`. |
+| `target_reward` | `Optional[float]` | `None` | Stop as soon as held-out reward reaches this. Without it a run always spends all `rounds`, including after it has converged -- measured at 43% of rollouts wasted on an artifact that had stopped changing. |
+| `patience` | `Optional[int]` | `None` | Stop after this many consecutive rounds with no improvement in held-out reward. `None` disables it. Cheap insurance for a run that plateaus below `target_reward`. |
+| `max_worker_errors` | `int` | `3` | How much total failure to tolerate before giving up -- and only while *no* worker has ever completed a rollout, which reads as a misconfiguration (wrong key, dead endpoint). Once any worker has succeeded the backend demonstrably works, so failures are treated as transient and the run continues on whatever evidence it did gather. Counts consecutive failed rollouts per worker on the async path (see `result.retired_workers`) and consecutive rounds in which *every* worker failed on the sync path. |
+| `eval_concurrency` | `int` | `8` | How many held-out tasks to score at once. Every gate goes through this -- each round's measurement and, far more often, the aggregator's per-candidate comparisons -- so it is the merge half of the run's parallelism, independent of `n_workers`. `1` restores the old sequential behaviour. |
+| `asynchronous` | `bool` | `False` | **Deprecated bridge** to `async_evolve` (#809). Sync and async are two contracts, not a mode flag: prefer calling `async_evolve` directly. When `asynchronous=True`, both `max_seconds` and `max_rollouts` are required (no silent reinterpretation of `rounds`, no invented 20-second budget). `async_ratio` is the async lag budget. |
+| `async_ratio` | `int` | `3` | As `asynchronous`. |
+| `resync_on_commit` | `bool` | `True` | Asynchronous path only. Refresh every worker's snapshot as soon as a sweep commits, so no one *starts* a rollout against a superseded artifact. See `async_evolve`, which documents what it does and does not fix -- a commit landing mid-rollout still produces a stale card. |
+| `pipelined_gate` | `bool` | `False` | Under `asynchronous=True`, run a merge's **measurement** phase on its own threads instead of on the merger, so the merger goes back to draining while the gate runs. Off by default; documented in full on `async_evolve`, which implements it. Warns and does nothing on the synchronous path, where the round barrier idles every worker for the whole merge regardless. |
+| `gate_workers` | `int` | `2` | As `pipelined_gate`. |
+| `max_seconds` | `Optional[float]` | `None` | Wall-clock budget. `None` (default) means unbounded; the async path uses `20.0` when unset. |
+| `max_rollouts` | `Optional[int]` | `None` | The budget in the two units a comparison has to hold fixed: rollouts completed, and actor invocations (`run` + `propose`). `rounds` is not one of them -- configurations differ in how much model a round buys, so a budget fixed in rounds hands the wider configuration more model and then reports the extra model as a win for parallelism. Either bound stops the run with `stop_reason` `"max_rollouts"` / `"max_calls"`. **Checked at the round barrier, so a run overshoots by up to one round.** A round is dispatched or it is not; stopping halfway would leave a half-merged round, and the states a comparison compares are the ones a merge produced. So a budget is a *bound on where to stop*, never the number to compare on: read the spend the run actually reported (`result.rollouts`, `result.usage.calls`), which is what `baselines` does -- it refuses to call two arms equal-budget when their measured spends differ. The async path has no barrier and enforces both per rollout, so it overshoots by at most the rollouts already in flight. |
+| `max_calls` | `Optional[int]` | `None` | As `max_rollouts`. |
+| `max_tokens` | `Optional[int]` | `None` | Hard cap on total tokens consumed (`prompt_tokens + completion_tokens`). A reasoning model can spend 40k tokens on hidden thinking in one call, so `max_calls` and `max_rollouts` do not bound cost: a 20-round run with 4 workers is 80 rollouts and ~160 model calls, but at 40k tokens each that is 6.4M tokens -- the bill, not the count, is what a deployment needs to control. Checked at the round barrier alongside the other budgets; the async path checks per-rollout for tighter control. Stops with `stop_reason="max_tokens"`. `None` (default) means unbounded. |
+| `stop_on_diminishing_returns` | `bool` | `False` | Stop when the run's own return per token has fallen off its peak by more than `efficiency_floor`. The economic rule: keep buying compute while it pays, stop when it does not -- *even with budget left*. Off by default, because a run whose reward only rises late would be cut short by it, and because it needs `max_tokens` (return per token needs a cost to divide by). Stops with `stop_reason="diminishing_returns"`. |
+| `efficiency_floor` | `float` | `0.25` | How far below the peak counts as diminishing, when the stop above is on. Self-calibrating against the run's own best rate, so it is a *ratio*, not an absolute quantity: a reward is in `[0, 1]` and a token count is in the millions, and their quotient has no interpretable scale. |
+| `call_budget` | `Optional['CallBudget']` | `None` | An adaptive per-call thinking budget (o1-style test-time scaling). Pass a `CallBudget` whose `base` matches the adapter's configured `max_tokens`, and the engine adjusts the per-call ceiling based on each parent's score and the remaining budget — promising parents get more thinking, dead-end ones get less, and the allocation tightens as the token budget is spent. The adapter must be wrapped with `budgeted_completion` for this to reach it. `None` (default) means the per-call ceiling is the adapter's own and never changes. |
+| `self_verify` | `bool` | `True` | Re-run the trajectory with the diff applied to record a local before/after delta. Doubles the rollouts spent per proposal; ports that score candidates only on held-out should pass `False`. |
+| `held_out_frac` | `float` | `0.4` | Fraction of `tasks` reserved for held-out scoring, in `(0, 1)`. |
+| `test_frac` | `float` | `0.0` | Carve a **test** partition out of the held-out tail (#843). Selection and every gate keep reading the select partition; the test split is scored once, after the loop, and returned as `test_reward` (with `test_tasks` / `select_tasks` for the sizes). `0.0` (the default) is the old single-split run exactly -- the CLI then says the printed reward is select-set rather than an unseen test. Synchronous only: the async path warns that it does not split yet. |
+| `repo_path` | `Optional[str]` | `None` | Where the git-backed ledger lives. Omit for a throwaway repo that is removed when this call returns (not held until interpreter exit, so a sweep does not accumulate one git repo per run); **passing the same path again resumes** that ledger, and a caller-supplied path is never deleted. Git runs with an isolated config, so a personal `~/.gitconfig` (`commit.gpgsign`, `core.hooksPath`) cannot fail the ledger's own bookkeeping commits. |
+| `checkpointing` | `bool` | `False` | Save the aggregator's in-memory **search** state to `<repo_path>/checkpoints/` after every round, so a later run on the same `repo_path` resumes the search instead of re-deriving it from the ledger head. `repo_path` alone already resumes the *artifact*; what it cannot carry is what the search learned on the way there -- Beta posteriors, a population archive and its `selected` counts, the early-stop patience counter. Off by default, because a run that never resumes (a scratch repo, a tempdir) would pay the serialise-and-write for nothing, and because an aggregator opts in by implementing `checkpoint()` / `restore()` at all -- one without them is unaffected either way. A checkpoint that cannot be written or read (state that does not serialise, a lock another process holds, a full disk) is skipped, never raised: the cost of a missing checkpoint is a resume that starts the search fresh, which is what `False` does. |
+| `agg_config` | `Optional[AggregatorConfig]` | `None` | Tuning for the reference aggregator (batching, acceptance risk, trust region, staleness tolerance). |
+| `staleness_policy` | `Optional[StalenessPolicy]` | `None` | What to do with a diff proposed against an out-of-date version -- `full` / `guarded` (default) / `reflective`. |
+| `aggregator_factory` | `Optional[AggregatorFactory]` | `None` | Replace the optimizer entirely; receives `(ledger, verifier, audit, config, staleness_policy)`. |
+| `oracle_budget` | `int` | `200` | Hard cap on full held-out oracle evaluations during audits. Once spent, the verifier falls back to its cheap layer -- which only saves anything when `cheap_eval_tasks` makes that layer genuinely cheaper, so the two knobs go together. |
+| `cheap_eval_tasks` | `Optional[int]` | `None` | How many held-out tasks the *cheap* layer scores when the aggregator is merely **ranking** candidates -- conflict resolution, and the fusion tournament when it is on. `None` (default) is **8**, or the whole held-out set when that is smaller. It used to mean the whole set unconditionally, which made the cheap layer cost exactly what the oracle costs: ranking one candidate bought a full sweep of real agent calls, and `oracle_budget`'s fallback saved nothing because it was the same measurement. Nothing in `bench/` or `examples/` ever passed this, so every real run paid it. The cost of the new default is **ranking resolution**: 8 binary-scored tasks resolve 0.125, so two candidates closer than that are ordered by whichever the sample happens to favour. That is bounded to *which* candidate goes forward -- both commit gates read `eval_counts` on the full set, so it cannot decide whether a change is safe. Pass `len(held_out)` to restore the exact behaviour. The sample is fixed for the run, so candidates are always compared like-for-like. |
+| `fusion_tournament` | `Optional[bool]` | `None` | Rank the surviving diffs against their fusion before putting one forward. `None` (default) defers to `agg_config`, which is **off**. Off, because the ranking is paid every round while the only decision it changes from the acceptance gate's is recoverable: the union is a superset of every single diff, so committing it unranked loses no proposal. `DefaultFusion` carries the case analysis. On, because it is the only way to *measure* `win_rate` -- `best_single_score` exists only where a single was actually scored. That number is a property of the workload, not of the mechanism, so it is worth measuring per workload and not worth paying for on every run. |
+| `solved_threshold` | `float` | `0.999` | A reward at or above this counts as solved, so no proposal is requested and the task sampler counts a pass. The default (`SOLVED`, 0.999) is right for a binary scorer. **Lower it for a graded one** -- a ROUGE score or an LLM judge rarely reaches 0.999, so every rollout would ask the reflector to "fix" an answer that scored 0.95, and the run reports `below-threshold` as if the reflector were the problem. |
+| `shuffle` | `bool` | `False` | Shuffle `tasks` before that positional split. Off by default, which keeps a run reproducible and keeps `val_frac`'s promise that the engine's held-out split is exactly that `Dataset`'s `val`. Turn it on for **grouped** data -- anything ordered by category, source, difficulty or date -- where the tail of the file is a different distribution from the head, and every gate in the run (the acceptance test, `target_reward`, `final_reward`) would then be measured against it. |
+| `seed` | `int` | `0` | As `shuffle`. |
+| `on_round` | `Optional[Callable[['RoundInfo'], None]]` | `None` | Called with each `RoundInfo` as the round completes -- progress for a long run, which otherwise reports nothing until it returns. An exception raised here is reported but does not abort the run. |
+| `on_reports` | `Optional[Callable[[Sequence[Any]], None]]` | `None` | Called with each round's `MergeReport`s, before `on_round` reduces them to counters. Each report names the diff the merger measured (`candidate_diff`), so a caller can keep rejected candidates for a diagnosis instead of losing what a run that learned nothing proposed (#452). An exception raised here is reported, not fatal. |
+| `stop_when` | `Optional[Callable[['RoundInfo'], bool]]` | `None` | Called after `on_round` with the same `RoundInfo`; return `True` to end the run with `stop_reason="stop_when"`. This is the seam for a budget the engine does not know how to count -- dollars from a shared `Usage`, an external deadline, a kill file. It is asked where `max_seconds` / `max_calls` are, so it stops between rounds and never mid-merge, and the run keeps what it has committed. An exception raised here is reported, not fatal. |
+| `verbose` | `bool` | `False` | Print a line per round. Independent of the `RuntimeWarning` emitted when a run ends early -- that always fires. |
+| `usage` | `Optional[Usage]` | `None` | Share one `Usage` with your model adapters (`claude(usage=u)`, `openai_compatible(usage=u)`) and the result's token counts become real. Without it the run still reports calls, seconds and failures -- `run` is `(rendered, task) -> str`, so an opaque actor has no way to surface tokens, and inventing a number would be worse than reporting zero. |
+| `policies` | `Optional['Policies']` | `None` | Bundle of replaceable pieces (`Policies`). Every field defaults to `None` meaning "current behaviour", so `Policies()` and passing nothing are the same run. The individual keyword arguments -- `task_sampler`, `staleness_policy`, `aggregator_factory` -- are shortcuts onto its fields and keep working; an explicit argument wins over a bundle default rather than being silently ignored. Fields whose implementations have not landed yet raise rather than being accepted and ignored: a caller who passes a custom acceptance rule and sees a finished run would reasonably conclude it ran. New capabilities go here rather than adding another parameter to a function whose flat surface is already large — prefer a Policies field or a BudgetSettings / RuntimeSettings / ObservabilitySettings bag (#804). |
+| `allocator` | `Optional[Any]` | `None` | Value-directed budget allocation (see `allocator`). `None` (the default) is the old behaviour exactly: optional spend (fusion tournaments, the self-verify rollout) degrades against the global `soft_floor` / `hard_floor` thresholds as the token budget runs out, every candidate treated alike. Pass a `ValueBudgetAllocator` (or any object with `decide(ctx) -> AllocateDecision` and `observe(ctx, committed)`) and, once the budget is tight, the self-verify rollout is spent only on candidates the allocator's value model expects to commit; the merge path reports every outcome back so the model learns. Requires `max_tokens` to be set (the allocator decides how the budget is spent; `max_tokens` is what exists to spend). Counterfactual exploration re-measures candidates the model judged unworthy, so a biased value model is corrected rather than reinforced. |
+| `record_trajectories` | `bool` | `False` | Persist every rollout and gate evaluation as a `Trajectory` under `<repo_path>/trajectories/` -- what the run provider saw, what it returned, what that earned, against which artifact version and environment. Off by default: a throwaway repo's records die with it, so the write cost is pure overhead there, and recording is a deliberate choice about keeping a run's evidence. The store is the durable base every learning-type increment reads -- process-supervised reflection, offline re-weighting, audit replay -- and it is what an `EvidenceCard.trace_ids` entry points at. Pass `trajectory_store=` with a store you built to control where records land instead. |
+| `trajectory_store` | `Optional['TrajectoryStore']` | `None` | An explicit `TrajectoryStore` to record into. Pass one to control where records land (a shared store, a custom root, a custom privacy configuration) without going through the `<repo_path>/trajectories/` default. The explicit store wins over `record_trajectories`; `None` + `record_trajectories` builds the default store. |
+| `contract` | `Optional[Contract]` | `None` | The artifact's contract -- the externally-visible interface, and where governance invariants are declared. Pass `Contract(invariants=(Invariant("mutable_keys", ("a", "b")),))` and the aggregator enforces each rule **before** a candidate is measured (see `invariants`); a diff that breaks one reports a `violates-invariant` outcome and never buys a held-out sweep. `None` (the default) is the reference skill contract, which declares nothing and enforces nothing -- the untouched path exactly. |
+| `extra_artifacts` | `Optional[Dict[str, 'EvolvingArtifact']]` | `None` | Additional artifacts to register alongside the primary (`artifact_id`), as `{aid: EvolvingArtifact}`. The primary is the one the worker loop rolls out and proposes on; each extra is registered in the ledger and the worker proposes against it too, so a proposal can name one of them as a diff target and the aggregator merges it there (the evidence buffer already buckets by `diff.target`). `depends_on` on an extra's `Contract` declares which artifacts it relies on: a contract-breaking change to one re-measures its dependents (their cached scores were taken under the superseded contract) and lands atomically via `Ledger.commit_atomic`. Empty (the default) is the old single-artifact behaviour exactly. |
+| `population_islands` | `int` | `0` | How many **persistent head-islands** the population explores in parallel, on top of `dev` (see `PopulationAggregator`). Requires a declared selection policy (`Policies(selection=...)`). `0` (the default) keeps the old behaviour exactly: per-step forks that reset a policy's lineage. Above zero, `island_count` forks survive across steps and each keeps its own lineage, so tree-shaped policies (`CladeThompson`, `FlatPuct`) score *clades* -- the metaproductivity signal HGM's population search is built on. Islands checkpoint and resume like the rest of the population archive. |
+| `budget` | `Optional['BudgetSettings']` | `None` | Typed spend/stop bag (`BudgetSettings`). Prefer this for new budget knobs; flat `max_seconds` / `max_rollouts` / `max_calls` / `max_tokens` / … remain shortcuts onto its fields. See #804 and `EVOLVE_STABLE_SUBSET`. |
+| `runtime` | `Optional['RuntimeSettings']` | `None` | Typed runtime bag (`RuntimeSettings`). Workers, gates, data split, search extras. Flat kwargs remain shortcuts. |
+| `observability` | `Optional['ObservabilitySettings']` | `None` | Typed observability bag (`ObservabilitySettings`). Hooks, meters, trajectory recording. Flat kwargs remain shortcuts. |
+
+### `reflector(...)`
+
+Use any model as the *reflector* for an agent you already have.
+
+```python
+reflector(
+    complete: Completion,
+    template: str = "The artifact just failed a task (score {reward:.2f} out of 1.0).\n\nArtifact so far:\n{artifact}\n\nTask input:\n{prompt}\n\nIt produced:\n{output}\n{expected}\nPropose exactly ONE concise, general rule (a single imperative sentence) to improve the artifact for this and similar cases. State the rule in general terms -- it will be applied to other tasks, so do NOT mention this task's specific values or answer. Output only the rule text, or NONE if no rule would help.",
+    show_meta: bool = True
+) -> Propose
+```
+
+### `tasks_from(...)`
+
+Turn a list of dicts -- a dataset -- into `Task` objects.
+
+```python
+tasks_from(
+    rows,
+    prompt: str = 'prompt',
+    gold: str = 'gold',
+    id: Optional[str] = None,
+    **meta_keys: str
+) -> List['Task']
+```
+
+---
+
+## Meta-evolution
+
+Evolve a decision slot of `evolve()` itself, and validate it elsewhere. &nbsp;·&nbsp; `agentdescent.meta` &nbsp;·&nbsp; [guide](meta-evolution.md)
+
+### `ContinuousMetaReport(...)`
+
+What one `continuous_meta_run` session did, and why.
+
+```python
+ContinuousMetaReport(
+    slot: str,
+    seed_value: str,
+    value: str,
+    validation: Dict[str, Dict[str, float]],
+    mean_gain: float,
+    transfer: Optional[float],
+    verdict: str,
+    reason: str,
+    seeded_from: Optional[str],
+    fresh_seed_value: str,
+    fresh_gain: float,
+    fresh_transfer: Optional[float],
+    archived: bool,
+    archived_run_id: Optional[str],
+    archive_count: int
+) -> None
+```
+
+### `MetaOutcome(...)`
+
+What one inner run did under a candidate slot value.
+
+```python
+MetaOutcome(
+    curve: List[float] = <factory>,
+    final: float = 0.0,
+    rollouts: int = 0,
+    detail: Dict[str, Any] = <factory>
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `from_result(result: EvolutionResult, **detail: Any) -> 'MetaOutcome'` | Read an inner `EvolutionResult`. |
+
+### `MetaRunReport(...)`
+
+What a `meta_run` decided, and why.
+
+```python
+MetaRunReport(
+    slot: str,
+    seed_value: str,
+    value: str,
+    validation: Dict[str, Dict[str, float]],
+    mean_gain: float,
+    transfer: Optional[float],
+    verdict: str,
+    reason: str
+) -> None
+```
+
+### `ParamSlot(...)`
+
+The numeric hyper-parameters of any policy class, one key each.
+
+```python
+ParamSlot(
+    factory: Callable[..., Any],
+    params: Mapping[str, float],
+    bounds: Mapping[str, Tuple[float, float]] = <factory>,
+    title: str = '# Policy parameters',
+    invalid_proposals: int = 0,
+    _lock: threading.Lock = <factory>
+) -> None
+```
+
+### `PrioritySelection(...)`
+
+A `SelectionPolicy` driven by a `priority` rule.
+
+```python
+PrioritySelection(
+    source: str = 'def priority(rank, visits, total, prior, depth, n_nodes):\n    # Flat PUCT (ERA, futs.py): exploit by rank, explore by visit count.\n    c = 1.0\n    return rank + c * (1.0 / n_nodes) * math.sqrt(total) / (1 + visits)\n'
+) -> None
+```
+
+### `SlotSpec`
+
+A `Strategy` that also compiles.
+
+### `SourceSlot(...)`
+
+One slot of validated source, compiled by `build`.
+
+```python
+SourceSlot(
+    initial_value: str = '',
+    key: str = 'value',
+    empty_render: str = '(no instruction yet)',
+    min_chars: int = 1,
+    validate: Optional[Callable[[str], str]] = None,
+    build: Optional[Callable[[str], Any]] = None,
+    description: str = 'The value is source text; reply with the complete revised text.',
+    invalid_proposals: int = 0,
+    _lock: threading.Lock = <factory>
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `accepts(proposal: str) -> Tuple[bool, str]` | Would `to_diff` take this proposal? `(accepted, reason)`. |
+
+### `archive_rule(...)`
+
+Write an adopted slot rule back to the archive.
+
+```python
+archive_rule(
+    store: ConsolidationStore,
+    report: MetaRunReport,
+    result: EvolutionResult,
+    *,
+    run_id: str,
+    slot: str,
+    spec: SlotSpec,
+    config: Optional[Dict[str, Any]] = None,
+    problem: Optional[Dict[str, Any]] = None,
+    artifact_id: str = 'meta-rule',
+    trajectory_store: Optional[str] = None
+) -> ConsolidationRecord
+```
+
+### `auc(outcome: MetaOutcome) -> float`
+
+Mean best-so-far held-out reward over the inner run: how *fast* it rose.
+
+### `compile_policy_source(...)`
+
+Gate `source`, instantiate its `class_name`, and check it fits `slot`.
+
+```python
+compile_policy_source(
+    slot: str,
+    source: str,
+    *,
+    class_name: str = 'Policy',
+    smoke: Optional[Callable[[Any], None]] = None,
+    rng_seed: Optional[int] = None
+) -> Any
+```
+
+### `compile_priority(source: str) -> Callable[..., float]`
+
+AST-gate `source` and return its `priority` function.
+
+### `continuous_meta_run(...)`
+
+One session of continuous meta-learning: evolve, judge, archive.
+
+```python
+continuous_meta_run(
+    store: ConsolidationStore,
+    slot: str,
+    spec: SlotSpec,
+    propose: Optional[Callable[[str, Task, str, float], Optional[str]]] = None,
+    *,
+    tasks_for: Callable[[ConsolidationRecord], Sequence[Task]],
+    run: Callable[[str, Task], str],
+    reward: Callable[[Task, str], float],
+    inner_propose: Callable[[str, Task, str, float], Optional[str]],
+    inner_strategy: Any,
+    config: Optional[Dict[str, Any]] = None,
+    problems: Optional[Union[Sequence[Problem], Mapping[str, Problem]]] = None,
+    val_problems: Optional[Union[Sequence[Problem], Mapping[str, Problem]]] = None,
+    artifact_id: str = 'meta-rule',
+    train_runs: int = 2,
+    val_runs: int = 1,
+    inner: Optional[Dict[str, Any]] = None,
+    model: Optional[Completion] = None,
+    meta_reward: Optional[MetaReward] = None,
+    seeds: Sequence[int] = (0,),
+    val_seeds: Sequence[int] = (1, 2),
+    min_gain: float = 0.0,
+    transfer_floor: float = 0.0,
+    run_id: Optional[str] = None,
+    min_exam: Optional[str] = None,
+    **evolve_kwargs: Any
+) -> Tuple[ContinuousMetaReport, EvolutionResult]
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `store` | `ConsolidationStore` | *required* | The `ConsolidationStore` that makes the loop continuous: rules it already holds seed this session, and an adopted rule is written back to it. |
+| `slot` | `str` | *required* | As `meta_run` -- which `Policies` field evolves, how a value is represented/gated/compiled, and the reflector (pass `propose` directly or `model` to get `slot_reflector`). |
+| `spec` | `SlotSpec` | *required* | As `slot`. |
+| `propose` | `Optional[Callable[[str, Task, str, float], Optional[str]]]` | `None` | As `slot`. |
+| `tasks_for` | `Callable[[ConsolidationRecord], Sequence[Task]]` | *required* | Maps an archived `ConsolidationRecord` to the inner tasks of its problem -- the caller's data, read through the archive's configuration. |
+| `run` | `Callable[[str, Task], str]` | *required* | The inner `evolve()` domain functions, passed through to `problem_from_archive` for every rebuilt problem. |
+| `reward` | `Callable[[Task, str], float]` | *required* | As `run`. |
+| `inner_propose` | `Callable[[str, Task, str, float], Optional[str]]` | *required* | As `run`. |
+| `inner_strategy` | `Any` | *required* | As `run`. |
+| `config` | `Optional[Dict[str, Any]]` | `None` | This session's configuration (dataset/scorer/model/params), used to rank archived rules and written back with the adopted rule. |
+| `problems` | `Optional[Union[Sequence[Problem], Mapping[str, Problem]]]` | `None` | The fallback inner problems, used when the archive cannot fill a set (an empty archive is an ordinary `meta_run`). `inner` must describe how these were built for the archived descriptor to be faithful. |
+| `val_problems` | `Optional[Union[Sequence[Problem], Mapping[str, Problem]]]` | `None` | As `problems`. |
+| `artifact_id` | `str` | `'meta-rule'` | The archive `artifact_id` of rule records. |
+| `train_runs` | `int` | `2` | How many archived rules supply the train and validation problems. |
+| `val_runs` | `int` | `1` | As `train_runs`. |
+| `inner` | `Optional[Dict[str, Any]]` | `None` | The JSON-safe inner `evolve()` settings (`rounds`, `n_workers`, `target_reward` ...): defaults for rebuilt problems and the descriptor archived with an adopted rule. |
+| `model` | `Optional[Completion]` | `None` | As `meta_run`. |
+| `meta_reward` | `Optional[MetaReward]` | `None` | As `model`. |
+| `seeds` | `Sequence[int]` | `(0,)` | As `model`. |
+| `val_seeds` | `Sequence[int]` | `(1, 2)` | As `model`. |
+| `min_gain` | `float` | `0.0` | As `model`. |
+| `transfer_floor` | `float` | `0.0` | As `model`. |
+| `run_id` | `Optional[str]` | `None` | The archived `run_id` for the adopted rule; a unique `meta-<slot>-<unix time>-<random>` id when omitted (pass one explicitly when you need to find it again). |
+| `min_exam` | `Optional[str]` | `None` | The seeding bar applied to archived rules before they seed this session, via `verified_rules`: `None` (the default) keeps today's behaviour, `"flagged"` accepts flagged **and** passed rules, and `"passed"` seeds only certified rules. Any other value raises. |
+| `**evolve_kwargs` | `Any` |  | Everything else `meta_evolve` takes, except `initial_state` (this function sets it from the archive) and `strategy`/`run`/ `reward` (the inner domain's, passed above). Returns `(report, result)`; `report.value` is the evolved value and `report.verdict` the adopt/reject decision. |
+
+### `evolve_problem(...)`
+
+An inner `evolve()` as a `Problem`.
+
+```python
+evolve_problem(
+    tasks: Sequence[Task],
+    reward: Callable[[Task, str], float],
+    *,
+    slot: str,
+    base: Optional[Policies] = None,
+    **evolve_kwargs: Any
+) -> Problem
+```
+
+### `final_reward(outcome: MetaOutcome) -> float`
+
+The inner run's own final held-out reward, clipped to `[0, 1]`.
+
+### `meta_evolve(...)`
+
+Evolve one decision slot of the engine against a set of inner problems.
+
+```python
+meta_evolve(
+    problems: Union[Sequence[Problem], Mapping[str, Problem]],
+    *,
+    slot: str,
+    spec: SlotSpec,
+    propose: Optional[Callable[[str, Task, str, float], Optional[str]]] = None,
+    model: Optional[Completion] = None,
+    meta_reward: Optional[MetaReward] = None,
+    seeds: Sequence[int] = (0,),
+    blast_radius: float = 0.6,
+    artifact_id: str = 'policy-slot',
+    **evolve_kwargs: Any
+) -> EvolutionResult
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `problems` | `Union[Sequence[Problem], Mapping[str, Problem]]` | *required* | The inner problems, each `(value, seed) -> MetaOutcome` -- a list, or a mapping from a name to a problem (the name appears in task ids and in the reflector's prompt). `evolve_problem` builds one from the arguments of an inner `evolve()`. |
+| `slot` | `str` | *required* | Which `Policies` field the value fills; one of `SLOTS`. Recorded, and checked -- machinery fields refuse. |
+| `spec` | `SlotSpec` | *required* | How a value is represented, gated and compiled -- a `SlotSpec` such as `priority_selection` or a `ParamSlot`. |
+| `propose` | `Optional[Callable[[str, Task, str, float], Optional[str]]]` | `None` | The reflector. Pass `propose` directly, or `model` to get `slot_reflector` over the spec. One of the two is required. |
+| `model` | `Optional[Completion]` | `None` | As `propose`. |
+| `meta_reward` | `Optional[MetaReward]` | `None` | `MetaOutcome` to `[0, 1]`; `None` is `auc`. |
+| `seeds` | `Sequence[int]` | `(0,)` | Inner seeds per problem; each `(problem, seed)` pair is one outer task, so `len(problems) * len(seeds)` tasks in all, split into train and held-out by `held_out_frac` as `evolve()` always does. |
+| `blast_radius` | `float` | `0.6` | Governance. `0.6` is L1: the value is a harness and every merge also passes the oracle. |
+| `artifact_id` | `str` | `'policy-slot'` | As `blast_radius`. |
+| `**evolve_kwargs` | `Any` |  | Everything else `evolve` takes -- `rounds`, `n_workers`, `max_concurrency`, `held_out_frac`, `max_rollouts` ... `strategy`, `run` and `reward` are this function's and cannot be passed. Returns the ordinary `EvolutionResult`; `spec.compile(result.rendered)` is the evolved value, and `result.rendered` is what to hand `meta_validate`. |
+
+### `meta_run(...)`
+
+Evolve one decision slot, validate it on unseen problems, and decide.
+
+```python
+meta_run(
+    problems: Union[Sequence[Problem], Mapping[str, Problem]],
+    val_problems: Union[Sequence[Problem], Mapping[str, Problem]],
+    *,
+    slot: str,
+    spec: SlotSpec,
+    propose: Optional[Callable[[str, Task, str, float], Optional[str]]] = None,
+    model: Optional[Completion] = None,
+    meta_reward: Optional[MetaReward] = None,
+    seeds: Sequence[int] = (0,),
+    val_seeds: Sequence[int] = (1, 2),
+    min_gain: float = 0.0,
+    transfer_floor: float = 0.0,
+    baseline: Optional[str] = None,
+    **evolve_kwargs: Any
+) -> Tuple[MetaRunReport, EvolutionResult]
+```
+
+### `meta_validate(...)`
+
+Score `before` and `after` on problems the outer loop never saw.
+
+```python
+meta_validate(
+    spec: SlotSpec,
+    before: str,
+    after: str,
+    problems: Union[Sequence[Problem], Mapping[str, Problem]],
+    *,
+    seeds: Sequence[int] = (0,),
+    meta_reward: Optional[MetaReward] = None
+) -> Dict[str, Dict[str, float]]
+```
+
+### `policy_source(...)`
+
+The general spec: `slot`'s value is the source of a class satisfying its Protocol.
+
+```python
+policy_source(
+    slot: str,
+    seed: Optional[str] = None,
+    *,
+    class_name: str = 'Policy',
+    smoke: Optional[Callable[[Any], None]] = None,
+    notes: str = ''
+) -> SourceSlot
+```
+
+### `priority_selection(...)`
+
+The shipped spec for the `selection` slot of a tree search.
+
+```python
+priority_selection(
+    seed: str = 'def priority(rank, visits, total, prior, depth, n_nodes):\n    # Flat PUCT (ERA, futs.py): exploit by rank, explore by visit count.\n    c = 1.0\n    return rank + c * (1.0 / n_nodes) * math.sqrt(total) / (1 + visits)\n'
+) -> SourceSlot
+```
+
+### `problem_descriptor(slot: str, **inner: Any) -> Dict[str, Any]`
+
+The serializable shape of one inner `Problem`, for an archive.
+
+### `problem_from_archive(...)`
+
+Rebuild an inner `Problem` from an archived rule's descriptor.
+
+```python
+problem_from_archive(
+    store: ConsolidationStore,
+    run_id: str,
+    *,
+    tasks_for: Callable[[ConsolidationRecord], Sequence[Task]],
+    spec: SlotSpec,
+    run: Callable[[str, Task], str],
+    reward: Callable[[Task, str], float],
+    propose: Callable[[str, Task, str, float], Optional[str]],
+    strategy: Any,
+    **defaults: Any
+) -> Problem
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `store` | `ConsolidationStore` | *required* | The archive holding the record. |
+| `run_id` | `str` | *required* | Which archived run to rebuild from. `KeyError` when it is not archived or carries no problem descriptor. |
+| `tasks_for` | `Callable[[ConsolidationRecord], Sequence[Task]]` | *required* | Maps an archived `ConsolidationRecord` to the inner tasks its problem ran on. The caller owns the data; the archive owns the semantics and the configuration. |
+| `spec` | `SlotSpec` | *required* | The outer `SlotSpec` -- used as a guard, not as an input to the inner run: the record's `strategy` must be this spec's class name, the same "adopt through the strategy that wrote the state" rule `seed_from_archive` enforces. A record archived by a different spec is refused, never silently misread. |
+| `run` | `Callable[[str, Task], str]` | *required* | The inner problem's own `evolve()` parts -- the domain functions. |
+| `reward` | `Callable[[Task, str], float]` | *required* | As `run`. |
+| `propose` | `Callable[[str, Task, str, float], Optional[str]]` | *required* | As `run`. |
+| `strategy` | `Any` | *required* | As `run`. |
+| `**defaults` | `Any` |  | Inner `evolve()` settings. Each overrides the archived value: the descriptor says how the problem was run *then*; the caller may want it run differently *now*. |
+
+### `rollouts_to(target: float) -> MetaReward`
+
+`1 / (1 + sweeps until the curve first reaches target)`; 0 if never.
+
+### `seed_source(slot: str) -> str`
+
+A valid starting value for `slot`, as candidate source.
+
+### `slot_reflector(...)`
+
+A `propose` for `meta_evolve`: one model call per failing rollout.
+
+```python
+slot_reflector(
+    complete: Completion,
+    spec: SlotSpec,
+    *,
+    max_outcome_chars: int = 2000
+) -> Callable[[str, Task, str, float], Optional[str]]
+```
+
+### `transfer_ratio(...)`
+
+Gain on `target` over gain on `source`, from a `meta_validate` report.
+
+```python
+transfer_ratio(
+    report: Mapping[str, Mapping[str, float]],
+    source: str,
+    target: str
+) -> Optional[float]
+```
+
+---
+
+## Learn-to-think
+
+Evolve *when* the framework spends compute: direct, search, or reflect. &nbsp;·&nbsp; `agentdescent.learn_to_think` &nbsp;·&nbsp; [guide](meta-evolution.md)
+
+### `LearnToThinkReport(...)`
+
+What `learn_to_think` found: the evolved route rule and how its quality-per-cost compares with the default on validation problems.
+
+```python
+LearnToThinkReport(
+    seed_value: str,
+    value: str,
+    seed_score: float,
+    evolved_score: float,
+    gain: float,
+    routes_on: Dict[str, str]
+) -> None
+```
+
+### `learn_to_think(...)`
+
+Evolve the route rule on quality-per-cost.
+
+```python
+learn_to_think(
+    problems: Union[Sequence[Problem], Mapping[str, Problem]],
+    val_problems: Union[Sequence[Problem], Mapping[str, Problem]],
+    *,
+    propose: Optional[Callable[[str, Task, str, float], Optional[str]]] = None,
+    model: Optional[Any] = None,
+    seeds: Sequence[int] = (0, 1, 2, 3),
+    val_seeds: Sequence[int] = (4, 5, 6, 7),
+    seed_source: str = 'class Policy:\n    # Answer directly unless the task is hard and the budget allows a search.\n    def route(self, difficulty, budget_left, reward):\n        if difficulty >= 0.7 and budget_left >= 0.5:\n            return "search"\n        if difficulty >= 0.4:\n            return "reflect"\n        return "direct"\n',
+    **evolve_kwargs: Any
+) -> Tuple[LearnToThinkReport, EvolutionResult]
+```
+
+### `quality_per_cost(outcome: MetaOutcome) -> float`
+
+The outcome's reward, read back (already quality-per-cost).
+
+### `think_policy_spec(...)`
+
+The evolvable spec: the value is a `Policy.route` source, gated and compiled by `_build_route` (a smoke test runs the route on an easy, a hard-with-budget and a hard-without-budget input).
+
+```python
+think_policy_spec(
+    seed: str = 'class Policy:\n    # Answer directly unless the task is hard and the budget allows a search.\n    def route(self, difficulty, budget_left, reward):\n        if difficulty >= 0.7 and budget_left >= 0.5:\n            return "search"\n        if difficulty >= 0.4:\n            return "reflect"\n        return "direct"\n'
+) -> SourceSlot
+```
+
+### `think_problem(...)`
+
+A `Problem` over one workload instance.
+
+```python
+think_problem(
+    *,
+    lam: float = 0.1,
+    base_quality: Optional[Callable[[float], float]] = None
+) -> Problem
+```
+
+---
+
+## Agents and models
+
+Any `prompt -> text` is a completion; a `WorkspaceAgent` also has a directory. &nbsp;·&nbsp; `agentdescent.agents` &nbsp;·&nbsp; [guide](agents.md)
+
+### `AgentError`
+
+A tool-using agent failed; the message carries its stderr / exit status.
+
+### `ProviderConfigError`
+
+The provider refused the request for a reason no retry can change (#635).
+
+### `QuotaExhausted`
+
+The account's quota or billing limit is used up until a human acts (#653).
+
+### `SubscriptionInactive`
+
+The account has no active subscription or credit for this endpoint (#1006).
+
+### `Usage(...)`
+
+What a run cost: calls, tokens, and wall-clock spent in the model.
+
+```python
+Usage(
+    calls: int = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    seconds: float = 0.0,
+    failures: int = 0,
+    failure_seconds: float = 0.0,
+    on_change: Optional[Callable[[], None]] = None,
+    _lock: threading.Lock = <factory>
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `add_tokens(prompt_tokens: int = 0, completion_tokens: int = 0) -> None` | Add provider-reported tokens without counting a call or any time. |
+| `begin(phase: Optional[str] = None) -> int` | Mark an actor invocation as started; returns its token. |
+| `end(token: int) -> None` | Finish the invocation `begin` returned `token` for. |
+| `estimated_cost(per_1m_prompt: float, per_1m_completion: float) -> float` | Cost at the given per-million-token prices (both provider-specific). |
+| `record(...)` | Account one finished call. `finishes` is the `begin` token of the invocation this record completes; without it, in-flight state is left alone (an unpaired provider attempt is not the actor call). |
+| `token_sink() -> 'TokenSink'` | A `usage=` for a model adapter that adds only its **tokens** here. |
+
+### `WorkspaceAgent`
+
+A `Completion` that can additionally be bound to a directory.
+
+### `anthropic_compatible(...)`
+
+A completion for any **Anthropic-format** endpoint, with no SDK dependency.
+
+```python
+anthropic_compatible(
+    model: str,
+    *,
+    base_url_env: str = 'ANTHROPIC_BASE_URL',
+    api_key_env: str = 'ANTHROPIC_API_KEY',
+    default_base_url: str = 'https://api.anthropic.com',
+    version: str = '2023-06-01',
+    max_tokens: int = 4096,
+    timeout: float = 120.0,
+    usage: Optional[Usage] = None,
+    retries: int = 3,
+    **create_kwargs
+) -> Completion
+```
+
+### `claude(...)`
+
+A Claude-backed completion (requires `pip install anthropic` + creds).
+
+```python
+claude(
+    model: str = 'claude-opus-4-8',
+    max_tokens: int = 4096,
+    client: Optional[object] = None,
+    usage: Optional[Usage] = None,
+    retries: int = 3,
+    timeout: float = 120.0,
+    api_key_env: Optional[str] = None,
+    **create_kwargs
+) -> Completion
+```
+
+### `claude_code(...)`
+
+Claude Code in non-interactive print mode, as a `Completion`.
+
+```python
+claude_code(
+    *,
+    workspace: Optional[str] = None,
+    extra_args: Sequence[str] = (),
+    **kwargs
+) -> Completion
+```
+
+### `cli_agent(...)`
+
+Run any **command-line** coding agent as a `Completion`.
+
+```python
+cli_agent(
+    command: Sequence[str],
+    *,
+    workspace: Optional[str] = None,
+    via_stdin: bool = False,
+    timeout: float = 600.0,
+    env: Optional[Dict[str, str]] = None,
+    usage: Optional[Usage] = None,
+    isolate: bool = True
+) -> 'WorkspaceAgent'
+```
+
+### `codex(...)`
+
+OpenAI Codex CLI in non-interactive exec mode, as a `Completion`.
+
+```python
+codex(
+    *,
+    workspace: Optional[str] = None,
+    extra_args: Sequence[str] = (),
+    **kwargs
+) -> Completion
+```
+
+### `dsh(*, workspace: Optional[str] = None, extra_args: Sequence[str] = (), **kwargs) -> Completion`
+
+DeepSeek Harness (`dsh`) headless profile, as a `Completion`.
+
+### `echo(transform: Optional[Callable[[str], str]] = None) -> Completion`
+
+A deterministic, no-network completion for tests and dry runs.
+
+### `from_callable(fn: Completion) -> Completion`
+
+Identity adapter -- documents that any `prompt -> text` callable works.
+
+### `metered(completion: Completion, usage: Usage) -> Completion`
+
+Count calls and model wall-clock for *any* completion.
+
+### `openai_compatible(...)`
+
+A completion for any OpenAI-compatible chat endpoint (GLM/Zhipu, proxies, local servers, OpenAI itself).
+
+```python
+openai_compatible(
+    model: str,
+    *,
+    base_url_env: str = 'OPENAI_BASE_URL',
+    api_key_env: str = 'OPENAI_API_KEY',
+    default_base_url: str = 'https://api.openai.com/v1',
+    max_tokens: int = 4096,
+    timeout: float = 120.0,
+    usage: Optional[Usage] = None,
+    retries: int = 3,
+    stream: bool = False,
+    **create_kwargs
+) -> Completion
+```
+
+### `opencode(...)`
+
+OpenCode's non-interactive `run` mode, as a `Completion`.
+
+```python
+opencode(
+    *,
+    workspace: Optional[str] = None,
+    extra_args: Sequence[str] = (),
+    **kwargs
+) -> Completion
+```
+
+### `with_retries(...)`
+
+Wrap a completion with exponential-backoff retries on any exception.
+
+```python
+with_retries(
+    completion: Completion,
+    attempts: int = 3,
+    backoff: float = 0.5,
+    sleep: Callable[[float], None] = <built-in function sleep>,
+    rate_limit_backoff: float = 5.0,
+    max_sleep: float = 60.0
+) -> Completion
+```
+
+### `worker_env(...)`
+
+The environment a worker agent CLI runs with.
+
+```python
+worker_env(
+    workspace: Optional[str],
+    extra: Optional[Mapping[str, str]] = None,
+    *,
+    isolate: bool = True
+) -> Dict[str, str]
+```
+
+---
+
+## Directories as state
+
+Load a directory into state, materialise it back, serialise it losslessly. &nbsp;·&nbsp; `agentdescent.filetree` &nbsp;·&nbsp; [guide](directory-evolution.md)
+
+### `TreeError`
+
+A directory could not be represented as evolvable state, or vice versa.
+
+### `TreeSpec(...)`
+
+Which files make up an evolvable tree, and how big it may get.
+
+```python
+TreeSpec(
+    include: Sequence[str] = ('**/*.md', '**/*.txt', '**/*.py', '**/*.json', '**/*.yaml', '**/*.yml', '**/*.toml', '**/*.sh', '**/*.cfg', '**/*.ini'),
+    exclude: Sequence[str] = ('**/.git/**', '**/__pycache__/**', '**/node_modules/**', '**/.venv/**', '**/*.egg-info/**', '**/.pytest_cache/**', '**/.DS_Store'),
+    max_file_bytes: int = 28000,
+    max_files: int = 200,
+    max_total_bytes: int = 2000000
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `validate_against(trust_region_chars: int) -> None` | Fail now if the loader admits files the optimizer can never accept. |
+
+### `canonical(state: Mapping[str, str]) -> str`
+
+A lossless, stable serialisation of a file tree.
+
+### `load_tree(path: str, spec: Optional[TreeSpec] = None) -> Dict[str, str]`
+
+Read a directory into `{relpath: text}`.
+
+### `materialize(...)`
+
+Write a tree into `dest` (optionally under `prefix`); return the paths.
+
+```python
+materialize(
+    state: Mapping[str, str],
+    dest: str,
+    *,
+    prefix: str = '',
+    exec_patterns: Sequence[str] = ('**/*.sh', 'scripts/**', '**/bin/**')
+) -> List[str]
+```
+
+### `parse_tree(rendered: str) -> Dict[str, str]`
+
+The inverse of `canonical`.
+
+### `tree_summary(state: Mapping[str, str], limit: int = 40) -> str`
+
+A human/LLM-readable listing (paths + sizes), for prompts and logs.
+
+---
+
+## The file-tree strategy
+
+One state key per file, plus the multi-file proposal protocol. &nbsp;·&nbsp; `agentdescent.treestrategy` &nbsp;·&nbsp; [guide](directory-evolution.md)
+
+### `FileTree(...)`
+
+The artifact **is a directory**; each state key is a relative file path.
+
+```python
+FileTree(
+    initial_files: Mapping[str, str] = <factory>,
+    editable: Sequence[str] = ('**',),
+    frozen: Sequence[str] = (),
+    max_files_per_diff: int = 2,
+    max_file_bytes: int = 28000,
+    planned_paths: Sequence[str] = (),
+    validators: Sequence[Callable[[Mapping[str, str]], Optional[str]]] = ()
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `check_candidate(state: Mapping[str, str], ops: Mapping[str, Optional[str]]) -> Optional[str]` | Run `validators` on `state` with `ops` applied. |
+| `frozen_files(source: Mapping[str, str]) -> Dict[str, str]` | The pristine content of every frozen path, for the runner's overlay. |
+| `keys() -> Sequence[str]` | The declared key space, for `TensorParallel`. |
+| `writable(path: str) -> bool` | May the loop write this path? `frozen` beats `editable`. |
+
+### `parse_edits(proposal: str) -> Dict[str, Optional[str]]`
+
+Parse a reflector reply into `{path: new_content}` (`None` = delete).
+
+### `parse_proposal(proposal: str) -> Tuple[Dict[str, Optional[str]], str]`
+
+Parse a reflector reply into `(edits, rationale)`.
+
+### `tree_reflector(...)`
+
+A `propose` callable that asks `complete` for multi-file edits.
+
+```python
+tree_reflector(
+    complete: Completion,
+    *,
+    strategy: 'FileTree',
+    context_files: Sequence[str] = ('**/SKILL.md', '**/AGENT.md', '*.md'),
+    max_context_chars: int = 12000,
+    max_output_chars: int = 2000,
+    template: str = 'You maintain the files below. An agent used them to do a task and did poorly (reward {reward:.2f} out of 1.00). Improve the files so this class of failure stops happening -- generalise, do not hard-code this one case.\n\nFILES IN THE ARTIFACT:\n{listing}\n\n{contents}\nTASK THE AGENT WAS GIVEN:\n{prompt}\n\nWHAT THE AGENT PRODUCED:\n{output}\n{expected}\n{protocol}'
+) -> Any
+```
+
+---
+
+## Runners
+
+Give a real agent the candidate directory, one workspace per rollout. &nbsp;·&nbsp; `agentdescent.runners` &nbsp;·&nbsp; [guide](directory-evolution.md)
+
+### `PluginHost(...)`
+
+How one host loads an *uninstalled* plugin from a path, as data.
+
+```python
+PluginHost(
+    name: str,
+    entrypoint: Sequence[str],
+    setup: Optional[Sequence[str]] = None,
+    validate: Optional[Sequence[str]] = None,
+    env: Mapping[str, str] = <factory>
+) -> None
+```
+
+### `code_runner(...)`
+
+Run **candidate code** on a task: materialise, gate, execute.
+
+```python
+code_runner(
+    entrypoint: Sequence[str],
+    *,
+    layout: str = 'root',
+    name: str = 'agent',
+    setup_cmd: Optional[Sequence[str]] = None,
+    test_cmd: Optional[Sequence[str]] = None,
+    overlay: Optional[Mapping[str, str]] = None,
+    fixtures: Optional[Callable[[Task], Mapping[str, str]]] = None,
+    timeout: float = 120.0,
+    env: Optional[Mapping[str, str]] = None,
+    workspace_root: Optional[str] = None,
+    sandbox_pool: Optional['SandboxPool'] = None
+) -> Callable[[str, Task], str]
+```
+
+### `gated_reward(reward: Callable[[Task, str], float]) -> Callable[[Task, str], float]`
+
+`reward`, with a failed `code_runner` gate scoring 0.
+
+### `plugin_runner(...)`
+
+Run a **host plugin** on a task: materialise it, load it into an isolated copy of the host, gate it, then run the host on the prompt.
+
+```python
+plugin_runner(
+    host: Union[str, PluginHost],
+    *,
+    name: str = 'plugin',
+    agent_args: Sequence[str] = (),
+    env_passthrough: Sequence[str] = (),
+    overlay: Optional[Mapping[str, str]] = None,
+    fixtures: Optional[Callable[[Task], Mapping[str, str]]] = None,
+    timeout: float = 900.0,
+    workspace_root: Optional[str] = None,
+    sandbox_pool: Optional['SandboxPool'] = None
+) -> Callable[[str, Task], str]
+```
+
+### `tree_runner(...)`
+
+Build a `run(rendered, task)` that gives `agent` the evolving directory.
+
+```python
+tree_runner(
+    agent: Completion,
+    *,
+    layout: str = 'claude_skill',
+    name: str = 'artifact',
+    prompt_template: str = '{prompt}\n\n(The files under {tree_dir} in this directory are available to you; read them and follow them. Reply with only the final answer.)',
+    overlay: Optional[Mapping[str, str]] = None,
+    fixtures: Optional[Callable[[Task], Mapping[str, str]]] = None,
+    answer_file: Optional[str] = None,
+    keep_failed: bool = False,
+    workspace_root: Optional[str] = None,
+    sandbox_pool: Optional['SandboxPool'] = None
+) -> Callable[[str, Task], str]
+```
+
+---
+
+## The data model
+
+What a unit of evolution is, and what a gradient looks like here. &nbsp;·&nbsp; `agentdescent.evolvable` &nbsp;·&nbsp; [guide](data-model.md)
+
+### `Contract(...)`
+
+The externally-visible interface of an artifact.
+
+```python
+Contract(
+    input_schema: str = 'any',
+    output_schema: str = 'any',
+    side_effects: Tuple[str, ...] = (),
+    major: int = 1,
+    invariants: Tuple[Any, ...] = (),
+    depends_on: Tuple[str, ...] = ()
+) -> None
+```
+
+### `ContractError`
+
+The caller's own code broke a documented contract.
+
+### `Diff(...)`
+
+A proposed change to an artifact's state.
+
+```python
+Diff(
+    diff_id: str,
+    target: str,
+    ops: Dict[str, Any] = <factory>,
+    contract_breaking: bool = False,
+    author: str = 'unknown',
+    rationale: str = ''
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `size() -> int` | A crude "number of edited lines" proxy used by the trust-region cap (design doc, section 4.4). |
+
+### `EvidenceCard(...)`
+
+The "gradient metadata" carried by every diff (design doc, section 3.3).
+
+```python
+EvidenceCard(
+    diff: Diff,
+    base_version: VersionVector,
+    touched: List[str],
+    before_after_delta: float = 0.0,
+    trajectory_refs: List[Any] = <factory>,
+    trace_ids: Tuple[str, ...] = <factory>,
+    advantage: Optional[float] = None,
+    cost_tokens: int = 0,
+    cost_wallclock: float = 0.0,
+    branch: Optional[str] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `rebased_onto(head: VersionVector) -> 'EvidenceCard'` | Return a copy whose base is advanced to `head` for touched keys. |
+
+### `Evolvable`
+
+The single interface every unit of evolution must satisfy.
+
+### `stable_hash(key: Any) -> int`
+
+A process-independent hash for seeding and partitioning.
+
+### `vv_dominates(a: VersionVector, b: VersionVector) -> bool`
+
+Return True if `a` is at least as new as `b` on every shared key.
+
+### `vv_staleness(head: VersionVector, base: VersionVector) -> int`
+
+Per-diff staleness `eta` (design doc, section 4.2).
+
+---
+
+## The aggregator (the optimizer)
+
+Staleness filter, conflict resolution, fusion, acceptance, commit. &nbsp;·&nbsp; `agentdescent.aggregator` &nbsp;·&nbsp; [guide](aggregator.md)
+
+### `Aggregator(...)`
+
+Per-artifact optimizer step over the ledger.
+
+```python
+Aggregator(
+    ledger: Ledger,
+    verifier: ThreeLayerVerifier,
+    audit: AuditScheduler,
+    config: Optional[AggregatorConfig] = None,
+    staleness_policy: Optional[StalenessPolicy] = None,
+    meter: Optional['Meter'] = None,
+    conflict: Optional['ConflictPolicy'] = None,
+    fusion: Optional['FusionPolicy'] = None,
+    acceptance: Optional['AcceptancePolicy'] = None,
+    promotion: Optional['PromotionPolicy'] = None,
+    screen: Optional['ScreenPolicy'] = None,
+    policy_digest: str = ''
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `begin_step(*, skip_in_flight: bool = False) -> List[Union['_Candidate', MergeReport]]` | Phases 1 and 2: tick, drain what is ready, choose candidates. |
+| `checkpoint() -> Optional[dict]` | Serialise the search state the ledger does not persist. |
+| `finalize() -> None` | Publish the current dev head to stable at the end of a clean run. |
+| `finish_step(items: List[Union['_Candidate', MergeReport]]) -> List[MergeReport]` | Phase 3: decide the measured candidates, then age and promote. |
+| `head_for_worker(worker_id: int = 0) -> str` | The ledger branch a worker should snapshot and propose against. |
+| `measure(items: List[Union['_Candidate', MergeReport]]) -> List[Union['_Candidate', MergeReport]]` | Phase 2 for a batch from `begin_step`. **Off-thread safe.** |
+| `recent_settled(task: Any, n: int = 3) -> List[EvidenceCard]` | The most recent N settled cards whose trajectory_refs mention task. |
+| `restore(state: dict) -> None` | Restore state written by `checkpoint`. |
+| `set_settled_consumer(consumer: Optional[Callable[[EvidenceCard], None]]) -> None` | Subscribe a consumer to the settled-evidence pool. |
+| `step(n_workers: int = 1) -> List[MergeReport]` | Fire every artifact bucket that is ready and return per-artifact reports. |
+
+### `AggregatorConfig(...)`
+
+```python
+AggregatorConfig(
+    batch_trigger: int = 4,
+    max_wait_rounds: int = 3,
+    base_delta: float = 0.5,
+    alpha_head: int = 5,
+    alpha_tail: int = 1,
+    trust_region_ops: int = 6,
+    trust_region_chars: int = 32000,
+    trust_region_policy: Optional[Any] = None,
+    promote_after_k: int = 3,
+    anneal_half_life: int = 64,
+    accept_samples: int = 4000,
+    cas_attempts: int = 3,
+    cas_backoff: float = 0.05,
+    audit_drain_per_step: int = 0,
+    fusion_tournament: bool = False,
+    bounded_gate: bool = False
+) -> None
+```
+
+### `AggregatorContractError`
+
+A custom aggregator returned something `step()` may not return.
+
+### `AggregatorProtocol`
+
+The contract a custom aggregator must satisfy to plug into `evolve`.
+
+### `EvidenceBuffer() -> None`
+
+Cards bucketed by (target artifact, branch) (design doc, section 4.1).
+
+| method | what it does |
+|---|---|
+| `drain(aid: str) -> Dict[str, List[EvidenceCard]]` | Pop every bucket for `aid`, grouped by branch (`""` = dev). |
+| `ready(config: AggregatorConfig) -> List[str]` | Artifact ids with a ready bucket. Each id is listed once, whatever branches it has: the caller drains all of them and merges per branch. |
+| `recent_settled(task: Any, n: int = 3) -> List[EvidenceCard]` | The most recent N settled cards whose `trajectory_refs` mention `task`. |
+| `set_settled_consumer(consumer: Optional[Callable[[EvidenceCard], None]]) -> None` | Subscribe a consumer to every card that is settled. |
+| `settle(cards: List[EvidenceCard]) -> None` | Keep discarded-diff evidence addressable, under a hard bound. |
+
+### `MergeOutcome`
+
+The vocabulary of `category`.
+
+| member | value |
+|---|---|
+| `COMMITTED` | `'committed'` |
+| `BELOW_THRESHOLD` | `'below-threshold'` |
+| `ALL_STALE` | `'all-stale'` |
+| `OVERSIZED` | `'oversized'` |
+| `ORACLE_REJECTED` | `'oracle-rejected'` |
+| `CAS_CONFLICT` | `'cas-conflict'` |
+| `UNKNOWN_ARTIFACT` | `'unknown-artifact'` |
+| `VIOLATES_INVARIANT` | `'violates-invariant'` |
+| `MISSING_ADAPTERS` | `'missing-adapters'` |
+| `CRITIC_REJECTED` | `'critic-rejected'` |
+| `NEEDS_APPROVAL` | `'needs-approval'` |
+| `APPROVAL_REJECTED` | `'approval-rejected'` |
+| `NOISE_FLOOR` | `'noise-floor'` |
+| `COST_RULE` | `'cost-rule'` |
+
+### `MergeReport(...)`
+
+```python
+MergeReport(
+    artifact_id: str,
+    accepted: Optional[Diff],
+    fused: bool,
+    considered: int,
+    survived_staleness: int,
+    discarded_stale: int,
+    conflicts_dropped: int,
+    prob_improve: float,
+    committed_version: Optional[int],
+    reason: str = '',
+    category: str = '',
+    oversized: int = 0,
+    candidate_diff: Optional[Diff] = None
+) -> None
+```
+
+### `diffs_conflict(a: Diff, b: Diff) -> bool`
+
+Syntactic overlap: do two diffs edit an overlapping set of keys?
+
+### `diffs_contradict(a: Diff, b: Diff) -> bool`
+
+Semantic contradiction: same key, different proposed value.
+
+### `fuse_diffs(diffs: List[Diff]) -> Diff`
+
+Merge complementary (non-contradicting) diffs into one candidate.
+
+---
+
+## The ledger
+
+The git-backed, compare-and-swap artifact store. &nbsp;·&nbsp; `agentdescent.ledger` &nbsp;·&nbsp; [guide](ledger.md)
+
+### `CASConflict`
+
+Raised when a commit's declared base version is stale.
+
+### `ContractRejected`
+
+Raised when a commit would change an artifact's contract major.
+
+### `GitError`
+
+A git command failed; the message carries git's own stderr.
+
+### `Ledger(...)`
+
+A git-backed, version-vectored artifact store with dual branches.
+
+```python
+Ledger(
+    repo_path: str,
+    serialize: Serializer,
+    deserialize: Deserializer,
+    author: str = 'agentdescent <bot@agentdescent.local>'
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `close() -> None` | Refuse further use of this ledger. Idempotent. |
+| `commit(...)` | Compare-and-swap commit of a single artifact. |
+| `commit_atomic(...)` | Two-phase, all-or-nothing commit of several artifacts. |
+| `discard_head(name: str) -> None` | Delete a forked head branch. |
+| `fork(name: str, from_branch: str = 'dev') -> str` | Create or reset `name` to hold `from_branch`'s current state. |
+| `live_heads() -> List[str]` | Every live head branch: `dev` first, then the `head/` forks. |
+| `promote_to_stable(artifact_id: str) -> Optional[int]` | EMA-style confirmation: copy dev's current artifact onto stable. |
+| `register(artifact: Evolvable, branch: str = 'dev') -> None` | Add a brand-new artifact at version 1 on both branches. |
+| `snapshot(branch: str = 'dev') -> Snapshot` | Materialize every artifact on `branch` into live Evolvables. |
+
+### `Snapshot(artifacts: Dict[str, Evolvable], version: VersionVector) -> None`
+
+An immutable view of one branch at one point in time.
+
+---
+
+## The verifier
+
+Rule / learned / oracle, and the budget that bounds the expensive one. &nbsp;·&nbsp; `agentdescent.verifier` &nbsp;·&nbsp; [guide](verifier.md)
+
+### `ThreeLayerVerifier(...)`
+
+Rule / learned / full backend for the aggregator.
+
+```python
+ThreeLayerVerifier(
+    eval_fn: EvalFn,
+    held_out: Sequence,
+    rule_subset: int = 8,
+    learned_noise: float = 0.04,
+    seed: int = 0,
+    budget: VerifierBudget = <factory>
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `cheap_eval(artifact: Evolvable) -> float` | The signal used everywhere a budget-free score is needed. |
+| `eval_counts(artifact: Evolvable, floor: Optional[float] = None) -> Tuple[float, float]` | Return (successes, failures) on the full held-out set. |
+| `full_eval(artifact: Evolvable) -> float` | `eval_fn` on the **whole** held-out set. Consumes audit budget. |
+| `learned_eval(artifact: Evolvable) -> Tuple[float, float]` | Noisy proxy that also returns an uncertainty estimate. |
+| `oracle_eval(artifact: Evolvable) -> float` | Deprecated alias for `full_eval`. Removed in 0.7. |
+| `rule_eval(artifact: Evolvable) -> float` | Cheap, deterministic-ish check on a tiny subset. |
+
+### `VerifierBudget(oracle_calls_remaining: int = 200, oracle_calls_used: int = 0) -> None`
+
+Budget for full-set evaluations, consumed by `full_eval`.
+
+---
+
+## The sparse audit layer
+
+Pair a cheap verifier against ground truth without paying for truth. &nbsp;·&nbsp; `agentdescent.audit.tap` &nbsp;·&nbsp; [guide](audit.md)
+
+### `AuditedReward(...)`
+
+A cheap verifier that hands a sampled minority of its work to the truth.
+
+```python
+AuditedReward(
+    verifier: Callable[[Any, str], float],
+    *,
+    oracle: Optional[Any] = None,
+    store: Optional[AuditStore] = None,
+    draw_by: str = 'task',
+    sample_rate: float = 0.1,
+    stratify: Optional[Callable[[Any, str, float], str]] = None,
+    rates: Optional[Dict[str, float]] = None,
+    calibration_fraction: float = 0.7,
+    seed: int = 0,
+    verifier_version: Optional[str] = None,
+    version_extra: Any = None,
+    correction_extra: Any = None
+) -> None
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `verifier` | `Callable[[Any, str], float]` | *required* | The cheap scorer the loop optimises against -- an agent judging the output, a learned scorer, a heuristic. `(task, output) -> float`. |
+| `oracle` | `Optional[Any]` | `None` | Ground truth. `GoldAnswer` when it returns now, `DeferredOracle` when it arrives later. Defaults to `NullOracle`, which still records the questions -- useful when the answerer has not been asked yet. |
+| `store` | `Optional[AuditStore]` | `None` | Where records go. Defaults to an in-memory store; pass `AuditStore("audit.jsonl")` to keep them. |
+| `draw_by` | `str` | `'task'` | What the inclusion draw is a function of. `"task"` (the default) audits a task **whole or not at all**; `"output"` draws per unit. They are identical when each task is scored once, and differ exactly where the difference matters. A run scores the same task again for every artifact version, and a per-unit draw then puts that task in *both* the labelled and the unlabelled half -- which the estimator assumes cannot happen. Measured at a nominal 0.95, on 200 tasks scored under four versions each: coverage **0.9125** when the halves share tasks and **0.945** when they do not. `"output"` buys more distinct tasks per label and an interval about 15% too narrow. Use it only when a task is scored once, where it is the same thing. |
+| `sample_rate` | `float` | `0.1` | Probability a unit is audited, when no stratum-specific rate applies. |
+| `stratify` | `Optional[Callable[[Any, str, float], str]]` | `None` | Optional `(task, output, verifier_score) -> str`. Names the layer a unit belongs to, so `rates` can spend more of the budget where the residual varies most. The stratum is recorded either way. |
+| `rates` | `Optional[Dict[str, float]]` | `None` | Per-stratum inclusion probabilities, falling back to `sample_rate`. |
+| `calibration_fraction` | `float` | `0.7` | Share of audited units assigned `CALIBRATION`; the rest become `IMPROVEMENT`. The split is drawn at random rather than taken in order, because units arrive grouped by task and by artifact and any ordered split would correlate the two pools with whatever the ordering happens to encode. |
+| `seed` | `int` | `0` | Base seed for the inclusion draw. |
+| `verifier_version` | `Optional[str]` | `None` | Overrides the fingerprint derived from `verifier`. Pass one when the verifier is an agent whose behaviour lives in a prompt or a model id rather than in the source of the function. |
+| `version_extra` | `Any` | `None` | Mixed into the derived fingerprint. The cheaper way to say the same thing: `version_extra={"model": "...", "prompt_sha": "..."}`. |
+| `correction_extra` | `Any` | `None` | A live tag (a callable, e.g. `VerifierBoost.version_tag`) for a correction layered on the scorer. It is mixed into `verifier_version` -- so the audit re-measures when the correction changes -- but not into `scorer_version`, which keeps naming the scorer alone. |
+
+| method | what it does |
+|---|---|
+| `calibration_set() -> list` | Resolved CALIBRATION records for *this* verifier version. |
+| `pending() -> list` | Audited units still waiting on truth. |
+| `refresh_verifier_version() -> str` | Re-derive `verifier_version` from a live `version_extra`. |
+
+### `RenderTap(run: Callable[[str, Any], str]) -> None`
+
+Optional wrapper for `run` that records *which* artifact produced an output.
+
+---
+
+## Switching the audit on
+
+One call that assembles the six pieces and the four cross-references. &nbsp;·&nbsp; `agentdescent.audit.wiring` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Audit(...)`
+
+The assembled layer. Hand the three fields to `evolve()`.
+
+```python
+Audit(
+    reward: AuditedReward,
+    run: Optional[RenderTap],
+    acceptance: RectifiedAcceptance,
+    store: AuditStore,
+    calibrator: Calibrator,
+    watch: VerifierWatch,
+    boost: Optional['VerifierBoost'] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `rebalance(unseen: float, **kw: Any) -> float` | Move the calibration share as the improvement pool stops learning. |
+| `recompute() -> Rectification` | Re-read the store and re-estimate. Call after a batch resolves. |
+| `rectification() -> Rectification` | The correction in force. Never raises; stale is an answer. |
+| `status() -> Dict[str, Any]` | What the audit knows, for a round hook or a log line. |
+
+### `attach(...)`
+
+Assemble the audit around `verifier` and return what `evolve()` needs.
+
+```python
+attach(
+    verifier: Callable[[Any, str], float],
+    *,
+    oracle: Optional[Any] = None,
+    store: Union[AuditStore, str, None] = None,
+    run: Optional[Callable[[str, Any], str]] = None,
+    inner: Any = None,
+    enabled: bool = True,
+    plan: Optional[SamplePlan] = None,
+    policy: Optional[AuditPolicy] = None,
+    sample_rate: float = 0.1,
+    stratify: Optional[Callable[[Any, str, float], str]] = None,
+    calibration_fraction: float = 0.7,
+    draw_by: str = 'task',
+    seed: int = 0,
+    verifier_version: Optional[str] = None,
+    version_extra: Any = None,
+    watch_ids: Iterable[str] = (),
+    watch_globs: Sequence[str] = (),
+    boost: Optional['VerifierBoost'] = None
+) -> Audit
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `verifier` | `Callable[[Any, str], float]` | *required* | The cheap scorer the loop optimises against, `(task, output) -> float`. |
+| `oracle` | `Optional[Any]` | `None` | Ground truth. A bare callable `(task, output) -> float` is wrapped in `GoldAnswer`, because that is what every caller with a gold answer already has and asking them to wrap it adds an import and a chance to forget that an oracle must never raise into the rollout. `None` records the questions without answering them. |
+| `store` | `Union[AuditStore, str, None]` | `None` | An `AuditStore`, or a path to open one at. A path is the usual case: the process that resolves a deferred oracle is not this one. |
+| `run` | `Optional[Callable[[str, Any], str]]` | `None` | The loop's `run`. Wrapped in a `RenderTap` so each unit records which artifact produced it. Leave it out and the audit still estimates the bias; it just cannot attribute a unit to an artifact. |
+| `inner` | `Any` | `None` |  |
+| `enabled` | `bool` | `True` | `False` collects records and **does not correct anything** -- the gate delegates to `inner` on the untouched context. The honest way to run a first round: measure before you spend. |
+| `plan` | `Optional[SamplePlan]` | `None` | A `SamplePlan` from a previous round, which carries per-stratum rates and overrides `sample_rate`. |
+| `policy` | `Optional[AuditPolicy]` | `None` |  |
+| `sample_rate` | `float` | `0.1` |  |
+| `stratify` | `Optional[Callable[[Any, str, float], str]]` | `None` |  |
+| `calibration_fraction` | `float` | `0.7` |  |
+| `draw_by` | `str` | `'task'` |  |
+| `seed` | `int` | `0` |  |
+| `verifier_version` | `Optional[str]` | `None` |  |
+| `version_extra` | `Any` | `None` |  |
+| `watch_ids` | `Iterable[str]` | `()` | Artifact ids and diff-key globs that mean the verifier changed. Nothing is watched by default, which is right for a fixed function and exactly wrong for a run that evolves its own judge -- see `VerifierWatch`. |
+| `watch_globs` | `Sequence[str]` | `()` | As `watch_ids`. |
+| `boost` | `Optional['VerifierBoost']` | `None` |  |
+
+---
+
+## Audit oracle sources
+
+Where ground truth comes from, and how long it takes to arrive. &nbsp;·&nbsp; `agentdescent.audit.sources` &nbsp;·&nbsp; [guide](audit.md)
+
+### `DeferredOracle(*, max_queued: Optional[int] = None) -> None`
+
+Truth that arrives later: an experiment, a human, an overnight job.
+
+| method | what it does |
+|---|---|
+| `forget(record_id: str) -> None` | Drop a resolved id from the queue view. |
+| `queued() -> List[str]` | Record ids awaiting an answer, oldest first. |
+
+### `GoldAnswer(fn: Callable[[object, str], float]) -> None`
+
+Synchronous truth: a gold answer, an exact match, a checker, a simulator.
+
+### `NullOracle()`
+
+An oracle that never answers. The default, and it is not a no-op.
+
+### `OracleSource`
+
+Ground truth for one `(task, output)` pair.
+
+### `resolve_from_mapping(store, answers: Dict[str, float], *, at: Optional[float] = None) -> int`
+
+Fill in truth for many pending records at once. Returns how many landed.
+
+---
+
+## The audit store
+
+Append-only persistence for paired observations, and the two pools. &nbsp;·&nbsp; `agentdescent.audit.store` &nbsp;·&nbsp; [guide](audit.md)
+
+### `AuditStore(path: Optional[str] = None) -> None`
+
+Records on disk, indexed in memory.
+
+| method | what it does |
+|---|---|
+| `all() -> List[AuditRecord]` | Every record, in the order first seen. |
+| `flush() -> None` | Persist the moments now. Call it when a run ends. |
+| `for_calibration(verifier_version: str) -> List[AuditRecord]` | Resolved CALIBRATION records for one verifier version, and nothing else. |
+| `for_improvement(...)` | Resolved IMPROVEMENT records -- the pool you are allowed to look at. |
+| `load() -> None` | Re-read the file, last-occurrence-wins. |
+| `observe_skipped(verifier_version: str, stratum: str) -> None` | Count one unit the tap dropped, without its score. |
+| `observe_unlabelled(verifier_version: str, stratum: str, score: float) -> None` | Fold one un-audited score into its stratum's running moments. |
+| `pending(...)` | Records still waiting on truth -- the work list for whoever answers. |
+| `remember_fingerprint(fingerprint: str) -> None` | Persist the fingerprint so a restart can be compared against it. |
+| `remember_priorities(priorities: Dict[str, float]) -> None` | Record what the merge path thought was worth auditing. |
+| `reopen(record_id: str) -> bool` | Clear a resolution so it can be replaced. For corrections, not for retries. |
+| `resolve(record_id: str, oracle_score: float, *, at: Optional[float] = None) -> bool` | Attach ground truth to a pending record. `False` if there was none to attach. |
+| `unlabelled_moments(verifier_version: str)` | `stratum -> {n, mean, var, skipped}` over the units not audited. |
+| `versions() -> List[str]` | Every `verifier_version` seen, in order of first appearance. |
+
+### `summarise(records: Iterable[AuditRecord]) -> Dict[str, float]`
+
+Counts and the raw mean residual. **Not** an estimate of the bias.
+
+---
+
+## Diagnosing the verifier
+
+Sort the residual by what fixing it would cost, and measure a proposed fix. &nbsp;·&nbsp; `agentdescent.audit.diagnose` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Direction`
+
+Which way the verifier was wrong.
+
+| member | value |
+|---|---|
+| `OVER` | `'over'` |
+| `UNDER` | `'under'` |
+
+### `Disagreement(record: AuditRecord, kind: Kind, direction: Direction, note: str = '') -> None`
+
+### `DisagreementReport(...)`
+
+The residual, sorted by what fixing it would cost.
+
+```python
+DisagreementReport(
+    n_pairs: int,
+    n_disagree: int,
+    delta: float,
+    sigma: float,
+    by_kind: Dict[Kind, int],
+    by_direction: Dict[Direction, int],
+    by_kind_direction: Dict[Tuple[Kind, Direction], int],
+    floor_sigma: float,
+    sigma_without: Dict[Kind, float],
+    items: List[Disagreement] = <factory>
+) -> None
+```
+
+### `FixReport(...)`
+
+What a proposed change to the verifier actually costs.
+
+```python
+FixReport(
+    n_pairs: int,
+    delta_before: float,
+    delta_after: float,
+    sigma_before: float,
+    sigma_after: float,
+    disagree_before: float,
+    disagree_after: float,
+    fixed: int,
+    broken: int,
+    breakage_rate: float,
+    false_negative_before: float,
+    false_negative_after: float,
+    unchanged: int,
+    moved: int = 0,
+    noise_floor: int = 0
+) -> None
+```
+
+### `Kind`
+
+What it would take to fix this disagreement. Ordered by increasing cost.
+
+| member | value |
+|---|---|
+| `FORMATTING` | `'formatting'` |
+| `SPEC_GAP` | `'spec_gap'` |
+| `AMBIGUOUS` | `'ambiguous'` |
+| `JUDGMENT` | `'judgment'` |
+| `UNCLASSIFIED` | `'unclassified'` |
+
+### `classify_disagreements(...)`
+
+Sort a store's resolved disagreements by what fixing them would take.
+
+```python
+classify_disagreements(
+    records: Iterable[AuditRecord],
+    classifier: Optional[Classifier] = None,
+    context: Optional[Mapping[str, Any]] = None
+) -> DisagreementReport
+```
+
+### `evaluate_fix(...)`
+
+Score a proposed verifier change against **every** labelled pair.
+
+```python
+evaluate_fix(
+    records: Iterable[AuditRecord],
+    fix: Callable[[AuditRecord, Any], float],
+    context: Optional[Mapping[str, Any]] = None,
+    *,
+    noise_floor: int = 0
+) -> FixReport
+```
+
+### `reference_classifier(...)`
+
+A classifier for the common case: a reference answer and a normaliser.
+
+```python
+reference_classifier(
+    normalise: Callable[[str], str],
+    reference_of: Callable[[Any], str],
+    *,
+    ambiguous_when: Optional[Callable[[str, str, Any], bool]] = None,
+    spec_gap_when: Optional[Callable[[str, str, Any], bool]] = None
+) -> Classifier
+```
+
+### `residual_stats(records: Iterable[AuditRecord]) -> Dict[str, float]`
+
+`n`, `delta`, `sigma`, `disagree` over resolved records.
+
+---
+
+## Searching for a fix
+
+Enumerate the hard rules, score every combination, rank by the residual. &nbsp;·&nbsp; `agentdescent.audit.propose` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Candidate(rules: Tuple[str, ...], report: FixReport, passengers: Tuple[str, ...] = ()) -> None`
+
+One combination of rules and what it does to the whole labelled set.
+
+### `Rule(name: str, predicate: Predicate) -> None`
+
+A named reason to mark an output wrong that the verifier marked right.
+
+### `SearchReport(...)`
+
+Every combination tried, best first, and the two things to distrust.
+
+```python
+SearchReport(
+    sigma_before: float,
+    candidates: List[Candidate] = <factory>,
+    n_rules: int = 0,
+    n_combinations: int = 0,
+    floor: float = nan,
+    warnings: List[str] = <factory>
+) -> None
+```
+
+### `length_rules(...)`
+
+Candidate rules that need only a reference and a normaliser.
+
+```python
+length_rules(
+    normalise: Callable[[str], str],
+    reference_of: Callable[[Any], str],
+    *,
+    question_of: Optional[Callable[[Any], str]] = None,
+    short: Sequence[float] = (0.6, 0.4),
+    long: Sequence[float] = (1.6, 3.0)
+) -> List[Rule]
+```
+
+### `search(...)`
+
+Score every combination of `rules` up to `max_size`, best first.
+
+```python
+search(
+    records: Sequence[AuditRecord],
+    rules: Sequence[Rule],
+    context: Optional[Mapping[str, Any]] = None,
+    *,
+    max_size: int = 2,
+    floor: float = nan,
+    max_combinations: int = 200
+) -> SearchReport
+```
+
+---
+
+## The verifier scorecard
+
+What has to be true before a new verifier replaces the old one. &nbsp;·&nbsp; `agentdescent.audit.scorecard` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Cost(verifier_seconds: float, oracle_seconds: float = nan) -> None`
+
+Seconds per decision, for the verifier and for the thing it stands in for.
+
+### `Goal`
+
+Which way a metric is supposed to move.
+
+| member | value |
+|---|---|
+| `LOWER` | `'lower is better'` |
+| `HIGHER` | `'higher is better'` |
+| `WATCH` | `'no target; read it'` |
+
+### `Metric(...)`
+
+One row. `previous` is `None` when there is nothing to compare to.
+
+```python
+Metric(
+    name: str,
+    value: float,
+    goal: Goal,
+    previous: Optional[float] = None,
+    note: str = '',
+    blocking: bool = False,
+    triggered: bool = False
+) -> None
+```
+
+### `RescanReport(...)`
+
+What a new verifier would have said about outputs the run already scored.
+
+```python
+RescanReport(
+    n: int,
+    n_artifacts: int,
+    agreement: float,
+    mean_shift: float,
+    sigma_shift: float,
+    by_artifact: Dict[str, Dict[str, float]] = <factory>,
+    flipped: List[Tuple[str, str, float, float]] = <factory>,
+    n_pairs: int = 0,
+    sigma_before: float = nan,
+    sigma_after: float = nan
+) -> None
+```
+
+### `Scorecard(...)`
+
+The rows, and whether they add up to a change worth making.
+
+```python
+Scorecard(
+    version: str,
+    previous_version: Optional[str],
+    metrics: List[Metric],
+    blockers: List[str] = <factory>,
+    notes: List[str] = <factory>,
+    rescan: Optional[RescanReport] = None,
+    rank: Optional[RankReport] = None,
+    computed_at: float = 0.0
+) -> None
+```
+
+### `rescan(...)`
+
+Re-score the outputs the audit kept, and see what would have moved.
+
+```python
+rescan(
+    records: Sequence[AuditRecord],
+    new_verifier: Callable[[AuditRecord, Any], float],
+    context: Optional[Mapping[str, Any]] = None,
+    *,
+    pairs: Optional[Sequence[Tuple[str, str]]] = None
+) -> RescanReport
+```
+
+### `verifier_scorecard(...)`
+
+Fill the card for `current`, against `previous` where there is one.
+
+```python
+verifier_scorecard(
+    current: Rectification,
+    records: Sequence[AuditRecord],
+    *,
+    previous: Optional[Rectification] = None,
+    previous_records: Sequence[AuditRecord] = (),
+    rescan_report: Optional[RescanReport] = None,
+    rank: Optional[RankReport] = None,
+    cost: Optional[Cost] = None,
+    previous_cost: Optional[Cost] = None,
+    max_false_negative: float = 0.05,
+    max_cost_ratio: float = 0.25
+) -> Scorecard
+```
+
+---
+
+## Ordering agreement
+
+Can the verifier put candidates in the right order -- the only thing the gate uses. &nbsp;·&nbsp; `agentdescent.audit.ranking` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Flip(...)`
+
+One artifact pair the verifier orders backwards.
+
+```python
+Flip(
+    base: str,
+    candidate: str,
+    verifier_gap: float,
+    oracle_gap: float,
+    n_base: int,
+    n_candidate: int
+) -> None
+```
+
+### `RankReport(...)`
+
+Ordering agreement, at the unit level and at the level the gate acts on.
+
+```python
+RankReport(
+    n_units: int,
+    tau_b: float,
+    concordant: int,
+    discordant: int,
+    one_directional: bool,
+    n_artifacts: int,
+    by_artifact: Dict[str, Dict[str, float]] = <factory>,
+    n_pairs: int = 0,
+    compared: Tuple[Tuple[str, str], ...] = (),
+    agree: int = 0,
+    ties: int = 0,
+    flips: List[Flip] = <factory>
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `above(gap: float) -> Tuple[int, int]` | `(agree, flip)` among pairs whose *verifier* gap is at least `gap`. |
+
+### `kendall_tau_b(x: Sequence[float], y: Sequence[float]) -> Tuple[float, int, int]`
+
+`(tau_b, concordant, discordant)`, tie-corrected.
+
+### `rank_agreement(...)`
+
+Does the verifier order units, and artifacts, the way ground truth does?
+
+```python
+rank_agreement(
+    records: Iterable[AuditRecord],
+    *,
+    pairs: Optional[Sequence[Tuple[str, str]]] = None,
+    min_units: int = 1
+) -> RankReport
+```
+
+---
+
+## Drift monitoring
+
+EWMA control charts on the correction, without an alarm every generation. &nbsp;·&nbsp; `agentdescent.audit.drift` &nbsp;·&nbsp; [guide](audit.md)
+
+### `DriftKind`
+
+What a signal is telling the operator to do.
+
+| member | value |
+|---|---|
+| `BIAS_UP` | `'bias-up'` |
+| `BIAS_DOWN` | `'bias-down'` |
+| `SIGNAL_LOST` | `'signal-lost'` |
+| `NOT_INDEPENDENT` | `'not-independent'` |
+
+### `DriftMonitor(...)`
+
+EWMA charts on `delta_hat` and `gain_factor`, generation by generation.
+
+```python
+DriftMonitor(
+    *,
+    lam: float = 0.2,
+    L: float = 3.0,
+    centre: Optional[float] = None,
+    min_gain: float = 1.05,
+    gain_lam: float = 0.2
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `observe(rect: Rectification, label: str = '') -> List[DriftSignal]` | Chart one generation. Returns only the signals *this* point raised. |
+| `observe_point(point: DriftPoint) -> List[DriftSignal]` | Chart a point assembled by hand. For a caller that is not using `Calibrator`. |
+
+### `DriftPoint(...)`
+
+One generation's rectification, reduced to what a chart needs.
+
+```python
+DriftPoint(
+    label: str,
+    delta_hat: float,
+    se: float,
+    gain_factor: float,
+    n: int,
+    covers: Tuple[float, float] = (0.0, 0.0)
+) -> None
+```
+
+### `DriftReport(...)`
+
+Every point charted, every signal raised, and whether the chart is valid.
+
+```python
+DriftReport(
+    points: List[DriftPoint] = <factory>,
+    z_bias: List[float] = <factory>,
+    band: List[float] = <factory>,
+    z_gain: List[float] = <factory>,
+    signals: List[DriftSignal] = <factory>,
+    centre: float = 0.0,
+    overlapping: bool = False
+) -> None
+```
+
+### `DriftSignal(...)`
+
+One alarm, with the number that raised it and what to do.
+
+```python
+DriftSignal(
+    kind: DriftKind,
+    at: int,
+    label: str,
+    value: float,
+    z: float,
+    limit: float,
+    detail: str
+) -> None
+```
+
+---
+
+## Coverage allocation
+
+Where the improvement labels go: Good-Turing unseen mass, not Neyman. &nbsp;·&nbsp; `agentdescent.audit.coverage` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Coverage(key: str, labels: int, modes: int, singletons: int, unseen: float) -> None`
+
+What one key has taught so far, and how much it still has to teach.
+
+### `CoveragePlan(...)`
+
+Per-key inclusion probabilities for the improvement pool.
+
+```python
+CoveragePlan(
+    rates: Dict[str, float],
+    target_n: Dict[str, int],
+    weights: Dict[str, float],
+    unseen: Dict[str, float],
+    default_rate: float = 0.0,
+    total_n: int = 0,
+    expected_units: int = 0,
+    unseen_overall: float = nan,
+    warnings: List[str] = <factory>
+) -> None
+```
+
+### `coverage_of(...)`
+
+Group resolved records by `key` and measure the variety inside each.
+
+```python
+coverage_of(
+    records: Iterable[Any],
+    key: Callable[[Any], str],
+    mode: Callable[[Any], Optional[str]],
+    *,
+    keys: Sequence[str] = ()
+) -> Dict[str, Coverage]
+```
+
+### `exhausted(coverage: Mapping[str, Coverage], min_unseen: float = 0.05) -> List[str]`
+
+Keys where the next label is unlikely to show anything new.
+
+### `plan_coverage(...)`
+
+Allocate `target_n` improvement labels by how much each key can still teach.
+
+```python
+plan_coverage(
+    *,
+    weights: Mapping[str, float],
+    expected_units: int,
+    coverage: Mapping[str, Coverage],
+    target_n: int = 100,
+    min_per_key: int = 5,
+    max_rate: float = 1.0
+) -> CoveragePlan
+```
+
+### `rarefaction(...)`
+
+`[(m, mean distinct modes in a sample of m)]` -- the diminishing return.
+
+```python
+rarefaction(
+    modes: Sequence[str],
+    sizes: Sequence[int],
+    *,
+    reps: int = 200,
+    seed: int = 0
+) -> List[Tuple[int, float]]
+```
+
+### `rebalance(...)`
+
+How much of the audit budget belongs to calibration, given `unseen`.
+
+```python
+rebalance(
+    unseen: float,
+    *,
+    floor: float = 0.5,
+    ceiling: float = 0.95,
+    learning_at: float = 0.25
+) -> float
+```
+
+### `unseen_mass(modes: Sequence[Optional[str]]) -> float`
+
+Good-Turing: the probability that the next label shows an unseen mode.
+
+### `unseen_mass_overall(coverage: Mapping[str, Coverage]) -> float`
+
+Good-Turing across every key, pooled by label count.
+
+---
+
+## The merge path's ranking
+
+Draining the audit scheduler into the queue a person works from. &nbsp;·&nbsp; `agentdescent.audit.queue` &nbsp;·&nbsp; [guide](audit.md)
+
+### `DrainReport(...)`
+
+What came off the queue, and what could not be placed.
+
+```python
+DrainReport(
+    priorities: Dict[str, float] = <factory>,
+    popped: int = 0,
+    unplaced: int = 0,
+    examples: List[str] = <factory>
+) -> None
+```
+
+### `drain(...)`
+
+Empty the scheduler's queue into `signature -> priority`.
+
+```python
+drain(
+    scheduler: Any,
+    *,
+    signature_of: Optional[Callable[[Any], Optional[str]]] = None,
+    limit: Optional[int] = None
+) -> DrainReport
+```
+
+### `prioritise(...)`
+
+Order pending records by what the merge path thought was risky.
+
+```python
+prioritise(
+    records: Iterable[AuditRecord],
+    priorities: Dict[str, float],
+    *,
+    default: float = 0.0
+) -> List[AuditRecord]
+```
+
+---
+
+## Audit allocation
+
+Neyman allocation, as per-stratum inclusion probabilities. &nbsp;·&nbsp; `agentdescent.audit.sampler` &nbsp;·&nbsp; [guide](audit.md)
+
+### `AuditPolicy(...)`
+
+What the audit is trying to achieve, and what it refuses to do to get there.
+
+```python
+AuditPolicy(
+    enabled: bool = False,
+    target_halfwidth: float = 0.05,
+    boundary_width: float = 0.05,
+    calibration_fraction: float = 0.7,
+    min_per_stratum: int = 20,
+    min_dominant: int = 80,
+    max_labels: int = 400,
+    alpha: float = 0.05
+) -> None
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `enabled` | `bool` | `False` | Off by default. The whole layer is opt-in, and a policy that is not enabled plans a rate of zero everywhere rather than a small one -- "we are not auditing" and "we are auditing a little" produce different records and only one of them is honest. |
+| `target_halfwidth` | `float` | `0.05` | How narrow the correction's 95% interval should be. Drives the total label budget through the Neyman-optimal sample size; see `plan`. |
+| `boundary_width` | `float` | `0.05` | Half-width of the band around the acceptance threshold that counts as `boundary`. |
+| `calibration_fraction` | `float` | `0.7` | Share of audited units that go to the calibration pool rather than the improvement pool. Passed through to the tap. |
+| `min_per_stratum` | `int` | `20` | No layer gets fewer than this many labels, whatever Neyman says. A layer allocated two labels contributes a variance estimate from two points, which is worse than not stratifying at all. |
+| `min_dominant` | `int` | `80` | The heaviest layer gets at least this many. Defaults to `MIN_N_DOMINANT`, below which the reported coverage is about 0.92 rather than 0.95 -- so this floor and that warning are the same number for the same reason, and moving one without the other is how a floor stops meaning anything. |
+| `max_labels` | `int` | `400` | A hard cap. Oracle labels cost money or a person's afternoon, and a target half-width small enough to be unreachable should produce a warning and a bounded plan rather than an unbounded bill. |
+| `alpha` | `float` | `0.05` |  |
+
+### `SamplePlan(...)`
+
+Per-stratum inclusion probabilities, and the reasoning that produced them.
+
+```python
+SamplePlan(
+    rates: Dict[str, float],
+    target_n: Dict[str, int],
+    weights: Dict[str, float],
+    resid_sd: Dict[str, float],
+    default_rate: float = 0.0,
+    total_n: int = 0,
+    expected_units: int = 0,
+    warnings: List[str] = <factory>
+) -> None
+```
+
+### `boundary_stratifier(threshold: float, width: float = 0.05) -> Callable[[Any, str, float], str]`
+
+Split units into `accepted` / `boundary` / `rejected` around a threshold.
+
+### `observed_weights(store: Any, verifier_version: str) -> Dict[str, float]`
+
+Population shares from what a previous run actually saw.
+
+### `plan_audit(...)`
+
+Neyman allocation, converted to per-stratum inclusion probabilities.
+
+```python
+plan_audit(
+    policy: AuditPolicy,
+    *,
+    weights: Dict[str, float],
+    expected_units: int,
+    resid_sd: Optional[Dict[str, float]] = None
+) -> SamplePlan
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `policy` | `AuditPolicy` | *required* |  |
+| `weights` | `Dict[str, float]` | *required* | Population share per stratum. Need not sum to exactly 1; it is normalised, because these usually come from counting a previous run and arriving at 0.9999 should not be an error. |
+| `expected_units` | `int` | *required* | How many units the next run is expected to score. Rates are `n_h / (W_h * expected_units)`, so an estimate that is too low oversamples and one that is too high undersamples -- both bounded, and the realised inclusion probability is recorded per unit either way, so a wrong guess costs precision and never correctness. |
+| `resid_sd` | `Optional[Dict[str, float]]` | `None` | Per-stratum sd of `f - Y` from the last calibration. Missing entries fall back to an equal-residual assumption, which is what proportional allocation already assumes -- so the first run, with no history, plans proportionally and is right to. |
+
+### `resid_sd_from(previous: Any) -> Dict[str, float]`
+
+`stratum -> resid_sd` out of a `PPIResult`, or `{}`.
+
+---
+
+## The calibrator
+
+Turns a store of audited pairs into a correction the acceptance gate applies. &nbsp;·&nbsp; `agentdescent.audit.calibrator` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Calibrator(...)`
+
+Keeps one rectification per verifier version, and knows when to distrust it.
+
+```python
+Calibrator(
+    store: AuditStore,
+    *,
+    alpha: float = 0.05,
+    seed: int = 0,
+    min_labels: int = 30,
+    min_per_stratum: int = 5,
+    cluster_by: Optional[str] = 'task_id'
+) -> None
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `store` | `AuditStore` | *required* | Where the audited pairs and the unlabelled moments live. |
+| `alpha` | `float` | `0.05` | `1 - alpha` is the nominal coverage of the interval. Must satisfy `0 < alpha < 1`; anything else raises `ValueError` here, at construction, rather than on the first merge. |
+| `seed` | `int` | `0` |  |
+| `min_labels` | `int` | `30` | Below this many resolved calibration labels the result is stale rather than wide. A very wide interval and "we do not know yet" are different claims, and only the second one stops a caller reading a number off it. |
+| `min_per_stratum` | `int` | `5` | A stratum with fewer than this many labels is **merged into the largest one** rather than dropped. Dropping it would silently change the population the estimate describes; merging keeps every unit represented and costs only resolution. |
+| `cluster_by` | `Optional[str]` | `'task_id'` | Record attribute the audited units are grouped by, `"task_id"` by default. They are **not** independent draws: a run scores the same task again for every artifact version, and a task the verifier is generous about it is generous about every time. Measured on the Phase 0 audit -- 177 units from 49 tasks -- treating them as independent made the interval **32% too narrow**, and the gate spends that interval's width as `drift`. `None` restores the independent estimate, which is right only when each audited unit is a distinct task. |
+
+| method | what it does |
+|---|---|
+| `current(verifier_version: str) -> Rectification` | The rectification to apply now, computing it if it is not cached. |
+| `mark_stale(reason: str) -> None` | Withhold every rectification until the next `recompute`. |
+| `recompute(verifier_version: str) -> Rectification` | Re-read the store and re-estimate. Clears any manual stale mark. |
+
+### `Rectification(...)`
+
+The correction, its uncertainty, and whether it may be used at all.
+
+```python
+Rectification(
+    verifier_version: str,
+    delta_hat: float,
+    delta_se: float,
+    theta: float,
+    theta_ci: Tuple[float, float],
+    se: float,
+    n: int,
+    n_unlab: int,
+    gain_factor: float,
+    is_stale: bool,
+    stale_reason: Optional[str],
+    resid_sd: float = nan,
+    warnings: List[str] = <factory>,
+    computed_at: float = 0.0,
+    covers: Tuple[float, float] = (0.0, 0.0)
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `stale(...)` | A rectification that must not be applied, and says why. |
+
+### `population_resid_sd(strata) -> float`
+
+Sd of `f - Y` over the whole population, from the labelled pairs.
+
+---
+
+## Spending the correction
+
+The only place the audit changes an outcome: evidence discounted by verifier noise. &nbsp;·&nbsp; `agentdescent.audit.gate` &nbsp;·&nbsp; [guide](audit.md)
+
+### `Adjustment(...)`
+
+What the audit did to one merge decision, and why.
+
+```python
+Adjustment(
+    applied: bool,
+    reason: str,
+    delta_hat: float = 0.0,
+    sigma_eps: float = 0.0,
+    drift: float = 0.0,
+    kappa_base: float = 1.0,
+    kappa_cand: float = 1.0,
+    var_before: float = 0.0,
+    var_after: float = 0.0,
+    audit_limited: bool = False,
+    stale: bool = False
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `to_detail() -> str` | One clause, for the tail of a refusal a person will read. |
+
+### `RectifiedAcceptance(...)`
+
+An acceptance gate that knows its measurement came from a proxy.
+
+```python
+RectifiedAcceptance(
+    inner: Any = None,
+    *,
+    calibrator: Optional[Calibrator] = None,
+    verifier_version: Union[str, Callable[[], str]] = '',
+    rectification: Optional[Rectification] = None,
+    enabled: bool = True,
+    drift_allowance: Optional[float] = None,
+    inflate_when_stale: float = 2.0,
+    explain_refusals: Optional[bool] = None,
+    min_kappa: float = 0.001
+) -> None
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `inner` | `Any` | `None` | The rule that actually decides. Defaults to the shipped gate, with the run's thresholds filled in by the aggregator at install time. |
+| `calibrator` | `Optional[Calibrator]` | `None` | Where the correction comes from. Re-read on every decision, so a rectification that goes stale mid-run takes effect at the next merge. |
+| `verifier_version` | `Union[str, Callable[[], str]]` | `''` | The version to ask the calibrator about -- a string, or a callable returning one for a verifier that can change under the run. |
+| `rectification` | `Optional[Rectification]` | `None` | A fixed correction instead of a calibrator. For a run that measured its bias once, offline, and does not intend to keep measuring. |
+| `enabled` | `bool` | `True` | `False` delegates to `inner` on the untouched context. This is the constraint that lets the audit be turned on mid-run: off, it is not approximately the old behaviour, it *is* the old call. |
+| `drift_allowance` | `Optional[float]` | `None` | Standard deviation to carry for `Delta` differing between the two sides being compared. `None` uses the rectification's own `se`, which is the right order of magnitude and not an estimate of the thing (see the module docstring). |
+| `inflate_when_stale` | `float` | `2.0` | Variance multiplier while no usable correction exists. `1.0` passes through instead, which is the choice to treat "we have not measured the verifier" and "the verifier is unbiased" as the same claim. |
+| `explain_refusals` | `Optional[bool]` | `None` |  |
+| `min_kappa` | `float` | `0.001` |  |
+
+| method | what it does |
+|---|---|
+| `current() -> Optional[Rectification]` | The rectification in force, or `None` if there is no source. |
+| `explain(ctx) -> Adjustment` | What `accept` would do to `ctx`, without deciding anything. |
+
+### `VerifierWatch(...)`
+
+Marks a calibrator stale when the instrument it calibrated may have moved.
+
+```python
+VerifierWatch(
+    calibrator: Calibrator,
+    *,
+    fingerprint: Optional[Callable[[], str]] = None,
+    artifact_ids: Iterable[str] = (),
+    key_globs: Sequence[str] = (),
+    layers: Iterable[int] = (),
+    store: Any = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `check() -> bool` | Re-read the fingerprint; mark stale and return True if it changed. |
+| `on_merge(artifact, diff) -> bool` | Call after a diff commits. True means the calibration was withdrawn. |
+
+### `discount_for(...)`
+
+How many of these observations are worth believing, given `extra_var`.
+
+```python
+discount_for(
+    counts: Tuple[float, float],
+    extra_var: float,
+    *,
+    min_kappa: float = 0.001
+) -> Tuple[float, float, float]
+```
+
+### `rectified_counts(counts: Tuple[float, float], delta: float) -> Tuple[Tuple[float, float], float]`
+
+Shift `(successes, failures)` so the rate reads `p - delta`.
+
+---
+
+## Prediction-powered inference
+
+The calibration estimator: a stratified mean that borrows the unlabelled scores. &nbsp;·&nbsp; `agentdescent.audit.ppi` &nbsp;·&nbsp; [guide](audit.md)
+
+### `PPIError`
+
+The input cannot support an estimate at all.
+
+### `PPIResult(...)`
+
+The estimate, its interval, and everything needed to distrust it.
+
+```python
+PPIResult(
+    theta: float,
+    ci: Tuple[float, float],
+    se: float,
+    df: float,
+    lambda_: float,
+    gain_factor: float,
+    n: int,
+    n_unlab: int,
+    alpha: float,
+    warnings: List[str] = <factory>,
+    clustered: bool = False,
+    per_stratum: Dict[str, Dict[str, float]] = <factory>
+) -> None
+```
+
+### `Stratum(...)`
+
+One layer of the sampling design, with its labelled and unlabelled halves.
+
+```python
+Stratum(
+    name: str,
+    weight: float,
+    f_lab: np.ndarray,
+    y_lab: np.ndarray,
+    f_unlab: Optional[np.ndarray] = None,
+    n_unlab: int = 0,
+    mean_unlab: float = 0.0,
+    var_unlab: float = 0.0,
+    clusters_lab: Optional[Sequence[Any]] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `from_moments(...)` | Build from a running summary of the unlabelled half rather than its scores. |
+
+### `cluster_var_of_mean(values: np.ndarray, clusters: Sequence[Any]) -> Tuple[float, int]`
+
+Variance of `mean(values)` when the units come in correlated groups.
+
+### `ppi_mean_stratified(...)`
+
+Estimate `E[Y]` over a stratified population, using the unlabelled `f`.
+
+```python
+ppi_mean_stratified(
+    strata: Sequence[Stratum],
+    *,
+    alpha: float = 0.05,
+    k_folds: int = 5,
+    seed: int = 0
+) -> PPIResult
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `strata` | `Sequence[Stratum]` | *required* | One `Stratum` per layer. `weight` must be the **population** share and the weights must sum to 1. |
+| `alpha` | `float` | `0.05` | `1 - alpha` is the nominal coverage. 0.05 gives a 95% interval. |
+| `k_folds` | `int` | `5` | Folds for cross-fitting `lam`; see `_lambda_crossfit`. |
+| `seed` | `int` | `0` | Fixes the fold split, so the same labels give the same interval twice. |
+
+### `t_ppf(p: float, df: float) -> float`
+
+Quantile of Student's t, accurate for every `df > 0`.
+
+---
+
+## Audit estimation
+
+The design-based baseline: a weighted mean of the residual, with an interval. &nbsp;·&nbsp; `agentdescent.audit.estimate` &nbsp;·&nbsp; [guide](audit.md)
+
+### `bootstrap_ci(...)`
+
+Percentile bootstrap interval for `hajek_mean`.
+
+```python
+bootstrap_ci(
+    values: Sequence[float],
+    probs: Sequence[float],
+    *,
+    draws: int = 5000,
+    alpha: float = 0.05,
+    seed: int = 0,
+    clusters: Optional[Sequence] = None
+) -> Tuple[float, float]
+```
+
+### `hajek_mean(values: Sequence[float], probs: Sequence[float]) -> float`
+
+Inclusion-probability-weighted mean -- the Hajek ratio estimator.
+
+### `residual_bias(...)`
+
+Estimate `Delta = E[f - Y]` from resolved `AuditRecord`s.
+
+```python
+residual_bias(
+    records: Iterable,
+    *,
+    draws: int = 5000,
+    alpha: float = 0.05,
+    seed: int = 0
+) -> Dict[str, object]
+```
+
+### `standard_error(...)`
+
+Bootstrap standard error of `hajek_mean`.
+
+```python
+standard_error(
+    values: Sequence[float],
+    probs: Sequence[float],
+    *,
+    draws: int = 2000,
+    seed: int = 1,
+    clusters: Optional[Sequence] = None
+) -> float
+```
+
+---
+
+## The audit out of process
+
+The audit's verbs as JSON, for the MCP surface and anything resolving truth later. &nbsp;·&nbsp; `agentdescent.audit.service` &nbsp;·&nbsp; [guide](audit.md)
+
+### `audit_drift(path: str, versions: Optional[Sequence[str]] = None) -> Dict[str, Any]`
+
+Chart one rectification per verifier version, oldest first.
+
+### `audit_pending(...)`
+
+The records waiting on an oracle -- for a person or an experiment system.
+
+```python
+audit_pending(
+    path: str,
+    limit: int = 50,
+    older_than: Optional[float] = None,
+    version: Optional[str] = None,
+    order: str = 'dispatched'
+) -> Dict[str, Any]
+```
+
+### `audit_recompute(path: str, version: Optional[str] = None) -> Dict[str, Any]`
+
+Re-read the store and re-estimate. Returns the new rectification.
+
+### `audit_rescan(...)`
+
+Re-score the stored outputs with another verifier and see what moves.
+
+```python
+audit_rescan(
+    path: str,
+    verifier: str,
+    version: Optional[str] = None,
+    allow: Optional[Sequence[str]] = None,
+    pairs: Optional[Sequence[Sequence[str]]] = None
+) -> Dict[str, Any]
+```
+
+### `audit_resolve(path: str, record_id: str, oracle_score: float) -> Dict[str, Any]`
+
+Attach ground truth to one pending record.
+
+### `audit_scorecard(...)`
+
+Fill the card for `version`, against `previous` if one is named.
+
+```python
+audit_scorecard(
+    path: str,
+    version: Optional[str] = None,
+    previous: Optional[str] = None,
+    max_false_negative: float = 0.05,
+    verifier_seconds: Optional[float] = None,
+    oracle_seconds: Optional[float] = None
+) -> Dict[str, Any]
+```
+
+### `audit_status(path: str, version: Optional[str] = None) -> Dict[str, Any]`
+
+The rectifier in force, how much it rests on, and what is outstanding.
+
+---
+
+## Audit records
+
+What one audited measurement is, and how a verifier is versioned. &nbsp;·&nbsp; `agentdescent.audit.records` &nbsp;·&nbsp; [guide](audit.md)
+
+### `AuditRecord(...)`
+
+One `(task, output)` pair scored by the verifier, awaiting or carrying truth.
+
+```python
+AuditRecord(
+    record_id: str,
+    task_id: str,
+    artifact_signature: str,
+    output: str,
+    verifier_version: str,
+    verifier_score: float,
+    inclusion_prob: float,
+    purpose: Purpose,
+    stratum: str = 'all',
+    oracle_score: Optional[float] = None,
+    dispatched_at: float = <factory>,
+    resolved_at: Optional[float] = None,
+    sampler_seed: int = 0,
+    schema_version: int = 2,
+    scorer_version: str = ''
+) -> None
+```
+
+### `Purpose`
+
+Which of the two disjoint pools a labelled unit belongs to.
+
+| member | value |
+|---|---|
+| `CALIBRATION` | `'calibration'` |
+| `IMPROVEMENT` | `'improvement'` |
+
+### `new_record_id() -> str`
+
+A fresh record id. Also the ticket a deferred oracle resolves against.
+
+### `output_digest(output: str) -> str`
+
+A short stable digest of an output, for logs and for de-duplication.
+
+### `verifier_fingerprint(fn: Callable[..., Any], *, extra: Any = None) -> str`
+
+A stable id for the verifier `fn`, so a correction can be bound to it.
+
+---
+
+## Governance
+
+L0 frozen / L1 slow / L2 fast, assigned by blast radius. &nbsp;·&nbsp; `agentdescent.governance` &nbsp;·&nbsp; [guide](governance.md)
+
+### `GovernanceError`
+
+Raised when the evolution loop tries to mutate a frozen (L0) artifact.
+
+### `L1SerialGate(_in_flight: Dict[str, str] = None, _lock: threading.Lock = <factory>) -> None`
+
+Enforces "at most one L1 diff in evaluation at a time" (section 6).
+
+### `Layer`
+
+| member | value |
+|---|---|
+| `L2_FAST` | `2` |
+| `L1_SLOW` | `1` |
+| `L0_FROZEN` | `0` |
+
+### `assert_mutable(artifact: Evolvable) -> None`
+
+Guard invoked before applying any diff (design doc, section 6, L0).
+
+### `classify(artifact: Evolvable) -> Layer`
+
+Assign an artifact to a governance layer.
+
+---
+
+## Staleness policies
+
+What to do with a diff proposed against a version that has moved. &nbsp;·&nbsp; `agentdescent.staleness` &nbsp;·&nbsp; [guide](staleness.md)
+
+### `FullStaleness()`
+
+Use stale diffs directly regardless of `eta` (max throughput).
+
+### `GuardedStaleness()`
+
+Version-gated with rebase in the middle band (AgentDescent's default).
+
+### `ReflectiveStaleness()`
+
+Always rebase + re-verify; discard only if the improvement no longer holds.
+
+### `StaleAction`
+
+What the aggregator should do with a (possibly stale) evidence card.
+
+| member | value |
+|---|---|
+| `ACCEPT` | `'accept'` |
+| `REBASE` | `'rebase'` |
+| `DISCARD` | `'discard'` |
+
+### `StalenessPolicy`
+
+### `get_policy(name: str) -> StalenessPolicy`
+
+---
+
+## Parallelism methods
+
+How a round's work is split across workers: DP / TP / PP. &nbsp;·&nbsp; `agentdescent.parallel` &nbsp;·&nbsp; [guide](parallelism.md)
+
+### `ClusterParallel(...)`
+
+DP over task **clusters**, leased by UCB instead of sharded round-robin.
+
+```python
+ClusterParallel(
+    cluster_of: Callable[[str], str],
+    c: float = 1.4,
+    pass_threshold: Optional[float] = None,
+    name: str = 'CP'
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `observe(unit: WorkUnit, task_id: str, score: float) -> None` | Feed one rollout's outcome back into the cluster's UCB estimate. |
+
+### `DataParallel(name: str = 'DP') -> None`
+
+DP -- every worker holds the same artifact; the *tasks* (keys) are sharded across workers and their diffs are merged. Coverage rotates each round.
+
+### `ParallelMode`
+
+| member | value |
+|---|---|
+| `DP` | `'data_parallel'` |
+| `TP` | `'tensor_parallel'` |
+| `PP` | `'pipeline_parallel'` |
+
+### `ParallelStrategy`
+
+How a round of work is partitioned across `n_workers`.
+
+### `PipelineChain(stages: List[str]) -> None`
+
+An ordered artifact dependency chain, upstream -> downstream.
+
+| method | what it does |
+|---|---|
+| `blame(stage_success: Dict[str, bool]) -> Optional[str]` | Back-propagate blame to the *earliest* failing stage. |
+| `counterfactual_pairs(stage: str) -> List[Tuple[str, str]]` | The {old x new} version swaps to replay for minimal factor analysis. |
+
+### `PipelineParallel(stages: Sequence[str], name: str = 'PP') -> None`
+
+PP -- artifacts form a dependency chain; each worker drives one stage, and a downstream failure back-propagates blame to the earliest failing stage (via `PipelineChain`).
+
+### `SectionViolation`
+
+Raised when a worker's diff touches a key outside its section.
+
+### `TensorParallel(...)`
+
+TP -- one hot artifact is split into `n_sections` disjoint sections; each worker owns a section, so edits are conflict-free *by construction* and the merge is a union (concatenation + a consistency check).
+
+```python
+TensorParallel(
+    n_sections: int,
+    keys: Optional[Sequence[str]] = None,
+    route: Optional[Callable[[str], str]] = None,
+    name: str = 'TP'
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `section_map() -> Dict[str, int]` | `artifact key -> section`. Empty when no key space was declared. |
+
+### `TensorParallelMerge(n_sections: int, keys: Optional[Sequence[str]] = None) -> None`
+
+Merge section-scoped diffs into one artifact (concatenation + review).
+
+| method | what it does |
+|---|---|
+| `merge(base: Evolvable, section_diffs: List[Tuple[int, Diff]]) -> Tuple[Evolvable, bool]` | Return (merged_artifact, consistency_ok). |
+| `owner_of(key: str) -> int` | Which section owns `key` -- via the declared partition when there is one. |
+
+### `WorkUnit(worker: int, keys: List[str], stage: int = 0, section: Optional[int] = None) -> None`
+
+What one worker is responsible for in one round of a parallel plan.
+
+### `assign_key_sections(keys: Sequence[str], n_sections: int) -> Dict[str, int]`
+
+Partition a **known** artifact key space into balanced, disjoint sections.
+
+### `assign_sections(worker_ids: Sequence[str], n_sections: int) -> Dict[str, int]`
+
+Authorize each worker for exactly one section (round-robin).
+
+### `section_of(key: str, n_sections: int) -> int`
+
+Hash an artifact key to a section id.
+
+### `shard_round_robin(items: Sequence, n_shards: int) -> List[List]`
+
+Split a task list into `n_shards` disjoint shards, round-robin.
+
+---
+
+## Task sampling
+
+Which task a worker rolls out next. &nbsp;·&nbsp; `agentdescent.sampling` &nbsp;·&nbsp; [guide](sampling.md)
+
+### `DifficultyWeighted(...)`
+
+UCB over tasks, weighted by how much learning signal each one carries.
+
+```python
+DifficultyWeighted(
+    c: float = 0.2,
+    pass_threshold: Optional[float] = None,
+    prior: float = 0.5
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `stats() -> Dict[str, Tuple[float, float]]` | Copy of the per-task (passes, trials) counters -- for inspection/tests. |
+
+### `RoundRobin()`
+
+Cycle through the shard in order -- the deterministic default.
+
+### `TaskSampler`
+
+Chooses the next task id for a worker, and learns from the outcome.
+
+| method | what it does |
+|---|---|
+| `pick(keys: Sequence[str], round_index: int) -> str` | Return one task id from `keys` (never mutate `keys`). |
+| `record(task_id: str, score: float) -> None` | Report the reward a rollout of `task_id` achieved (0..1). |
+
+---
+
+## Candidate selection
+
+Which candidate the next batch of workers starts from. &nbsp;·&nbsp; `agentdescent.selection` &nbsp;·&nbsp; [guide](selection.md)
+
+### `Archive(...)`
+
+DGM's and ADAS's archive sampling: performance, tempered by novelty.
+
+```python
+Archive(
+    sampling: str = 'novelty',
+    temperature: float = 1.0,
+    seed: int = 0,
+    rng: Optional['random.Random'] = None
+) -> None
+```
+
+### `Beam(k: int = 1) -> None`
+
+Keep the `k` best-scoring candidates and spread the workers over them.
+
+### `CladeThompson(...)`
+
+HGM's expansion policy: Thompson sampling on clade metaproductivity.
+
+```python
+CladeThompson(
+    cool_down_beta: float = 0.0,
+    max_tau: float = 1000.0,
+    seed: int = 0,
+    rng: Optional['random.Random'] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `tau(budget_remaining: float) -> float` | `budget_remaining ** (-cool_down_beta)`, clamped to `[1, max_tau]`. |
+
+### `CostEfficient(...)`
+
+FlatPuct that pays for exploration out of a budget. **Test-time scaling.**
+
+```python
+CostEfficient(
+    c_puct: float = 1.0,
+    cost_exponent: float = 1.0,
+    prior_exponent: float = 0.0,
+    anneal: bool = True
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `cost_factors(rows: Sequence[Candidate]) -> List[float]` | `cost**alpha` per row, normalised so the mean is 1. |
+
+### `MCTS(exploration: float = 1.4) -> None`
+
+UCT over the candidate tree: one evolve step is one rollout.
+
+### `MultiHeadUnsupported`
+
+A policy named a starting point the ledger cannot hold yet.
+
+### `ParetoFrontier(...)`
+
+Three published frontier rules, as one class and one argument.
+
+```python
+ParetoFrontier(
+    mode: str = 'per_instance',
+    k: int = 5,
+    seed: int = 0,
+    rng: Optional['random.Random'] = None
+) -> None
+```
+
+### `SelectionContext(...)`
+
+What a `SelectionPolicy` is allowed to look at.
+
+```python
+SelectionContext(
+    head: Candidate,
+    candidates: Sequence[Candidate] = (),
+    round: int = 0,
+    n_workers: int = 1,
+    budget_remaining: float = 1.0
+) -> None
+```
+
+### `SelectionPolicy`
+
+Given the candidates, return the `n` starting points for the next batch.
+
+### `SingleHead()`
+
+Every worker starts from the current head. Today's behaviour, exactly.
+
+### `pareto_front(candidates: Sequence[Candidate], *, tasks: Sequence[str]) -> List[Candidate]`
+
+Candidates no other candidate beats on every task and betters on one.
+
+---
+
+## The population layer
+
+What makes a selection policy take effect on a one-branch ledger. &nbsp;·&nbsp; `agentdescent.population` &nbsp;·&nbsp; [guide](selection.md)
+
+### `PopulationAggregator(...)`
+
+The shipped merge pipeline plus an archive and a selection policy.
+
+```python
+PopulationAggregator(
+    ledger,
+    verifier,
+    audit,
+    config,
+    staleness_policy = None,
+    *,
+    selection: SelectionPolicy,
+    artifact_id: str,
+    meter = None,
+    conflict = None,
+    fusion = None,
+    acceptance = None,
+    promotion = None,
+    screen = None,
+    island_count: int = 0
+)
+```
+
+| method | what it does |
+|---|---|
+| `checkpoint() -> Optional[dict]` | Serialise the archive and the selection counter. |
+| `finalize() -> None` | Leave the best-scoring candidate on the head, then promote. |
+| `head_for_worker(worker_id: int = 0) -> str` | The branch a worker should snapshot. |
+| `lineage_report() -> List[Dict[str, object]]` | A read-only per-branch view for a population run (#150, semantics C). |
+| `restore(state: dict) -> None` | Restore the archive written by `checkpoint`. |
+| `step(n_workers: int = 1) -> List[MergeReport]` | Fire every artifact bucket that is ready and return per-artifact reports. |
+
+### `population_factory(...)`
+
+The `aggregator_factory=` adapter for one run.
+
+```python
+population_factory(
+    selection: SelectionPolicy,
+    artifact_id: str,
+    *,
+    meter = None,
+    conflict = None,
+    fusion = None,
+    acceptance = None,
+    promotion = None,
+    screen = None,
+    island_count: int = 0
+)
+```
+
+---
+
+## Cross-run consolidation
+
+What a run learned survives it: archive, retrieve, mini-eval gate. &nbsp;·&nbsp; `agentdescent.consolidation` &nbsp;·&nbsp; [guide](consolidation.md)
+
+### `ConsolidationRecord(...)`
+
+One archived run: the artifact it produced, and the configuration that produced it.
+
+```python
+ConsolidationRecord(
+    run_id: str,
+    artifact_id: str,
+    strategy: str,
+    config: Dict[str, Any],
+    state: Dict[str, str],
+    rendered: str,
+    final_reward: float,
+    rounds: int,
+    trajectory_store: Optional[str] = None,
+    problem: Optional[Dict[str, Any]] = None,
+    exam: Optional[str] = None,
+    exam_flags: int = 0,
+    exam_note: str = '',
+    created_at: float = <factory>
+) -> None
+```
+
+### `ConsolidationStore(root: str, *, create: bool = True) -> None`
+
+A durable archive of what runs learned.
+
+| method | what it does |
+|---|---|
+| `archive(...)` | Archive one run's product. Idempotent by `run_id` (atomic rewrite). |
+| `find(run_id: str) -> Optional[ConsolidationRecord]` | Lookup by identity. |
+| `mark_exam(...)` | Stamp a rule's self-exam status. Idempotent by `run_id`. |
+
+### `SeedReport(...)`
+
+What `seed_from_archive` decided, and why.
+
+```python
+SeedReport(
+    matched_run: Optional[str],
+    archived_reward: float,
+    seeded_score: float,
+    empty_score: float,
+    accepted: bool,
+    reason: str,
+    sample_n: int
+) -> None
+```
+
+### `config_fingerprint(config: Optional[Dict[str, Any]]) -> str`
+
+A stable id for the run configuration (dataset, scorer, model, params).
+
+### `seed_from_archive(...)`
+
+Retrieve a seed for a new run, gated by a mini-eval on its own tasks.
+
+```python
+seed_from_archive(
+    store: ConsolidationStore,
+    tasks: Sequence[Task],
+    run: Any,
+    reward: Any,
+    *,
+    strategy: Any,
+    artifact_id: str = 'artifact',
+    config: Optional[Dict[str, Any]] = None,
+    sample: int = 8,
+    min_reward: float = 0.0,
+    seed: int = 0
+) -> Tuple[Optional[Dict[str, str]], SeedReport]
+```
+
+---
+
+## The RSI loop kernel
+
+One resumable loop over step, control, apply and the durable event log. &nbsp;·&nbsp; `agentdescent.loop_kernel` &nbsp;·&nbsp; [guide](loop-kernel.md)
+
+### `LoopConfig(...)`
+
+Identity, bounds and controller thresholds for one durable loop.
+
+```python
+LoopConfig(
+    tenant: str,
+    workspace: str,
+    spec_hash: str = 'loop',
+    max_generations: int = 3,
+    target: Optional[float] = None,
+    max_cost: Optional[float] = None,
+    min_gain: float = 0.0,
+    patience: int = 2,
+    risk_limit: float = 1.0,
+    base_seed: int = 0,
+    lease_seconds: float = 30.0,
+    max_retries: int = 3
+) -> None
+```
+
+### `LoopContext(...)`
+
+What the caller's `step` sees for one generation.
+
+```python
+LoopContext(
+    run_id: str,
+    generation: int,
+    seed: int,
+    budget_scale: float,
+    best_reward: Optional[float],
+    history: Tuple[LoopGeneration, ...],
+    snapshot: RunSnapshot
+) -> None
+```
+
+### `LoopGeneration(...)`
+
+One generation's durable record, reconstructed from the event log.
+
+```python
+LoopGeneration(
+    generation: int,
+    seed: int,
+    action: str,
+    reason: str,
+    reward: float,
+    cost: float,
+    risk: float,
+    gain: Optional[float],
+    artifact_id: str,
+    stop: bool,
+    applied: bool = False,
+    error: Optional[str] = None,
+    budget_scale: float = 1.0,
+    span_id: str = '',
+    evidence: Mapping[str, Any] = <factory>
+) -> None
+```
+
+### `LoopKernel(...)`
+
+Run a durable loop of `step -> control -> apply` generations.
+
+```python
+LoopKernel(
+    store: SqliteRunStore,
+    config: LoopConfig,
+    *,
+    decision_log: Optional[Any] = None,
+    telemetry: Optional[Any] = None,
+    gate: Optional[Callable[..., Any]] = None,
+    risk_gate: Optional[Callable[..., Any]] = None,
+    controller_factory: Optional[ControllerFactory] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `cancel(run_id: str, *, reason: str = 'operator cancel') -> LoopReport` | Cancel a pending/running loop and return the durable report. |
+| `run(...)` | Resume/run until the controller stops or the budget ends. |
+
+### `LoopObservation(...)`
+
+One measured generation: reward, cost, risk and the artifact it produced.
+
+```python
+LoopObservation(
+    reward: float,
+    cost: float = 0.0,
+    risk: float = 0.0,
+    error: Optional[str] = None,
+    artifact_id: str = '',
+    evidence: Mapping[str, Any] = <factory>
+) -> None
+```
+
+### `LoopReport(...)`
+
+The durable loop's generations and why it stopped.
+
+```python
+LoopReport(
+    run_id: str,
+    status: str,
+    generations: Tuple[LoopGeneration, ...] = (),
+    best_reward: Optional[float] = None,
+    total_cost: float = 0.0,
+    accepted: int = 0,
+    stopped_reason: str = '',
+    reason: str = '',
+    detail: str = ''
+) -> None
+```
+
+---
+
+## Trusted promotion
+
+One fail-closed promotion decision over eval, statistics, proof, canary and admission. &nbsp;·&nbsp; `agentdescent.promotion` &nbsp;·&nbsp; [guide](trusted-promotion.md)
+
+### `PromotionAction()`
+
+The closed vocabulary a promotion decision may emit.
+
+### `PromotionDecision(...)`
+
+The verdict, the evidence it saw and a stable hash of that evidence.
+
+```python
+PromotionDecision(
+    artifact_id: str,
+    action: str,
+    accepted: bool,
+    reasons: Tuple[str, ...] = (),
+    missing: Tuple[str, ...] = (),
+    evidence: Mapping[str, Any] = <factory>,
+    evidence_hash: str = '',
+    decision_hash: str = '',
+    risk: Optional[float] = None
+) -> None
+```
+
+### `PromotionRequest(...)`
+
+All evidence a caller has for one candidate.
+
+```python
+PromotionRequest(
+    artifact_id: str,
+    artifact_hash: Optional[str] = None,
+    eval_result: Optional[EvalResult] = None,
+    contaminated: Optional[bool] = None,
+    conformal: Optional[ConformalReport] = None,
+    sequential: Optional[SequentialReport] = None,
+    canary: Optional[CanaryResult] = None,
+    proof: Optional[ProofEvidence] = None,
+    admission: Optional[AdmissionResult] = None,
+    risk: Optional[float] = None,
+    approved: Optional[bool] = None,
+    goodhart: Optional[GoodhartReport] = None,
+    metamorphic: Optional[MetamorphicReport] = None,
+    verifier: Optional[EnsembleReport] = None,
+    calibration: Optional[CalibrationReport] = None,
+    review_cost: Optional[ReviewCost] = None,
+    metadata: Mapping[str, Any] = <factory>
+) -> None
+```
+
+### `PromotionRules(...)`
+
+What evidence a promotion must present, and the bars it must clear.
+
+```python
+PromotionRules(
+    require_eval: bool = True,
+    require_contamination: bool = True,
+    require_risk: bool = True,
+    require_conformal: bool = False,
+    require_sequential: bool = False,
+    require_canary: bool = True,
+    require_proof: bool = False,
+    require_admission: bool = False,
+    require_approval: bool = False,
+    require_goodhart: bool = False,
+    require_metamorphic: bool = False,
+    require_verifier: bool = False,
+    require_calibration: bool = False,
+    allow_contaminated: bool = False,
+    min_effect: float = 0.0,
+    min_tasks: int = 2,
+    max_risk: float = 1.0,
+    max_review_cost: float = 0.0,
+    max_review_minutes: float = 0.0
+) -> None
+```
+
+### `ProofEvidence(certificate: ProofCertificate, verification: ProofVerification) -> None`
+
+A proof certificate plus the verification that actually checked it.
+
+### `ReviewCost(...)`
+
+What reviewing one proposed diff costs a human (#950).
+
+```python
+ReviewCost(
+    files_changed: int,
+    lines_changed: int,
+    blast_radius: float = 0.2,
+    risk: Optional[float] = None,
+    evidence_items: int = 0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `estimate(...)` | Build a cost from the diff's measured shape. |
+
+### `promote(request: PromotionRequest, policy: Optional[PromotionRules] = None) -> PromotionDecision`
+
+Assemble and judge one promotion; missing or failed evidence never passes.
+
+---
+
+## Adaptive compute
+
+Which strategy deserves this task's compute: direct, PRM, search or ensemble. &nbsp;·&nbsp; `agentdescent.compute_policy` &nbsp;·&nbsp; [guide](compute-policy.md)
+
+### `ComputeAction()`
+
+The closed strategy vocabulary this policy allocates over.
+
+### `ComputeContext(...)`
+
+What the task asks of the compute policy.
+
+```python
+ComputeContext(
+    task_id: str = '',
+    tokens: int = 0,
+    difficulty: float = 0.5,
+    max_cost: Optional[float] = None,
+    required_tags: Tuple[str, ...] = ()
+) -> None
+```
+
+### `ComputeController(...)`
+
+A cost-aware Thompson-sampling bandit over compute strategies.
+
+```python
+ComputeController(
+    options: Sequence[ComputeOption],
+    router: ModelRouter,
+    *,
+    cost_weight: float = 0.5,
+    exploration: float = 0.05,
+    max_calls: Optional[int] = None,
+    seed: int = 0
+) -> None
+```
+
+### `ComputeDecision(...)`
+
+One allocated strategy + model, with the numbers used to choose it.
+
+```python
+ComputeDecision(
+    option: str,
+    action: str,
+    model: str,
+    reason: str,
+    expected_quality: float,
+    sampled_quality: float,
+    expected_cost: float,
+    calls: int,
+    exploration: bool = False,
+    model_reason: str = '',
+    detail: str = '',
+    reservation_id: str = ''
+) -> None
+```
+
+### `ComputeOption(...)`
+
+One strategy's cost/quality profile and when it is eligible.
+
+```python
+ComputeOption(
+    name: str,
+    action: str,
+    calls: int = 1,
+    quality_prior: Tuple[float, float] = (1.0, 1.0),
+    min_difficulty: float = 0.0,
+    max_difficulty: float = 1.0,
+    note: str = ''
+) -> None
+```
+
+### `ComputeReport(...)`
+
+```python
+ComputeReport(
+    options: Tuple[OptionReport, ...],
+    router: RoutingReport,
+    pulls: int,
+    mean_reward: float,
+    mean_cost: float,
+    total_calls: int,
+    reserved_calls: int = 0,
+    detail: str = ''
+) -> None
+```
+
+### `OptionReport(...)`
+
+```python
+OptionReport(
+    option: str,
+    action: str,
+    pulls: int,
+    mean_reward: float,
+    mean_cost: float,
+    posterior_mean: float,
+    detail: str = ''
+) -> None
+```
+
+---
+
+## Trusted evidence
+
+Build the evaluation, canary, statistical, Goodhart, metamorphic, verifier and calibration reports from one paired run. &nbsp;·&nbsp; `agentdescent.trust_evidence` &nbsp;·&nbsp; [guide](trust-evidence.md)
+
+### `RunHealth(attempted: int, failed_tasks: Tuple[str, ...] = (), threshold: float = 0.2) -> None`
+
+How much of a run produced a real answer (#993).
+
+### `TrustEvidence(...)`
+
+The reports one paired evaluation produced, ready for `promote()`.
+
+```python
+TrustEvidence(
+    eval_result: EvalResult,
+    canary: CanaryResult,
+    conformal: Optional[ConformalReport] = None,
+    sequential: Optional[SequentialReport] = None,
+    goodhart: Optional[GoodhartReport] = None,
+    metamorphic: Optional[MetamorphicReport] = None,
+    verifier: Optional[EnsembleReport] = None,
+    calibration: Optional[CalibrationReport] = None,
+    contaminated: Optional[bool] = None,
+    risk: Optional[float] = None,
+    approved: Optional[bool] = None,
+    artifact_changed: Optional[bool] = None,
+    run_health: Optional[RunHealth] = None,
+    metadata: Mapping[str, Any] = <factory>
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `to_promotion_request(...)` | A `PromotionRequest` carrying every report this bundle has. |
+
+### `build_trust_evidence(...)`
+
+Compute every report from paired task scores and optional side data.
+
+```python
+build_trust_evidence(
+    before: Mapping[str, float],
+    after: Mapping[str, float],
+    *,
+    eval_id: str = 'paired',
+    dataset_id: str = 'paired',
+    version: int = 1,
+    verifier: Optional[VerifierEnsemble] = None,
+    candidate: Any = None,
+    calibration: Optional[Tuple[Iterable[float], Iterable[float]]] = None,
+    sequential_deltas: Optional[Iterable[float]] = None,
+    sequential_max_n: Optional[int] = None,
+    proxy_gains: Optional[Sequence[float]] = None,
+    oracle_gains: Optional[Sequence[float]] = None,
+    metamorphic: Optional[MetamorphicSuite] = None,
+    metamorphic_run: Optional[Callable[[Any], Any]] = None,
+    metamorphic_tasks: Iterable[Any] = (),
+    contaminated: Optional[bool] = None,
+    risk: Optional[float] = None,
+    approved: Optional[bool] = None,
+    artifact_changed: Optional[bool] = None,
+    alpha: float = 0.05,
+    seed: int = 0,
+    min_effect: float = 0.0
+) -> TrustEvidence
+```
+
+---
+
+## Counterfactual experience
+
+Turn Shapley step credit into per-action experience rewards. &nbsp;·&nbsp; `agentdescent.counterfactual_experience` &nbsp;·&nbsp; [guide](continual-experience.md)
+
+### `CounterfactualExperience(...)`
+
+Convert Shapley step credit into an `ExperienceRecord` and ingest it.
+
+```python
+CounterfactualExperience(
+    lab: ReplayLab,
+    engine: ExperienceEngine,
+    action_of: Callable[[TraceStep], str],
+    *,
+    min_credit: Optional[float] = None,
+    require_positive_gain: bool = False,
+    permutations: int = 64,
+    seed: int = 0,
+    exact_limit: int = 7
+) -> None
+```
+
+### `CounterfactualExperienceReport(...)`
+
+The credit report, the record it produced and where it was ingested.
+
+```python
+CounterfactualExperienceReport(
+    record: ExperienceRecord,
+    credit: CreditReport,
+    observed: int,
+    detail: str = ''
+) -> None
+```
+
+---
+
+## Preference replay
+
+Rank stored experience with a fitted preference model and replay the preferred slice. &nbsp;·&nbsp; `agentdescent.preference_replay` &nbsp;·&nbsp; [guide](continual-experience.md)
+
+### `PreferenceReplay(...)`
+
+Rank stored experience by a preference model and replay the top slice.
+
+```python
+PreferenceReplay(
+    model: PreferenceModel,
+    store: ExperienceStore,
+    *,
+    featurize: Optional[Callable[[ExperienceRecord], Sequence[float]]] = None
+) -> None
+```
+
+### `PreferenceReplayReport(...)`
+
+The selected records, their scores and what the engine ingested.
+
+```python
+PreferenceReplayReport(
+    selected: Tuple[ExperienceRecord, ...],
+    ingested: Tuple[str, ...],
+    scores: Mapping[str, float] = None,
+    skipped: int = 0,
+    detail: str = ''
+) -> None
+```
+
+---
+
+## Promotion ledger
+
+Sign an accepted promotion into a manifest and lineage receipt. &nbsp;·&nbsp; `agentdescent.promotion_ledger` &nbsp;·&nbsp; [guide](trusted-promotion.md)
+
+### `PromotionLedger(lineage: Optional[LineageGraph] = None, *, issuer: str = 'agentdescent') -> None`
+
+Sign accepted promotions and write their lineage receipt.
+
+### `ReleaseRecord(...)`
+
+The signed manifest, its verification and the lineage node.
+
+```python
+ReleaseRecord(
+    manifest: ArtifactManifest,
+    envelope: SignedEnvelope,
+    verification: VerificationResult,
+    lineage: LineageNode,
+    detail: str = ''
+) -> None
+```
+
+---
+
+## Capability foundry
+
+Admit a synthesized tool only after validation, review, safety, proof and a holdout gain. &nbsp;·&nbsp; `agentdescent.capability_foundry` &nbsp;·&nbsp; [guide](capability-foundry.md)
+
+### `CapabilityFoundry(...)`
+
+Admit a synthesized tool only when its review, safety, proof and gain hold.
+
+```python
+CapabilityFoundry(
+    gate: SafeSelfModifier,
+    *,
+    graph: Optional[ArtifactGraph] = None,
+    prover: Optional[ProofRunner] = None,
+    require_review: bool = True,
+    require_proof: bool = True,
+    require_registration: bool = True,
+    min_valid_score: float = 0.5,
+    min_review_agreement: float = 0.6,
+    min_holdout_gain: float = 0.0
+) -> None
+```
+
+### `CapabilityOutcome(...)`
+
+The admission decision, the proof and the registered artifact id.
+
+```python
+CapabilityOutcome(
+    gap_id: str,
+    tool_name: str,
+    status: str,
+    reasons: Tuple[str, ...] = (),
+    missing: Tuple[str, ...] = (),
+    artifact_id: str = '',
+    proof: Optional[ProofCertificate] = None,
+    safety: Optional[SafetyDecision] = None,
+    review: Optional[DeliberationReport] = None,
+    validation: Optional[ToolValidation] = None,
+    holdout_gain: Optional[float] = None
+) -> None
+```
+
+### `CapabilityRequest(...)`
+
+One synthesized tool and the evidence gathered for it.
+
+```python
+CapabilityRequest(
+    gap_id: str,
+    tool: ToolSpec,
+    validation: ToolValidation,
+    modification: ModificationSpec,
+    before: float,
+    after: float,
+    canary: Optional[float] = None,
+    review: Optional[DeliberationReport] = None,
+    review_winner: str = 'approve',
+    metadata: Mapping[str, Any] = <factory>
+) -> None
+```
+
+### `CapabilityStatus()`
+
+The closed outcome vocabulary for one capability candidate.
+
+---
+
+## Capability scout
+
+Turn failed tasks into a synthesized tool and hand it to the foundry. &nbsp;·&nbsp; `agentdescent.capability_scout` &nbsp;·&nbsp; [guide](capability-foundry.md)
+
+### `CapabilityScout(...)`
+
+Turn failure tasks into a reviewed tool via the existing seams.
+
+```python
+CapabilityScout(
+    synthesizer: ToolSynthesizer,
+    foundry: CapabilityFoundry,
+    *,
+    max_examples: int = 5,
+    max_candidates: int = 4
+) -> None
+```
+
+### `CapabilityScoutReport(...)`
+
+The failure tasks, synthesis trail and admission outcome.
+
+```python
+CapabilityScoutReport(
+    goal: str,
+    tasks: int,
+    synthesis: ToolSynthesisReport,
+    outcome: Optional[CapabilityOutcome],
+    verdict: str,
+    detail: str = ''
+) -> None
+```
+
+---
+
+## Continual experience
+
+Cross-run recall, replay warm-start and a forgetting guard around the meta learner. &nbsp;·&nbsp; `agentdescent.experience` &nbsp;·&nbsp; [guide](continual-experience.md)
+
+### `ExperienceEngine(...)`
+
+Feed cross-run records into a continual learner with a forgetting guard.
+
+```python
+ExperienceEngine(
+    learner: ContinualMetaLearner,
+    store: ExperienceStore,
+    *,
+    require_anchors: bool = True,
+    anchor_tolerance: float = 0.0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `replay_from_store() -> int` | Warm the learner replay from the store without re-writing rows. |
+
+### `ExperienceHit(record: ExperienceRecord, distance: float) -> None`
+
+One recalled record and its distance from the query.
+
+### `ExperienceRecord(...)`
+
+One run's experience: context features and the reward of each action.
+
+```python
+ExperienceRecord(
+    run_id: str,
+    features: Tuple[float, ...],
+    rewards: Mapping[str, float],
+    cost: float = 0.0,
+    accepted: bool = True,
+    artifact_id: str = '',
+    created_at: float = 0.0,
+    metadata: Mapping[str, Any] = <factory>
+) -> None
+```
+
+### `ExperienceReport(...)`
+
+```python
+ExperienceReport(
+    rows: int,
+    learner: ContinualReport,
+    skipped: int = 0,
+    detail: str = ''
+) -> None
+```
+
+### `ExperienceStore(path: Optional[str] = None) -> None`
+
+An append-only, optionally persistent experience memory.
+
+| method | what it does |
+|---|---|
+| `recall(features: Sequence[float], *, k: int = 5) -> Tuple[ExperienceHit, ...]` | Nearest records with the same feature dimension; others are skipped. |
+
+### `ExperienceUpdate(...)`
+
+The validation result plus the anchor guard's verdict.
+
+```python
+ExperienceUpdate(
+    version: int,
+    accepted: bool,
+    before: float,
+    after: float,
+    drift: float,
+    anchor_before: Optional[float] = None,
+    anchor_after: Optional[float] = None,
+    rolled_back: bool = False,
+    reason: str = ''
+) -> None
+```
+
+---
+
+## Continual meta-policy
+
+Online policy updates with replay, validation and rollback. &nbsp;·&nbsp; `agentdescent.continual_meta` &nbsp;·&nbsp; [guide](continual-experience.md)
+
+### `ContinualMetaLearner(...)`
+
+Update a softmax meta-policy with replay, validation and rollback.
+
+```python
+ContinualMetaLearner(
+    actions: Sequence[str],
+    *,
+    dim: int,
+    learning_rate: float = 0.2,
+    l2: float = 0.001,
+    replay_size: int = 1000,
+    min_gain: float = 0.0,
+    seed: int = 0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `rollback() -> bool` | Undo the immediately preceding accepted update. |
+
+### `ContinualReport(...)`
+
+```python
+ContinualReport(
+    version: int,
+    updates: int,
+    accepted: int,
+    rejected: int,
+    replay: int,
+    detail: str = ''
+) -> None
+```
+
+### `LinearPolicy(actions: Tuple[str, ...], dim: int, weights: List[List[float]] = <factory>) -> None`
+
+### `MetaExample(...)`
+
+```python
+MetaExample(
+    features: Tuple[float, ...],
+    rewards: Mapping[str, float],
+    cost: float = 0.0,
+    at: float = 0.0
+) -> None
+```
+
+### `MetaUpdate(...)`
+
+```python
+MetaUpdate(
+    version: int,
+    accepted: bool,
+    before: float,
+    after: float,
+    drift: float,
+    reason: str
+) -> None
+```
+
+### `ReplayBuffer(max_size: int = 1000) -> None`
+
+A bounded, deterministic replay buffer.
+
+---
+
+## The RSI platform cycle
+
+One cycle that hands compute, loop, promotion, foundry and experience to each other. &nbsp;·&nbsp; `agentdescent.platform` &nbsp;·&nbsp; [guide](platform.md)
+
+### `PlatformConfig(...)`
+
+The loop identity and bounds; the layers keep their own policies.
+
+```python
+PlatformConfig(
+    tenant: str,
+    workspace: str,
+    max_generations: int = 3,
+    target: Optional[float] = None,
+    max_cost: Optional[float] = None,
+    min_gain: float = 0.0,
+    patience: int = 2,
+    risk_limit: float = 1.0,
+    base_seed: int = 0,
+    spec_hash: str = 'platform',
+    lease_seconds: float = 30.0,
+    max_retries: int = 3
+) -> None
+```
+
+### `PlatformReport(...)`
+
+The five layers' decisions for one cycle, and whether all configured ones ran.
+
+```python
+PlatformReport(
+    run_id: str,
+    loop: LoopReport,
+    promotion: Optional[PromotionDecision] = None,
+    foundry: Optional[CapabilityOutcome] = None,
+    experience: Optional[ExperienceUpdate] = None,
+    skipped: Tuple[str, ...] = (),
+    self_validated: bool = False,
+    complete: bool = False,
+    detail: str = ''
+) -> None
+```
+
+### `RSIPlatform(...)`
+
+Compose the loop, compute, promotion, foundry and experience layers.
+
+```python
+RSIPlatform(
+    store: SqliteRunStore,
+    config: PlatformConfig,
+    *,
+    compute: ComputeController,
+    promotion_rules: Optional[PromotionRules] = None,
+    foundry: Optional[CapabilityFoundry] = None,
+    experience: Optional[ExperienceEngine] = None,
+    decision_log: Optional[Any] = None,
+    telemetry: Optional[Any] = None,
+    gate: Optional[Callable[..., Any]] = None,
+    risk_gate: Optional[Callable[..., Any]] = None,
+    _processed: Optional[Dict[str, Dict[str, Any]]] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `clone(*, base_seed: Optional[int] = None) -> 'RSIPlatform'` | A new platform with a new loop seed, sharing every other component. |
+| `run_cycle(...)` | Run one full cycle; every configured layer must produce a decision. |
+
+---
+
+## Budgeted search
+
+Stop UCT when another expansion stops buying value, using a per-expansion gain bar or MarginalGainStop. &nbsp;·&nbsp; `agentdescent.budgeted_search` &nbsp;·&nbsp; [guide](stopping.md)
+
+### `BudgetedSearch(...)`
+
+Run a search at increasing budgets and stop when the gain plateaus.
+
+```python
+BudgetedSearch(
+    fabric: SearchFabric,
+    *,
+    min_gain_per_expansion: float = 0.0001,
+    patience: int = 2,
+    stop: Optional[MarginalGainStop] = None,
+    seed: int = 0
+) -> None
+```
+
+### `BudgetedSearchReport(...)`
+
+```python
+BudgetedSearchReport(
+    rounds: Tuple[SearchRound, ...],
+    best: Optional[SearchResult],
+    stopped_reason: str,
+    detail: str = ''
+) -> None
+```
+
+### `SearchRound(...)`
+
+```python
+SearchRound(
+    budget: int,
+    result: SearchResult,
+    gain: Optional[float] = None,
+    gain_per_expansion: Optional[float] = None,
+    cumulative_expansions: int = 0,
+    stopped: bool = False
+) -> None
+```
+
+---
+
+## Solver-challenger self-play
+
+The task distribution evolves too: challenger, frontier, curriculum. &nbsp;·&nbsp; `agentdescent.selfplay` &nbsp;·&nbsp; [guide](selfplay.md)
+
+### `Challenger(...)`
+
+The task-generation artifact's behavior: generate, validate, propose.
+
+```python
+Challenger(
+    generate: Callable[[str, int], Dict[str, Any]],
+    validate: Callable[[Dict[str, Any]], Task],
+    propose: Callable[[str, Dict[str, float]], str],
+    spec: str = '',
+    config: ChallengerConfig = <factory>
+) -> None
+```
+
+### `ChallengerConfig(...)`
+
+The challenger's dials: how much of the task budget goes to the frontier, what counts as learned or stuck, and how long a generator may keep trying.
+
+```python
+ChallengerConfig(
+    generated_per_round: int = 4,
+    frontier_share: float = 0.5,
+    before_gap: float = 0.05,
+    stuck_gap: float = 0.0,
+    max_attempts: int = 8,
+    r0_floor: float = 0.05,
+    max_generate_attempts: int = 20,
+    max_frontier_pool: int = 64
+) -> None
+```
+
+### `FrontierSampler(challenger: Challenger, *, seed: int = 0) -> None`
+
+A `TaskSampler` that mixes the fixed seed tasks with a growable frontier pool the challenger generates.
+
+| method | what it does |
+|---|---|
+| `count_invalid() -> None` | A validity gate refused a generated payload. |
+| `install(tasks: Sequence[Task]) -> None` | Add a freshly generated, validated frontier batch. |
+| `live_ids() -> Tuple[str, ...]` | The ids currently on the frontier. |
+| `pick(keys: Sequence[str], r: int) -> Any` | A seed id (from the shard) or a frontier Task object. |
+| `record(task_id: str, score: float) -> None` | Learn one rollout's outcome. The engine calls this for every task, seed or frontier; only frontier ids are tracked. |
+| `sweep(solved_threshold: float) -> Dict[str, float]` | Close one solver round: judge every frontier task that was attempted, return the learnability report for the challenger. |
+
+### `curriculum_evolve(...)`
+
+Co-evolve the solver and its task distribution.
+
+```python
+curriculum_evolve(
+    seed_tasks: Sequence[Task],
+    reward: Reward,
+    *,
+    run: Run,
+    propose: Propose,
+    strategy: Strategy,
+    challenger: Challenger,
+    rounds: int = 15,
+    n_workers: int = 4,
+    held_out_frac: float = 0.4,
+    repo_path: Optional[str] = None,
+    seed: int = 0,
+    max_concurrency: int = 1,
+    solved_threshold: float = 0.999,
+    verbose: bool = False,
+    **evolve_kwargs: Any
+) -> EvolutionResult
+```
+
+---
+
+## Model-assisted fusion
+
+Combine competing values for the same key, when a dict update cannot. &nbsp;·&nbsp; `agentdescent.fusion` &nbsp;·&nbsp; [guide](aggregator.md)
+
+### `KeepContradictions()`
+
+A conflict policy that leaves contradicting diffs for fusion to resolve.
+
+### `LearnableFusionPolicy(...)`
+
+A fusion policy that learns when merging wins -- and stops paying for the ranking it cannot change.
+
+```python
+LearnableFusionPolicy(
+    inner: Optional[Any] = None,
+    *,
+    tournament: bool = True,
+    seed: int = 0,
+    min_trials: int = 20,
+    uncertainty_threshold: float = 0.15,
+    epsilon: float = 0.1,
+    max_wrong_skips: int = 1,
+    lr: float = 0.2,
+    reg: float = 0.05,
+    max_logit: float = 3.0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `bind(verifier: Any) -> None` | Forward the verifier to the inner tournament and the union path. |
+| `select(artifact: Evolvable, diffs: List[Diff]) -> Tuple[Diff, Evolvable, bool]` | Learn or predict: skip the ranking sweep when the union is confidently predicted to win (a learned logistic, not a proof). |
+
+### `ReflectiveFusion(...)`
+
+Combine contradicting diffs by asking a model to synthesise their values.
+
+```python
+ReflectiveFusion(
+    complete,
+    *,
+    verifier: Any = None,
+    max_chars: int = 8000,
+    max_proposals: int = 6,
+    validate: Optional[Callable[[Any], Any]] = None,
+    trust_union: bool = False
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `bind(verifier: Any) -> None` | Receive the engine's verifier, if the caller did not supply one. |
+| `select(artifact: Evolvable, diffs: List[Diff]) -> Tuple[Diff, Evolvable, bool]` | Build the union, rank it against parents (unless `trust_union`). |
+
+### `reflective_merge(complete, **kwargs) -> Dict[str, Any]`
+
+The two policies model-merging needs, as `Policies` keyword arguments.
+
+---
+
+## Borrowed RL decision rules
+
+Group-relative advantage, an adaptive trust region, distance from stable. &nbsp;·&nbsp; `agentdescent.advantage` &nbsp;·&nbsp; [guide](concepts.md)
+
+### `AdaptiveTrustRegion(...)`
+
+Widen the diff-size cap when merges land or oversized refusals dominate; tighten on reversals.
+
+```python
+AdaptiveTrustRegion(
+    *,
+    initial: TrustRegion = TrustRegion(ops=6, chars=32000),
+    minimum: TrustRegion = TrustRegion(ops=1, chars=2000),
+    maximum: TrustRegion = TrustRegion(ops=64, chars=512000),
+    window: int = 10,
+    widen: float = 1.25,
+    tighten: float = 0.5,
+    accept_rate_to_widen: float = 0.5
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `observe(outcome: str) -> TrustRegion` | Record one merge outcome and return the region for the next merge. |
+| `policy_fingerprint() -> dict` | This policy's configuration, for `policies.policy_digest` (#943). |
+
+### `AdvantageAcceptance(inner = None, strength: float = 1.0) -> None`
+
+Shift the acceptance prior by how well a proposal did against its group.
+
+### `AdvantageConflict(inner = None, margin: float = 0.5) -> None`
+
+Break a contradiction by group-relative advantage, not raw score.
+
+### `GroupAdvantage(min_group: int = 4, max_groups: int = 4096) -> None`
+
+Standardise a rollout's reward against the group it belongs to.
+
+| method | what it does |
+|---|---|
+| `key(base_version: int, cluster: str = '') -> str` | The group a rollout belongs to. Same base, same cluster. |
+| `observe(key: str, reward: float) -> Optional[float]` | Record a reward and return its advantage, or `None` if unknown yet. |
+
+### `StableDistanceAcceptance(inner = None, strength: float = 0.1) -> None`
+
+Penalise candidates that drift far from the confirmed branch.
+
+| method | what it does |
+|---|---|
+| `policy_fingerprint() -> dict` | `strength` is a decision knob kept on the instance (#943). |
+
+### `TrustRegion(ops: int, chars: int) -> None`
+
+How large one diff may be: operations, and characters.
+
+### `state_distance(a, b) -> float`
+
+Fraction of keys on which two artifact states differ, in `[0, 1]`.
+
+---
+
+## Scheduling and audits
+
+Duration-aware dispatch, straggler handling, and the oracle audit queue. &nbsp;·&nbsp; `agentdescent.scheduler` &nbsp;·&nbsp; [guide](duration-scheduling.md)
+
+### `AuditScheduler(max_queued: int = 4096, collect: bool = False) -> None`
+
+Allocates oracle budget by estimated value G-hat (design doc, 5.3).
+
+| method | what it does |
+|---|---|
+| `force_oracle(blast_radius: float, artifact_id: str) -> bool` | High-impact or low-trust changes are forced through the oracle. |
+| `requeue(item: _AuditItem) -> None` | Put a popped item back with its **original** priority. |
+| `update_trust(artifact_id: str, oracle_agreed: bool) -> None` | Raise trust when cheap eval agreed with the oracle, lower it when not. |
+
+### `DurationEstimator(...)`
+
+Predicts a rollout's wall-clock cost from a task's *size* (e.g. prompt length), calibrated online from observed rollouts.
+
+```python
+DurationEstimator(
+    prior: float = 0.05,
+    min_samples: int = 3,
+    _n: int = 0,
+    _sx: float = 0.0,
+    _sy: float = 0.0,
+    _sxx: float = 0.0,
+    _sxy: float = 0.0,
+    _lock: threading.Lock = <factory>
+) -> None
+```
+
+### `ResumeQueue(p90_multiplier: float = 2.0, max_attempts: int = 1) -> None`
+
+Turn-level checkpoints of timed-out rollouts (partial rollout).
+
+| method | what it does |
+|---|---|
+| `pop() -> Optional[ResumeItem]` | Pop the next resume. Counts as a resume for that task, feeding the `max_attempts` bound in `push`. |
+| `pop_for(task_ids: Sequence[str]) -> Optional[ResumeItem]` | Pop the first resume whose task belongs to `task_ids`. |
+| `push(item: ResumeItem) -> bool` | Queue `item`; `False` when this task has been resumed too often. |
+
+### `TaskCluster(...)`
+
+```python
+TaskCluster(
+    id: str,
+    tasks: List[Any],
+    recent_value: float = 0.5,
+    n_evidence: float = 0.0,
+    pass_rate: float = 0.5
+) -> None
+```
+
+### `TaskScheduler(clusters: List[TaskCluster], c: float = 1.4) -> None`
+
+UCB over task clusters, with a difficulty (zero-advantage) filter.
+
+| method | what it does |
+|---|---|
+| `lease_one() -> TaskCluster` | Atomically pick the single highest-UCB cluster (async worker pull). |
+| `lease_round_robin() -> TaskCluster` | Async worker pull that spreads concurrent workers across clusters. |
+| `select_batch(k: int) -> List[TaskCluster]` | Lease `k` clusters to workers, UCB-ordered, cycling if `k` exceeds the number of clusters. |
+
+### `fifo_makespan(weights: List[float], n_workers: int) -> float`
+
+Makespan of naive round-robin dispatch (the baseline LPT improves on).
+
+### `lpt_schedule(weights: List[float], n_workers: int) -> Tuple[List[int], float]`
+
+Longest-Processing-Time-first assignment of items to workers.
+
+---
+
+## The data layer
+
+Datasets, splits, and cached fetches from HuggingFace or raw URLs. &nbsp;·&nbsp; `agentdescent.dataloader` &nbsp;·&nbsp; [guide](dataloader.md)
+
+### `Dataset(...)`
+
+A dataset partitioned into **train / val / test** splits.
+
+```python
+Dataset(
+    train: List[Any] = <factory>,
+    val: List[Any] = <factory>,
+    test: List[Any] = <factory>,
+    name: str = ''
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `map(fn: Callable[[Any], Any]) -> 'Dataset'` | Apply `fn` to every item in every split, returning a new Dataset. |
+
+### `split_dataset(...)`
+
+Partition `items` into a `Dataset` by `ratios` (train, val, test).
+
+```python
+split_dataset(
+    items: Sequence[Any],
+    *,
+    ratios: Tuple[float, float, float] = (0.6, 0.2, 0.2),
+    seed: int = 0,
+    shuffle: bool = True,
+    stratify_key: Optional[Callable[[Any], Any]] = None,
+    name: str = ''
+) -> Dataset
+```
+
+---
+
+## An evolve() call as data
+
+The JSON spec a host agent writes and the CLI / MCP server run. &nbsp;·&nbsp; `agentdescent.evolvespec` &nbsp;·&nbsp; [guide](plugins.md)
+
+### `EvolveSpec(...)`
+
+What to evolve, against what, scored how, by whom -- as data.
+
+```python
+EvolveSpec(
+    kind: str,
+    target: str,
+    data: Dict[str, Any],
+    score: Union[str, Dict[str, Any]] = 'contains',
+    agent: Optional[Union[str, Dict[str, Any]]] = None,
+    reflect: Optional[Union[str, Dict[str, Any]]] = None,
+    name: Optional[str] = None,
+    template: str = '{skill}\n\n{prompt}',
+    layout: Optional[str] = None,
+    prompt_template: Optional[str] = None,
+    editable: Sequence[str] = ('**',),
+    frozen: Sequence[str] = (),
+    max_files_per_diff: int = 2,
+    validate_skill: bool = True,
+    entrypoint: Sequence[str] = (),
+    setup_cmd: Sequence[str] = (),
+    test_cmd: Sequence[str] = ('python', '-m', 'pytest', '-q'),
+    timeout: float = 120.0,
+    host: Optional[str] = None,
+    env_passthrough: Sequence[str] = (),
+    audit: Optional[Dict[str, Any]] = None,
+    algorithm: Optional[Union[str, Dict[str, Any]]] = None,
+    policies: Dict[str, Any] = <factory>,
+    agg_config: Dict[str, Any] = <factory>,
+    evolve: Dict[str, Any] = <factory>,
+    extra_artifacts: Dict[str, Any] = <factory>,
+    allow: Sequence[str] = (),
+    record_rollouts: bool = True,
+    version: int = 1
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `absolutise(base: Optional[str] = None) -> 'EvolveSpec'` | A copy whose file paths are absolute, resolved against `base` (cwd). |
+
+### `SpecError`
+
+A spec that cannot be composed, and the field that is wrong.
+
+### `compose(...)`
+
+Turn a spec into the `evolve()` call the quickstarts would write.
+
+```python
+compose(
+    spec: EvolveSpec,
+    *,
+    usage: Optional[Usage] = None,
+    on_round: Optional[Callable] = None,
+    repo_path: Optional[str] = None,
+    workspace_root: Optional[str] = None,
+    sandbox_pool: Any = None,
+    **overrides: Any
+) -> Composition
+```
+
+### `load_spec(path: str, *, absolutise: bool = True) -> EvolveSpec`
+
+Read a spec from a JSON file.
+
+### `run_spec(spec: EvolveSpec, **hooks: Any) -> EvolutionResult`
+
+Compose and run. `hooks` are `compose`'s keyword arguments.
+
+---
+
+## Barrier-free evolution
+
+`evolve()` without the round barrier. &nbsp;·&nbsp; `agentdescent.async_evolve` &nbsp;·&nbsp; [guide](async.md)
+
+### `async_evolve(...)`
+
+Evolve an artifact **without a round barrier**.
+
+```python
+async_evolve(
+    tasks,
+    reward: Reward,
+    *,
+    agent: Optional[Agent] = None,
+    run: Optional[Run] = None,
+    propose: Optional[Propose] = None,
+    strategy: Optional[Strategy] = None,
+    initial_state: Optional[Dict[str, str]] = None,
+    blast_radius: float = 0.2,
+    artifact_id: str = 'artifact',
+    n_workers: int = 4,
+    async_ratio: int = 3,
+    resync_on_commit: bool = True,
+    max_seconds: float = 20.0,
+    max_iters: Optional[int] = None,
+    max_calls: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    stop_on_diminishing_returns: bool = False,
+    efficiency_floor: float = 0.25,
+    call_budget: Optional[CallBudget] = None,
+    target_reward: Optional[float] = None,
+    patience: Optional[int] = None,
+    max_worker_errors: int = 3,
+    eval_concurrency: int = 8,
+    pipelined_gate: bool = False,
+    gate_workers: int = 2,
+    held_out_frac: float = 0.4,
+    repo_path: Optional[str] = None,
+    agg_config = None,
+    staleness_policy: Optional[StalenessPolicy] = None,
+    aggregator_factory = None,
+    oracle_budget: int = 200,
+    cheap_eval_tasks: Optional[int] = None,
+    fusion_tournament: Optional[bool] = None,
+    checkpointing: bool = False,
+    solved_threshold: float = 0.999,
+    shuffle: bool = False,
+    seed: int = 0,
+    self_verify: bool = True,
+    shutdown_grace: float = 2.0,
+    stall_patience: int = 50,
+    duration_estimator: Optional['DurationEstimator'] = None,
+    straggler_factor: float = 3.0,
+    resume_queue: Optional['ResumeQueue'] = None,
+    task_sampler: Optional['TaskSampler'] = None,
+    on_round: Optional[Callable[[RoundInfo], None]] = None,
+    on_reports: Optional[Callable[[Sequence[Any]], None]] = None,
+    stop_when: Optional[Callable[[RoundInfo], bool]] = None,
+    verbose: bool = False,
+    usage: Optional[Usage] = None,
+    policies: Optional['Policies'] = None,
+    allocator: Optional[Any] = None,
+    record_trajectories: bool = False,
+    trajectory_store: Optional[Any] = None,
+    contract: Optional[Contract] = None,
+    population_islands: int = 0,
+    extra_artifacts: Optional[Dict[str, 'EvolvingArtifact']] = None,
+    budget: Optional['BudgetSettings'] = None,
+    runtime: Optional['RuntimeSettings'] = None,
+    observability: Optional['ObservabilitySettings'] = None
+) -> EvolutionResult
+```
+
+| parameter | type | default | what it is |
+|---|---|---|---|
+| `tasks` |  | *required* | Exactly as in `evolve`, which documents them. (Listed rather than left to the paragraph above: a completeness check that reads prose cannot tell a documented parameter from a mentioned one.) |
+| `reward` | `Reward` | *required* | As `tasks`. |
+| `agent` | `Optional[Agent]` | `None` | As `tasks`. |
+| `run` | `Optional[Run]` | `None` | As `tasks`. |
+| `propose` | `Optional[Propose]` | `None` | As `tasks`. |
+| `strategy` | `Optional[Strategy]` | `None` | As `tasks`. |
+| `initial_state` | `Optional[Dict[str, str]]` | `None` | As `tasks`. |
+| `blast_radius` | `float` | `0.2` | As `tasks`. |
+| `artifact_id` | `str` | `'artifact'` | As `tasks`. |
+| `n_workers` | `int` | `4` | Producer threads (`>= 1`). The train tasks are sharded round-robin across them; a worker with an empty shard is not started. |
+| `async_ratio` | `int` | `3` | The lag budget, in two senses: a worker refreshes its snapshot once head drifts more than this far ahead, **and** it stops producing while more than this many cards sit un-merged. The second bound matters at cold start, before any commit has moved head. |
+| `resync_on_commit` | `bool` | `True` | Refresh every worker as soon as a sweep commits, whatever the ratio. On by default: a worker that starts a rollout against a version a finished sweep has already replaced is doing work the merger will discard, and no workload wants that. This does **not** remove staleness where a real workload gets it. A worker snapshots, then spends the rollout in `run`, then pushes; a commit landing anywhere in that window makes the card stale no matter what the top of the loop does. What it removes is the other source: *starting* a rollout against a snapshot a finished sweep has already superseded. The two coincide only when rollouts are short relative to sweep cadence -- as they are in this repo's synthetic tests and bench workloads, where a rollout is a dictionary lookup and turning this on does collapse η to 0. Those are the cases that need `False`: anything measuring what the lag budget alone does has to switch this off, or the budget is no longer the only resync trigger and the measurement is of something else. Turn it on when the artifact's *content* is what workers reason from, so an out-of-date copy makes the work void rather than merely stale. Evolving a skill library from empty is the case that motivated it: the lag budget fires at `head_v - base_v > async_ratio`, so with the default 3 the first three commits leave every worker still proposing against no library at all, re-deriving what head already has for the merger to discard. |
+| `max_seconds` | `float` | `20.0` | Wall-clock budget for the **production phase only**. Two things still happen after it, so budget for them: a bounded shutdown (`shutdown_grace`, since an in-flight rollout cannot be cancelled) and **one held-out scoring pass** to compute `final_reward`. That pass is memoised per (artifact, task), so it is free when the final head was already scored by a sweep and costs a full held-out sweep of the backend when it was not -- which is exactly the case when the budget was too short for any sweep to finish. |
+| `max_iters` | `Optional[int]` | `None` | Stop after this many worker rollouts in total (a budget, not a barrier). |
+| `max_calls` | `Optional[int]` | `None` | Stop after this many actor invocations (`run` + `propose`) in total. The second half of an equal-budget comparison: two configurations matched on rollouts still differ in model spend whenever one of them asks for more proposals per rollout, and the cheaper unit is the one a reader assumes was held fixed. Both bounds are checked as each rollout lands, so a run overshoots only by what was already in flight. |
+| `max_tokens` | `Optional[int]` | `None` | Stop after this many tokens in total (`prompt + completion`), as the meter measured them. The third budget unit, and the one cost is measured in: `max_calls` and `max_iters` count invocations, and a reasoning model can spend 40k tokens on hidden thinking in a single one, so neither bounds the bill. Checked as each rollout lands (tighter than the synchronous path's round barrier), and a `BudgetGovernor` degrades optional spend -- fusion tournaments at 75% of the budget, self-verify at 90% -- before the wall. `None` (default) means unbounded, and no governor is constructed. |
+| `stop_on_diminishing_returns` | `bool` | `False` | Stop when the run's measured return per token falls off its own peak by more than `efficiency_floor`. Off by default; needs `max_tokens`. See `evolve`. |
+| `efficiency_floor` | `float` | `0.25` | How far below the peak counts as diminishing, when the stop above is on. A self-calibrating ratio, not an absolute rate. See `evolve`. |
+| `call_budget` | `Optional[CallBudget]` | `None` | An adaptive per-call thinking budget (o1-style test-time scaling). See `evolve`; the allocation happens before each worker's `propose` call, gated by the same `score` and `governor.remaining_fraction()` the synchronous path uses. |
+| `target_reward` | `Optional[float]` | `None` | Stop as soon as a sweep's held-out reward reaches this. Compared against the real reward, never against an acceptance probability. |
+| `patience` | `Optional[int]` | `None` | Stop after this many consecutive merge sweeps that fail to beat the best held-out reward seen so far. The async analogue of the synchronous knob: there are no round barriers here, so a *sweep* (one drain-and-merge by the merger) is the unit. `None` disables it. |
+| `max_worker_errors` | `int` | `3` | Consecutive failed rollouts before a worker that has *never* succeeded gives up. Workers that have succeeded at least once never retire; they back off and keep trying until the run's own budget ends it. |
+| `eval_concurrency` | `int` | `8` | How many held-out tasks the merger scores at once. `1` restores the old sequential behaviour. |
+| `pipelined_gate` | `bool` | `False` | Run a merge's **measurement** phase on its own threads instead of on the merger. Off by default. The merger is one thread and it does three things per merge: drain and filter (cheap), score the base and the candidate (expensive), then accept, audit and commit (cheap). Measured on the stub workload, the middle phase is **94% of the merger's gate time** and the merger is ~90% busy, which leaves 4.5 of 8 workers blocked at the backpressure gate at any moment (`docs/efficiency.md`). This lets the merger go back to draining while the measurement runs, so the workers keep producing. **It changes no commit semantics.** At most one candidate per artifact is measured at a time, so every candidate is still committed against the head it was prepared and measured on -- there is no candidate-level staleness to have a policy about. Cards arriving meanwhile accumulate in the aggregator's buffer, which is what the buffer is for, so batches get larger rather than more numerous. Requires an aggregator with `begin_step` / `measure` / `finish_step` (the shipped one has them). A custom one that predates the seam warns and keeps the inline path. |
+| `gate_workers` | `int` | `2` | Threads for the measurement phase when `pipelined_gate` is on. Bounded in practice by one candidate per artifact, so the default of 2 is enough for a single-artifact run with one measurement finishing as the next starts. This is a **third** pool -- `n_workers` rollouts, `gate_workers` measurements, each of which fans out over `eval_concurrency` tasks -- so the ceiling your provider sees is `n_workers + gate_workers * eval_concurrency`. |
+| `held_out_frac` | `float` | `0.4` | As `tasks`. |
+| `repo_path` | `Optional[str]` | `None` | As `tasks`. |
+| `agg_config` |  | `None` | As `tasks`. |
+| `staleness_policy` | `Optional[StalenessPolicy]` | `None` | As `tasks`. |
+| `aggregator_factory` |  | `None` | As `tasks`. |
+| `oracle_budget` | `int` | `200` | As `tasks`. |
+| `cheap_eval_tasks` | `Optional[int]` | `None` | As in `evolve`: how many held-out tasks the cheap layer scores when ranking candidates. `None` is 8, or the whole held-out set when that is smaller. |
+| `fusion_tournament` | `Optional[bool]` | `None` | As in `evolve`: rank the survivors against their fusion before putting one forward. `None` defers to `agg_config`, which is off. The cost/benefit is identical on this path -- there is one merger thread here too, and it pays the ranking on the critical path of every commit. |
+| `checkpointing` | `bool` | `False` | As in `evolve`: save the aggregator's search state each round so a later run on the same `repo_path` resumes the search, not just the artifact. Off by default. The merger is the only thread that records a round here, so the write sits on the same single-writer path it does on the synchronous side. |
+| `solved_threshold` | `float` | `0.999` | As in `evolve`: the reward at which a task counts as solved and no proposal is requested. Lower it for a graded scorer. |
+| `shuffle` | `bool` | `False` | As in `evolve`: shuffle before the positional train/held-out split. Off by default. |
+| `seed` | `int` | `0` | As `shuffle`. |
+| `self_verify` | `bool` | `True` | As in `evolve`. `False` skips the extra per-trajectory rollout, which is what ports that judge candidates only on held-out want. |
+| `shutdown_grace` | `float` | `2.0` | Total seconds to wait for the worker and merger threads after the budget expires -- shared across all of them, not per thread. An in-flight rollout cannot be cancelled, so a slow backend can still overrun it; a warning says so and work already merged is kept. |
+| `stall_patience` | `int` | `50` | Merger sweeps that may pass with cards arriving and nothing committing before every worker is forced to resync, regardless of `async_ratio`. Without it a lag budget larger than the staleness tolerance **livelocks** under the Guarded policy: workers propose against a snapshot too old for the policy to accept, every card is discarded, head never moves, and the lag budget therefore never triggers a refresh either. |
+| `duration_estimator` | `Optional['DurationEstimator']` | `None` | Pass a `DurationEstimator` to fit `seconds ~ intercept + slope * len(prompt)` online and count rollouts that overran their own estimate by more than `straggler_factor` (`result.stragglers`). This is the design's **L-traj** mechanism, which until now lived only in the reference runtime and so was unreachable from the API a real workload uses. Detection only: resuming a partial rollout would need it to expose its turns, and `run(rendered, task) -> output` is opaque. |
+| `straggler_factor` | `float` | `3.0` | As `duration_estimator`. |
+| `resume_queue` | `Optional['ResumeQueue']` | `None` | Turn a counted straggler into a **re-run**. A shared `ResumeQueue` passed here receives every detected straggler's task and the version it measured; the next idle worker whose shard owns that task re-runs it against the **current** head. A straggler measured version N, its re-run measures version N+k, so the pair is a free cross-version A/B signal. Detection is **after-return** -- a rollout that overruns its estimate is noticed once it has finished, not cancelled mid-flight. `None` (the default) keeps the old behaviour exactly: stragglers are counted and dropped. `result.resumed` reports the re-runs. |
+| `task_sampler` | `Optional['TaskSampler']` | `None` | Which task a worker takes next from its shard. |
+| `on_round` | `Optional[Callable[[RoundInfo], None]]` | `None` | Called with each `RoundInfo` as a merger sweep completes -- progress for a long run. It runs on the merger thread and must be cheap and thread-safe; an exception is reported, not fatal. |
+| `on_reports` | `Optional[Callable[[Sequence[Any]], None]]` | `None` | Called with the sweep's `MergeReport`s before `on_round` reduces them to counters; each carries the diff the merger measured, accepted or not (#452). Same thread and same rules as `on_round`. |
+| `stop_when` | `Optional[Callable[[RoundInfo], bool]]` | `None` | Asked after `on_round` with the same `RoundInfo`; `True` ends the run with `stop_reason="stop_when"` -- the caller's own budget (dollars, a deadline, a kill file), checked between merger sweeps like the built-in bounds. Same thread and the same rules as `on_round`. |
+| `verbose` | `bool` | `False` | Print one line per merger sweep. |
+| `usage` | `Optional[Usage]` | `None` | Share one `Usage` with your model adapters (`claude(usage=u)`, `openai_compatible(usage=u)`) and the result's token counts become real. Without it the run still reports calls, seconds and failures -- `run` is `(rendered, task) -> str`, so an opaque actor has no way to surface tokens, and inventing a number would be worse than reporting zero. |
+| `policies` | `Optional['Policies']` | `None` | Bundle of replaceable pieces (`Policies`). Every field defaults to `None` meaning "current behaviour", so `Policies()` and passing nothing are the same run. The individual keyword arguments -- `task_sampler`, `staleness_policy`, `aggregator_factory` -- are shortcuts onto its fields and keep working; an explicit argument wins over a bundle default rather than being silently ignored. Fields whose implementations have not landed yet raise rather than being accepted and ignored: a caller who passes a custom acceptance rule and sees a finished run would reasonably conclude it ran. New capabilities go here rather than adding another parameter to a function whose flat surface is already large — prefer a Policies field or a BudgetSettings / RuntimeSettings / ObservabilitySettings bag (#804). |
+| `allocator` | `Optional[Any]` | `None` | Exactly as in `evolve`: value-directed budget allocation (see `allocator`). `None` (the default) is the old behaviour exactly. Pass a value allocator and, once the token budget is tight, the self-verify rollout is spent only on candidates the allocator expects to commit; the merger reports every outcome back so it learns. Requires `max_tokens`. Counterfactual exploration corrects a biased value model rather than reinforcing it. |
+| `record_trajectories` | `bool` | `False` | Exactly as in `evolve`: persist every rollout and gate evaluation as a `Trajectory` under `<repo_path>/trajectories/`. Off by default; pass `trajectory_store=` to control where records land. |
+| `trajectory_store` | `Optional[Any]` | `None` | An explicit `TrajectoryStore` to record into. `None` + `record_trajectories` builds the default store at `<repo_path>/trajectories`. |
+| `contract` | `Optional[Contract]` | `None` | Exactly as in `evolve`: the artifact's contract, where governance invariants are declared. `None` (the default) is the reference skill contract, which declares nothing and enforces nothing. |
+| `population_islands` | `int` | `0` | Persistent head-islands for a population run. Exactly as in `evolve`; `0` (the default) keeps the per-step-fork behaviour. |
+| `extra_artifacts` | `Optional[Dict[str, 'EvolvingArtifact']]` | `None` | Exactly as in `evolve`: additional artifacts to register alongside the primary, as `{aid: EvolvingArtifact}`. The barrier-free worker proposes against each of them too (no parallel strategy, so it is the primary plus every extra), and the aggregator merges their diffs by target. Empty (the default) is the old single-artifact behaviour exactly. |
+| `budget` | `Optional['BudgetSettings']` | `None` | Typed spend/stop bag (`BudgetSettings`). Flat `max_seconds` / `max_iters` / `max_calls` / `max_tokens` / … remain shortcuts; the bag field `max_rollouts` is this function's `max_iters`. |
+| `runtime` | `Optional['RuntimeSettings']` | `None` | Typed runtime bag (`RuntimeSettings`). |
+| `observability` | `Optional['ObservabilitySettings']` | `None` | Typed observability bag (`ObservabilitySettings`). |
+
+---
+
+## Evolve settings bags
+
+Budget / runtime / observability bags that freeze the flat evolve() surface. &nbsp;·&nbsp; `agentdescent.evolve_settings` &nbsp;·&nbsp; [guide](evolution.md)
+
+### `BudgetSettings(...)`
+
+Spend and stop bounds shared by the sync and async drivers.
+
+```python
+BudgetSettings(
+    max_seconds: Optional[float] = None,
+    max_rollouts: Optional[int] = None,
+    max_calls: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    stop_on_diminishing_returns: bool = False,
+    efficiency_floor: float = 0.25,
+    call_budget: Optional['CallBudget'] = None,
+    target_reward: Optional[float] = None,
+    patience: Optional[int] = None,
+    oracle_budget: int = 200
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `merged_with(**kwargs: Any) -> 'BudgetSettings'` | This bag with any explicit keyword taking precedence. |
+
+### `ObservabilitySettings(...)`
+
+Hooks, meters, and durable trajectory recording.
+
+```python
+ObservabilitySettings(
+    on_round: Optional[Callable[['RoundInfo'], None]] = None,
+    on_reports: Optional[Callable[[Sequence[Any]], None]] = None,
+    stop_when: Optional[Callable[['RoundInfo'], bool]] = None,
+    verbose: bool = False,
+    usage: Optional['Usage'] = None,
+    record_trajectories: bool = False,
+    trajectory_store: Optional['TrajectoryStore'] = None
+) -> None
+```
+
+### `RuntimeSettings(...)`
+
+How the loop runs: workers, gates, data split, search extras.
+
+```python
+RuntimeSettings(
+    rounds: int = 15,
+    n_workers: int = 4,
+    max_concurrency: int = 1,
+    refresh_interval: int = 1,
+    round_timeout: Optional[float] = None,
+    eval_concurrency: int = 8,
+    max_worker_errors: int = 3,
+    async_ratio: int = 3,
+    resync_on_commit: bool = True,
+    pipelined_gate: bool = False,
+    gate_workers: int = 2,
+    self_verify: bool = True,
+    held_out_frac: float = 0.4,
+    checkpointing: bool = False,
+    cheap_eval_tasks: Optional[int] = None,
+    fusion_tournament: Optional[bool] = None,
+    solved_threshold: float = 0.999,
+    shuffle: bool = False,
+    seed: int = 0,
+    population_islands: int = 0
+) -> None
+```
+
+---
+
+## The async orchestrator
+
+The reference barrier-free runtime and its statistics. &nbsp;·&nbsp; `agentdescent.async_runtime` &nbsp;·&nbsp; [guide](async.md)
+
+### `AsyncAgentDescent(...)`
+
+Barrier-free reference runtime, on the general engine.
+
+```python
+AsyncAgentDescent(
+    repo_path: str,
+    universe: TaskUniverse,
+    config: Optional[AsyncConfig] = None,
+    agg_config: Optional[AggregatorConfig] = None,
+    staleness_policy: Optional[StalenessPolicy] = None,
+    estimator: Optional[DurationEstimator] = None,
+    skill_id: str = 'mol-router',
+    aggregator_factory = None,
+    rollout = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `buffer_pending() -> int` | Cards waiting in the aggregator's buckets, or 0 before a run. |
+
+### `AsyncConfig(...)`
+
+```python
+AsyncConfig(
+    n_workers: int = 6,
+    async_ratio: int = 3,
+    resync_on_commit: bool = True,
+    noise: float = 0.15,
+    target_accuracy: float = 0.98,
+    max_seconds: float = 20.0,
+    oracle_budget: int = 400,
+    stall_patience: int = 150,
+    duration_timeout_factor: float = 3.0,
+    seed: int = 0,
+    self_verify: bool = True
+) -> None
+```
+
+### `AsyncStats(...)`
+
+```python
+AsyncStats(
+    rollouts: int = 0,
+    proposals: int = 0,
+    sweeps: int = 0,
+    commits: int = 0,
+    fused: int = 0,
+    discarded_stale: int = 0,
+    conflicts_dropped: int = 0,
+    forced_refreshes: int = 0,
+    stragglers_checkpointed: int = 0,
+    retired_workers: int = 0,
+    oracle_used: int = 0,
+    final_dev_accuracy: float = 0.0,
+    final_stable_accuracy: float = 0.0,
+    wallclock: float = 0.0,
+    error: Optional[str] = None,
+    timeline: List[Tuple[int, float]] = <factory>
+) -> None
+```
+
+---
+
+## The reference orchestrator
+
+The round loop the research results were measured with. &nbsp;·&nbsp; `agentdescent.orchestrator` &nbsp;·&nbsp; [guide](orchestrator.md)
+
+### `AgentDescent(...)`
+
+The merge-based parallel self-evolution system, on the general engine.
+
+```python
+AgentDescent(
+    repo_path: str,
+    universe: TaskUniverse,
+    n_workers: int = 6,
+    noise: float = 0.15,
+    refresh_interval: int = 2,
+    skill_id: str = 'mol-router',
+    config: Optional[AggregatorConfig] = None,
+    oracle_budget: int = 300,
+    seed: int = 0,
+    staleness_policy = None,
+    self_verify: bool = True
+) -> None
+```
+
+### `RoundStat(...)`
+
+```python
+RoundStat(
+    round: int,
+    dev_accuracy: float,
+    stable_accuracy: float,
+    committed: int,
+    fused: int,
+    discarded_stale: int,
+    conflicts_dropped: int,
+    oracle_used: int
+) -> None
+```
+
+### `run_fork_baseline(...)`
+
+DGM-style archive/fork control: parallel but never merged (RQ1).
+
+```python
+run_fork_baseline(
+    universe: TaskUniverse,
+    n_workers: int = 6,
+    noise: float = 0.15,
+    rounds: int = 40,
+    seed: int = 0
+) -> float
+```
+
+---
+
+## Document backends
+
+A tool-using agent over a document that is too big for a prompt. &nbsp;·&nbsp; `agentdescent.backends` &nbsp;·&nbsp; [guide](backends.md)
+
+### `AgentBackend`
+
+A base agent that answers a question about a document, possibly using tools.
+
+### `document_agent(...)`
+
+Turn **any** `Completion` into an `AgentBackend` for document questions.
+
+```python
+document_agent(
+    completion: Completion,
+    *,
+    doc_filename: str = 'document.txt',
+    inline_chars: int = 200000,
+    skills_dir: str = '.claude/skills'
+) -> AgentBackend
+```
+
+### `openhands(...)`
+
+A **real OpenHands agent** (SDK v1.x) as a workspace-bindable Completion.
+
+```python
+openhands(
+    model: str = 'openai/deepseek-v4-pro',
+    *,
+    base_url: str = 'https://api.deepseek.com',
+    api_key_env: str = 'OPENAI_API_KEY',
+    temperature: float = 0.0,
+    max_iterations: int = 40
+) -> '_OpenHandsAgent'
+```
+
+### `openhands_backend(...)`
+
+`document_agent(openhands(...))` -- the document task on OpenHands.
+
+```python
+openhands_backend(
+    model: str = 'openai/deepseek-v4-pro',
+    *,
+    base_url: str = 'https://api.deepseek.com',
+    api_key_env: str = 'OPENAI_API_KEY',
+    temperature: float = 0.0,
+    max_iterations: int = 40,
+    doc_filename: str = 'document.txt'
+) -> AgentBackend
+```
+
+### `tool_loop_backend(complete: Completion, *, max_steps: int = 5, window: int = 3) -> AgentBackend`
+
+A dependency-free `grep`/`read` ReAct loop over the document.
+
+---
+
+## Ready-made scorers
+
+The reward functions everyone writes, with the details right. &nbsp;·&nbsp; `agentdescent.rewards` &nbsp;·&nbsp; [guide](rewards.md)
+
+### `GraderError`
+
+A `command_scorer` command failed or printed something that is not a score.
+
+### `command_scorer(...)`
+
+Grade with **any program**: the task as JSON on stdin, a float on stdout.
+
+```python
+command_scorer(
+    cmd: Union[str, Sequence[str]],
+    *,
+    timeout: float = 60.0,
+    cwd: Optional[str] = None
+) -> Callable
+```
+
+### `contains(gold_key: str = 'gold', *, normalise: bool = True) -> Callable`
+
+1.0 when the gold answer appears anywhere in the output.
+
+### `exact_match(gold_key: str = 'gold', *, normalise: bool = True) -> Callable`
+
+1.0 when the output equals the gold answer.
+
+### `last_number(gold_key: str = 'gold', *, tolerance: float = 0.0) -> Callable`
+
+1.0 when the **last** number in the output matches the gold number.
+
+### `numeric_close(gold_key: str = 'gold', *, tolerance: float = 0.01) -> Callable`
+
+`last_number` with a relative tolerance -- for rounded answers.
+
+### `scorer(score) -> Callable`
+
+Resolve `score` -- a name from `SCORERS` or a `(task, output) -> float` callable -- into the reward `evolve()` takes.
+
+---
+
+## Equal-budget baselines
+
+merge-of-N against best-of-N fork and serial, on one rollout budget. &nbsp;·&nbsp; `agentdescent.baselines` &nbsp;·&nbsp; [guide](results.md)
+
+### `ArmResult(...)`
+
+One arm, one seed, and the spend it actually incurred.
+
+```python
+ArmResult(
+    arm: str,
+    seed: int,
+    width: int,
+    rollouts: int,
+    calls: int,
+    prompt_tokens: int,
+    completion_tokens: int,
+    wallclock: float,
+    wallclock_parallel: float,
+    dev_reward: float,
+    test_reward: Optional[float],
+    test_oracle: Optional[float] = None,
+    forks: Tuple[ForkOutcome, ...] = (),
+    stop_reason: str = '',
+    error: Optional[str] = None,
+    fusion: Optional['FusionStats'] = None
+) -> None
+```
+
+### `Budget(rollouts: int, calls: Optional[int] = None, tokens: Optional[int] = None) -> None`
+
+What every arm is allowed to spend.
+
+| method | what it does |
+|---|---|
+| `split(ways: int) -> 'Budget'` | The share of this budget one of `ways` independent runs may spend. |
+
+### `Comparison(...)`
+
+Several seeds of several arms, and whether they are comparable at all.
+
+```python
+Comparison(
+    arms: Dict[str, List[ArmResult]],
+    fixed: str = 'rollouts',
+    unequal: List[Tuple[str, str, float, float]] = <factory>,
+    confounded: List[Tuple[str, str, float, float]] = <factory>,
+    tolerance: float = 0.1
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `scored(arm: str) -> int` | Seeds of `arm` that produced a test score at all. |
+| `separates(a: str, b: str, *, min_seeds: int = 3) -> bool` | Whether `a`'s seeds are all above `b`'s, with no overlap. |
+| `spread(arm: str) -> Optional[Tuple[float, float, float]]` | (min, median, max) test quality. Not a confidence interval. |
+| `underpowered(*arms: str, min_seeds: int = 3) -> bool` | Whether any named arm has too few seeds to support a comparison. |
+
+### `ForkOutcome(...)`
+
+One member of a fork arm, kept so the selection step can be audited.
+
+```python
+ForkOutcome(
+    seed: int,
+    dev_reward: float,
+    test_reward: Optional[float],
+    rollouts: int,
+    calls: int
+) -> None
+```
+
+### `Workload(...)`
+
+The half of the comparison that must not vary, in one object.
+
+```python
+Workload(
+    tasks: Sequence[Task],
+    reward: Reward,
+    test_eval: Callable[[EvolutionResult], float],
+    agent: Optional[Any] = None,
+    run: Optional[Any] = None,
+    propose: Optional[Any] = None,
+    strategy: Optional[Any] = None,
+    evolve_kwargs: Mapping[str, Any] = <factory>
+) -> None
+```
+
+### `best_of_n_fork(...)`
+
+N runs that never see each other, each on its share of the budget.
+
+```python
+best_of_n_fork(
+    workload: Workload,
+    n: int,
+    *,
+    budget: Budget,
+    seed: int = 0,
+    concurrency: int = 1
+) -> ArmResult
+```
+
+### `compare(...)`
+
+Group arm results by arm and check what the comparison actually held fixed.
+
+```python
+compare(
+    results: Sequence[ArmResult],
+    *,
+    fixed: str = 'rollouts',
+    tolerance: float = 0.1
+) -> Comparison
+```
+
+### `merge_of_n(...)`
+
+N workers proposing into one artifact, merged every round. The claim.
+
+```python
+merge_of_n(
+    workload: Workload,
+    n: int,
+    *,
+    budget: Budget,
+    seed: int = 0,
+    usage: Optional[Usage] = None
+) -> ArmResult
+```
+
+### `serial(...)`
+
+One worker, improving itself in sequence. The floor.
+
+```python
+serial(
+    workload: Workload,
+    *,
+    budget: Budget,
+    seed: int = 0,
+    usage: Optional[Usage] = None
+) -> ArmResult
+```
+
+### `to_markdown(comparison: Comparison) -> str`
+
+A table whose caption cannot claim more than the numbers support.
+
+---
+
+## Replay fidelity
+
+The RNG, environment and hidden-state inputs a manifest cannot see. &nbsp;·&nbsp; `agentdescent.replay_fidelity` &nbsp;·&nbsp; [guide](manifest.md)
+
+### `EnvironmentFingerprint(...)`
+
+The environment a run happened in, as far as it is safe to record it.
+
+```python
+EnvironmentFingerprint(
+    cwd: str,
+    python: str,
+    platform: str,
+    tools: Mapping[str, str] = <factory>,
+    env_names: Tuple[str, ...] = (),
+    missing_env: Tuple[str, ...] = ()
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `capture(...)` | Fingerprint this process (or the explicit values a caller supplies). |
+| `diff(other: 'EnvironmentFingerprint') -> Tuple[str, ...]` | Names of the environment inputs that differ (empty when identical). |
+
+### `ReplayCheck(...)`
+
+The result of comparing a captured run with its replay.
+
+```python
+ReplayCheck(
+    ok: bool,
+    changed: Tuple[str, ...] = (),
+    verdict_changed: bool = False,
+    notes: Tuple[str, ...] = ()
+) -> None
+```
+
+### `ReplayFidelity(...)`
+
+Everything a replay needs that the manifest's input hashes do not cover.
+
+```python
+ReplayFidelity(
+    environment: Optional[EnvironmentFingerprint] = None,
+    rng: Tuple[RngRecord, ...] = (),
+    hidden_state: Mapping[str, str] = <factory>,
+    uncaptured: Tuple[str, ...] = ()
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `capture(...)` | Assemble a record; hidden-state summaries are digested here. |
+| `diff(other: 'ReplayFidelity') -> Tuple[str, ...]` | Names of the recorded inputs that differ (empty for the same run). |
+| `notes() -> Tuple[str, ...]` | What would stop a replay claim, in words (empty when eligible). |
+
+### `ReplayNotEligible(notes: Iterable[str]) -> None`
+
+A counterfactual was asked for over a run that cannot be replayed.
+
+### `RngRecord(boundary: str, digest: str, seed: Optional[str] = None) -> None`
+
+One RNG seed/state digest at an interaction boundary.
+
+### `content_digest(value: Any) -> str`
+
+A sha256 digest of any JSON-able summary.
+
+### `replay_check(captured: Any, replayed: Any) -> ReplayCheck`
+
+Whether `replayed` reproduces `captured` -- or refuses to say.
+
+### `rng_digest(*, seed: Any = None, state: Any = None) -> str`
+
+A digest of an RNG seed and/or a state summary at one boundary.
+
+---
+
+## Type aliases and constants
+
+Values rather than classes or functions.
+
+### `AcceptDecision`
+
+Commit or not, and -- when not -- which of the merge categories it was.
+
+### `AcceptancePolicy`
+
+Whether a candidate is committed.
+
+### `AdmitVerdict`
+
+The composed decision: `pass` / `flag` / `demote` and why.
+
+### `AgentNode`
+
+One node of a society: a name, an instruction (a callable), and a budget (how many uses the node may spend).
+
+### `AggregatorFactory`
+
+`(ledger, verifier, audit, config, policy) -> AggregatorProtocol` — how a custom optimizer is installed.
+
+### `AlgorithmArm`
+
+One algorithm/seed arm of a tournament.
+
+### `AlgorithmScore`
+
+One algorithm's aggregate over its seeds.
+
+### `AlgorithmTournamentReport`
+
+Every arm, the per-algorithm aggregate, the winner and any tie.
+
+### `AllocatorContext`
+
+One candidate, as the allocator sees it.
+
+### `AllocatorPolicy`
+
+Decide, per candidate, whether the expensive part of a merge is worth it.
+
+### `AppendRules`
+
+Accumulate a deduped list of rules/lessons (append-only, content-addressed).
+
+### `ApprovalGate`
+
+Require a human decision for changes above a risk/size threshold.
+
+### `ApprovalRequest`
+
+One high-risk candidate's approval request and its latest decision.
+
+### `ApprovalStore`
+
+Append-only JSONL decisions for high-risk candidates.
+
+### `BootstrapResult`
+
+A paired bootstrap of per-task gains.
+
+### `BudgetGovernor`
+
+Tracks token spend against a cap and decides what to degrade.
+
+### `CALIBRATION_CEILING`
+
+Where a calibration share sits when the improvement pool is still finding new error modes, and where it goes once the pool has stopped. Both are policy choices, not measurements: what a label is worth in each pool depends on whether you are trying to *fix* the verifier or to *correct for* it.
+
+### `CALIBRATION_FLOOR`
+
+Where a calibration share sits when the improvement pool is still finding new error modes, and where it goes once the pool has stopped. Both are policy choices, not measurements: what a label is worth in each pool depends on whether you are trying to *fix* the verifier or to *correct for* it.
+
+### `CacheProtocol`
+
+Somewhere to keep evaluations. In one process, across many, or on disk.
+
+### `CallBudget`
+
+A mutable per-call max_tokens, set by the engine before each expansion.
+
+### `CampaignReport`
+
+Every session, the best artifact and where it lives.
+
+### `CampaignSession`
+
+One evolution session inside a campaign.
+
+### `CanaryResult`
+
+The paired sign test and the deployment verdict.
+
+### `CapabilityGuard`
+
+Reject a self-modification that regresses a protected capability.
+
+### `CapabilityReport`
+
+What the protected suites measured for one candidate.
+
+### `CapabilitySuite`
+
+Tasks a self-modification must not regress, and the bar it must clear.
+
+### `ChainAuditReport`
+
+What a `chain_audit` pass found, ring by ring.
+
+### `ChainLink`
+
+One ring of an adoption's evidence chain.
+
+### `CoevolutionReport`
+
+The curriculum's effect on verifier/oracle agreement.
+
+### `CoevolutionRound`
+
+One curriculum step: the selected tasks, the bias before/after.
+
+### `Completion`
+
+`Callable[[str], str]` — the one contract every model and agent satisfies.
+
+### `ConflictPolicy`
+
+Which of a batch of mutually contradictory changes survive.
+
+### `ContaminationReport`
+
+How much of the validation text appears in the training text.
+
+### `ControllerConfig`
+
+Bounds and hooks for the multi-session loop.
+
+### `ControllerReport`
+
+The sessions run, the best reward and why the loop stopped.
+
+### `CuriousReplayReport`
+
+What `curious_replay_evolve` did: the weights, the gains on the still-curious vs mastered past, and the value produced.
+
+### `DecisionLog`
+
+Append-only JSONL decisions.
+
+### `DecisionRecord`
+
+One immutable adoption/session decision.
+
+### `DefaultConflict`
+
+Drop contradicting diffs, keeping whichever scores better (PCGrad-style).
+
+### `DefaultFusion`
+
+Build the union of complementary diffs and hand it to the gate.
+
+### `DiagnosisReport`
+
+One run's failure mode, the evidence, and what to try next.
+
+### `EDIT_PROTOCOL`
+
+The multi-file proposal format a `FileTree` reflector is told to emit.
+
+### `EVOLVE_PARAM_ALLOWLIST`
+
+Frozen set of public ``evolve()`` parameter names (#804). A PR that adds a raw kwarg must update this on purpose; prefer Policies or a settings bag.
+
+### `EVOLVE_STABLE_SUBSET`
+
+Short stable ``evolve()`` contract to teach first; the long tail is advanced (Policies, bags, or a documented flat shortcut).
+
+### `EloRating`
+
+A minimal Elo rating over pairwise matches (K-factor 32).
+
+### `EvaluationReport`
+
+The verifier/oracle comparison for one artifact.
+
+### `EvaluationRow`
+
+One audited task's verifier and oracle scores.
+
+### `EvidenceSnapshot`
+
+The reconciled view: slots, ports, and the archive's health counters.
+
+### `ExaminedRule`
+
+One archived rule's self-exam: what the oracle said about it.
+
+### `Executor`
+
+Runs rollouts somewhere. Threads here, processes and hosts later.
+
+### `FAST_MAX`
+
+The L2/L1 blast-radius boundary (`0.30`).
+
+### `FLIP_ALARM`
+
+Flip rate above which a rescan is called out rather than reported. The plan's number. It is a policy choice and not a measurement -- there is no rate at which silently re-scoring a run's history becomes fine.
+
+### `FROZEN_IDS`
+
+Artifact ids the loop may read but never mutate (L0).
+
+### `FastRuleReport`
+
+How an evolved rule does against the shipped seed, on both axes.
+
+### `FileCache`
+
+A directory of evaluations, so separate processes can share them.
+
+### `FusionPolicy`
+
+How complementary diffs become one candidate.
+
+### `FusionTrial`
+
+One tournament: what the fused candidate scored against the best single.
+
+### `GuardDecision`
+
+One guard's name and decision.
+
+### `GuardPipeline`
+
+Run guards in order; the first refusal is the pipeline's decision.
+
+### `GuardPipelineResult`
+
+The full ordered trail, including the first refusal when there is one.
+
+### `GuardedRun`
+
+The evolution result, the recorded decision and the acceptance chain.
+
+### `Harness`
+
+One algorithm port, named and runnable.
+
+### `HarnessEvidence`
+
+What the archive says about one algorithm port (harness) on a domain.
+
+### `HarnessReport`
+
+What a `compose_run` did, and why.
+
+### `HarnessRun`
+
+One harness's measured outcome in a `compose_run`.
+
+### `ImagineReport`
+
+What `imagine_then_evolve` did: the verified value, its real gain over the seed, the simulator's trust score, and how much of the budget was spent dreaming vs waking.
+
+### `JEVModel`
+
+A linear student verifier trained on oracle labels.
+
+### `JointMetaReport`
+
+What a `joint_meta_run` decided, per slot and jointly.
+
+### `KeyedRules`
+
+One entry per *category*: competing proposals contradict and are resolved.
+
+### `KillSwitch`
+
+A file-based global stop for further self-improvement sessions.
+
+### `LAYOUTS`
+
+Where a runner writes the evolving tree inside a workspace (`claude_skill`, `skill_library`, `claude_agent`, `dsh_skill`, `agents_skill`, `root`).
+
+### `LayerBudget`
+
+One spending line of the framework: a limit, what it spent, what it bought.
+
+### `LeakageGuard`
+
+Reject a candidate whose rendered artifact contains protected text.
+
+### `LeakageReport`
+
+What the guard found and which protected strings matched.
+
+### `LearnableMetaJudge`
+
+A small linear regressor from `outcome_features` to oracle quality, fit by least squares (pure Python, deterministic).
+
+### `LearnedSimulator`
+
+A pure-Python nearest-neighbour simulator from observed rollouts.
+
+### `LearningValueModel`
+
+A tiny online logistic model over the candidate features.
+
+### `LedgerFailure`
+
+The exception tuple a caller catches to treat any ledger problem as recoverable.
+
+### `LedgerProtocol`
+
+Eight methods: four the aggregator calls, four more the engine calls.
+
+### `LocalWorkspaceSandbox`
+
+A throwaway directory on this machine -- what a rollout has always got.
+
+### `MAX_COMBINATIONS`
+
+Combinations the search will build before it complains. Not a performance limit -- each one is a pass over the labelled set, which is a few hundred rows -- but a statistical one: every combination scored is another chance for one to look good by luck, and a search over a thousand of them on two hundred labels is fitting the noise.
+
+### `MIN_N_DOMINANT`
+
+Labels the heaviest stratum needs before the reported interval means what it says. Below it, measured coverage is about 0.92 against a nominal 0.95 -- see pitfall 3 in the module docstring, and `test_known_limitation_small_dominant_stratum`.
+
+### `MIN_UNSEEN`
+
+Below this estimated probability of a new mode, more improvement labels are buying the flat part of the rarefaction curve. Not a law -- the point at which a one-in-twenty chance of learning something stops being worth an oracle call is a budget question -- but it is where the Phase 0 curve had flattened.
+
+### `MarginalGainStop`
+
+Stop when reward gained per additional call falls below a bar.
+
+### `MatchResult`
+
+One pairwise match: who played whom, on whose ground, and who won.
+
+### `MemoryCache`
+
+In-process, single-flight, counted.
+
+### `MergeContext`
+
+Everything an `AcceptancePolicy` is allowed to look at.
+
+### `MetaAuditRecord`
+
+One sampled `(problem, seed)` before/after pair, awaiting truth.
+
+### `MetaAuditStore`
+
+Durable JSONL of sampled meta pairs and verdicts, indexed in memory.
+
+### `MetaChallengerConfig`
+
+The problem-challenger's dials: how much of the problem budget goes to the frontier, what counts as learned or stuck, and how long a generator may keep trying. The same numbers `curriculum_evolve` uses, one level up.
+
+### `MetaExamReport`
+
+What an `exam_archive` pass did, and why.
+
+### `MetaPopulationReport`
+
+What a `meta_population_run` did, and why.
+
+### `MetaProblemChallenger`
+
+The problem-generation artifact for the meta loop.
+
+### `PLUGIN_FROZEN`
+
+Frozen by default for each host, on top of whatever the spec freezes. Hooks and permission config are the plugin's own L0: a hook that blocks a tool call is a guard, and an optimizer that could loosen it to score better would be optimising the guard away. Lockfiles are regenerated by tooling in `setup`, not authored by a model. Tests are frozen for the same reason as in `code_runner`: the shortest path to a high score is to weaken the yardstick.
+
+### `PLUGIN_HOSTS`
+
+The hosts a `plugin`-kind spec may name. Paths are relative to the workspace.
+
+### `PRIORITY_SEED`
+
+Upstream ERA's flat PUCT -- `rank + c * P(s,a) * sqrt(N) / (1 + n)` with `c = 1` and a uniform prior. `PrioritySelection` on this source expands the same node as `FlatPuct(c_puct=1.0)` at every step.
+
+### `Policies`
+
+Every replaceable piece, in one argument.
+
+### `PoliciesBundle`
+
+The joint artifact: a bundle of per-slot `SlotSpec` values.
+
+### `PopulationIsland`
+
+One island of a `meta_population_run`: a rule's search, and how it went.
+
+### `PortfolioReport`
+
+What a `portfolio_report` pass saw, and decided.
+
+### `ProbeRow`
+
+One task's verifier and oracle scores, and how far apart they are.
+
+### `ProcessExecutor`
+
+Persistent worker processes, with re-dispatch when one dies.
+
+### `Promotion`
+
+One artifact the `PromotionPolicy` believes `stable` should hold.
+
+### `PromotionPolicy`
+
+Which artifacts `dev` has proved well enough to copy onto `stable`.
+
+### `ProposalContext`
+
+What a `ProposalPolicy` is given for one rollout.
+
+### `ProposalPolicy`
+
+How a rollout becomes candidate changes.
+
+### `REPLAY_ENV_ALLOWLIST`
+
+Environment variable names whose **presence** may affect a run, and which are therefore recorded as names. Chosen for determinism, not convenience: the hash seed changes dict/set iteration, `PYTHONPATH` decides which code is imported at all, the locale changes sorting and number formatting, `TZ` changes timestamps a prompt may contain, and the thread counts change floating-point reduction order in numeric workloads. Names only, never values -- not even hashed (Security review, #952). A four-entry dictionary recovered a `TZ` value offline from the old sha256 digests, and any candidate value confirms by `sha256()`, so a digest of a value is value material. `capture` also intersects the caller's list with this tuple, so no caller can widen it, and still drops credential-shaped names.
+
+### `ROUTE_SEED`
+
+The shipped route rule: answer directly unless the task is hard and the budget allows a search. Deliberately conservative -- it refuses to search when the budget is low, which is exactly the decision an evolved rule can improve on (searching hard tasks pays more than the budget it costs).
+
+### `RSIMetrics`
+
+Aggregate counts and cost for a stream of decisions.
+
+### `RSIReport`
+
+The archive's longitudinal view, plus the current portfolio health.
+
+### `RationaleReport`
+
+What `rationale_evolve` distilled: how many rationales the skill now carries, and the skill itself.
+
+### `ReallocationPolicy`
+
+The evolvable reallocation rule: four numbers, applied to a layer window.
+
+### `RecursiveRound`
+
+One outer round: the inner self-improvement session and the policy move.
+
+### `RecursiveSelfImproveReport`
+
+The outer session: every round, the final rule, and both gains.
+
+### `RedTeamReport`
+
+What a `red_team_evolve` round did: the attack's findings and the coverage before and after the retraining.
+
+### `Ref`
+
+A callable named rather than sent: `"module:attribute"` plus config.
+
+### `RefError`
+
+A reference could not be resolved, and why -- never a bare ImportError.
+
+### `ReplayExample`
+
+One replayed past example: the task it came from, its recorded outcome, and the rolling statistics that decide how curious the artifact still is.
+
+### `Result`
+
+What one rollout produced, or why it did not.
+
+### `RiskContext`
+
+The facts a policy may match on.
+
+### `RiskDecision`
+
+The action a policy chose and the rule that produced it.
+
+### `RiskPolicy`
+
+First-match risk rules with a fail-closed default.
+
+### `RiskRule`
+
+One ordered rule; every supplied condition must match.
+
+### `RolloutSpec`
+
+One rollout, described completely enough to run somewhere else.
+
+### `RunManifest`
+
+The hashed inputs of one run and the resulting stable id.
+
+### `SCHEMA_VERSION`
+
+Bumped when the on-disk shape of a record changes incompatibly. A reader that meets a record it does not understand must say so rather than guess -- see `load`. Version 2 adds optional `scorer_version`; this build still migrates version-1 lines. Stamp the new marker whenever the persisted shape is one an older v1-only reader cannot decode, so that reader hits its explicit unsupported-version path instead of treating a valid line as corrupt and silently skipping pending work (#315).
+
+### `SCORERS`
+
+Named scorers accepted by `scorer`. Pass a callable for anything else.
+
+### `SLOTS`
+
+The decision plane -- the `Policies` fields a run may evolve. The machinery fields (`verifier`, `ledger`, `executor`, `evaluator`, `eval_cache`, `aggregator_factory`, `sandbox_*`) are the training code and stay frozen.
+
+### `SLOT_PROTOCOLS`
+
+The contract each slot's value must satisfy -- the engine's own Protocols, all `runtime_checkable`, so a compiled class is checked structurally.
+
+### `SOLVED`
+
+Reward at or above which a task counts as solved (`0.999`). Lower it for a graded scorer, or every rollout asks the reflector to fix an answer that was already good.
+
+### `STALE_INFLATION`
+
+Variance multiplier the acceptance gate applies while a rectification is stale. Not a correction -- a stale rectifier has no number to correct *with* -- but a widening, so a gate that cannot be told how biased its verifier is commits less rather than the same amount with more confidence.
+
+### `SafetyCheck`
+
+One named check and why it passed, warned or failed.
+
+### `SafetyReport`
+
+The archive's trust posture, with every check that produced it.
+
+### `Sandbox`
+
+One acquired execution environment.
+
+### `SandboxPool`
+
+The single gate on how many sandboxes exist at once.
+
+### `SandboxProvider`
+
+Where sandboxes come from and go back to.
+
+### `SandboxSpec`
+
+What environment one rollout needs. Must survive JSON: it crosses processes.
+
+### `SearchTree`
+
+A state tree over rendered artifact values, searched by UCB.
+
+### `SeededAppendRules`
+
+Keep `seed` verbatim; append content-addressed rules under `title`.
+
+### `SelfImproveConfig`
+
+What the loop improves, on what, and how hard.
+
+### `SelfImproveReport`
+
+The whole session: every tick, whether anything improved, total gain.
+
+### `SelfImproveTick`
+
+One pass of the loop: targets, per-slot verdicts, and the budget move.
+
+### `SelfModifyReport`
+
+What `improve_source` accepted: the patch, its tests, its gain.
+
+### `SelfRewardingReport`
+
+What a `self_rewarding_meta_run` did: the evolved value, the judge's measured agreement with the oracle on validation outcomes, whether the judge actually fitted (or fell back to `auc`), how many oracle labels it trained on, and the value's oracle quality vs the seed's on the held-out problems.
+
+### `SessionOutcome`
+
+What one session produced.
+
+### `SessionRecord`
+
+One session's outcome inside the controller report.
+
+### `SharedSandboxPool`
+
+A pool whose ceiling is the machine's, not this process's.
+
+### `SingleSlot`
+
+The artifact **is one value**, and each accepted proposal replaces it.
+
+### `SlotEvidence`
+
+What the archive says about one decision slot's evolution.
+
+### `SlotRSI`
+
+One decision slot's adoption history and whether it is still rising.
+
+### `SocietyGraph`
+
+A directed graph of `AgentNode` with delegation edges.
+
+### `SocietyReport`
+
+What `society_evolve` found: the evolved graph, its cost-adjusted correctness on validation tasks, and the same for the seed.
+
+### `Strategy`
+
+Defines *what evolves and how* -- the representation and the merge rule.
+
+### `TEST_FAILURE_MARKER`
+
+Prefix of the output `code_runner` produces when the frozen gate fails, so the failure scores 0 and the reflector can read it.
+
+### `ThreadExecutor`
+
+The default: a bounded pool of threads in this process.
+
+### `TournamentReport`
+
+The ratings a tournament produced, and the matches that moved them.
+
+### `ValueBudgetAllocator`
+
+Learn which candidates are worth the expensive evaluation.
+
+### `VarianceSampler`
+
+UCB over the recent reward variance of each task.
+
+### `VerifiableReport`
+
+What `policy_improve` did: the per-round held-out verifiable reward curve (the trajectory-level signal RL trains on) and the before/after on held-out verifiable facts.
+
+### `VerifiedSeed`
+
+The archive's rule records that clear the trust bar, and the reasons the rest were excluded.
+
+### `VerifierAgreement`
+
+Reject a commit whose gain the verifier claims and the oracle denies.
+
+### `VerifierCurriculum`
+
+Select the tasks where the verifier disagrees most with the oracle.
+
+### `VerifierProtocol`
+
+Four methods, from `grep 'self\.verifier\.' agentdescent/aggregator.py`.
+
+### `VersionVector`
+
+`Dict[str, int]` — artifact id to version.
+
+### `WorkspaceProvider`
+
+Provisions `LocalWorkspaceSandbox` -- `mkdtemp`, plus a lease file.
+
+### `admit`
+
+Compose the ring statuses into one verdict.
+
+### `admit_record`
+
+Admit an archived rule using its own `exam` stamp plus any ring statuses.
+
+### `alerts`
+
+Human-readable alert conditions; empty means no alert.
+
+### `apply_patch`
+
+Apply a `patch_source` diff back to a source. `ValueError` when the patch does not apply cleanly -- a patch whose context does not match `source` is refused, never half-applied. Untouched lines outside a hunk's context are preserved, so a middle-of-file edit keeps the rest of the file.
+
+### `async_meta_population_run`
+
+`meta_population_run` with the islands run concurrently.
+
+### `audited_meta_validate`
+
+`meta_validate`, with a probability sample of pairs sent to the oracle.
+
+### `backends`
+
+Agentic backends -- a base agent that *navigates documents with tools*, not just maps a prompt to text.
+
+### `baselines`
+
+The control every efficiency number in this repository is missing.
+
+### `budgeted_completion`
+
+Wrap a `max_tokens -> Completion` factory into an adaptive Completion.
+
+### `build_manifest`
+
+Hash a spec, its data files/directories, model config and code version.
+
+### `canary`
+
+Compare candidate vs incumbent per task and recommend promote/hold/rollback.
+
+### `chain_audit`
+
+Trace one archived adoption through its evidence rings.
+
+### `compose_run`
+
+Run the harness(es) for a domain, record the outcomes, pick a winner.
+
+### `contamination_overlap`
+
+Fraction of validation n-grams that also occur in the training text.
+
+### `cost_adjusted_reward`
+
+`quality - lam * (cost / baseline)`, clipped to `[0, 1]`.
+
+### `curiosity_weight`
+
+How much replay weight this example should carry -- **failure-weighted**: high while the artifact is still failing it (mean far below the ceiling), falling as it improves, floor once mastered. `floor` keeps a mastered example replayable without dominating the still-curious past. (This is a failure/need signal, not learning-progress: a permanently stuck example stays heavily weighted until it is solved.)
+
+### `curious_replay_evolve`
+
+Evolve the artifact on its own past, weighted by curiosity.
+
+### `curriculum_meta_run`
+
+Evolve a decision slot against a problem distribution the meta loop generates.
+
+### `dataloader`
+
+Dependency-free dataset loading -- the *data layer* for examples/experiments.
+
+### `diagnose_payload`
+
+Classify why a run ended where it did.
+
+### `diff_manifest`
+
+Field-level differences between two manifests (empty when identical).
+
+### `distill`
+
+The rationales the artifact will carry: deduped rules from the rollouts, near-miss rationales included -- they are the artifact's own notes about what it still needs. Dedup is on the **exact rationale text**, so the output value stays semantic content (`-1` and `1`, `A` and `a` are different rules, not formatting to normalise away).
+
+### `estimate_campaign`
+
+Price a campaign without running it (one composed arm per session).
+
+### `estimate_tournament`
+
+The per-arm plan estimate without running anything.
+
+### `evaluate`
+
+Compare `verifier` with `oracle` on a deterministic sample.
+
+### `evaluate_source`
+
+Run the candidate against the tests and the benchmark.
+
+### `evolve_fast_rule`
+
+Evolve a `selection` priority rule on quality-per-cost, beat the seed.
+
+### `exam_archive`
+
+Re-validate the archive's adopted rules against an independent oracle.
+
+### `extract_rationale`
+
+One rollout's rationale as a rule the skill can carry.
+
+### `failed_rollouts`
+
+The recorded rollouts that failed, up to `max_failures`.
+
+### `find_leakage`
+
+The protected strings that appear in `text` (normalised match).
+
+### `gate_source`
+
+The candidate's gate: exactly one function of no arguments other than what its signature declares, built only from safe syntax. Imports, dunder access and the calls that reach the interpreter are refused -- the same walk `compile_policy_source` runs over every self-edit.
+
+### `harness`
+
+The least a harness can be: a name and a `(tasks, repo) -> result` callable.
+
+### `harness_leaderboard`
+
+`harness_name -> {rewards, best}` over the archive's recorded outcomes.
+
+### `harness_score`
+
+The best measured reward this harness has recorded for the domain.
+
+### `imagine_then_evolve`
+
+Evolve against the simulator, verify the result on the real problem.
+
+### `improve_source`
+
+Evolve the source of one function under its own tests and benchmark.
+
+### `is_significant`
+
+Whether the lower bound clears `min_effect` and the interval is usable.
+
+### `joint_archive_rule`
+
+Write an adopted bundle to the archive as one `meta-rule` per slot.
+
+### `joint_meta_run`
+
+Evolve several decision slots **together**, validate them jointly, decide.
+
+### `joint_meta_validate`
+
+Attribute a joint change to its slots, and isolate the ones that hurt.
+
+### `joint_problem`
+
+An inner `evolve()` whose candidate is the **whole bundle**.
+
+### `layers_from_archive`
+
+One layer per decision slot, aggregated from the archive's rule records.
+
+### `meta_population_run`
+
+Run a population of meta sessions from the archive's best rules, promote the winner.
+
+### `meta_run_audited`
+
+`meta_run` with an audited validation: sample, oracle, persist, decide.
+
+### `metrics_from_log`
+
+Aggregate any iterable log (a JSONL-backed log, list, or generator).
+
+### `metrics_from_records`
+
+Aggregate decision records.
+
+### `outcome_features`
+
+The features a judge learns quality from: mean best-so-far, the final reward, and a constant intercept term. Sweep counts / rollouts are deliberately dropped: raw counts dwarf a `[0, 1]` quality in a linear fit and had the old judge saturating its clip at 1.0 for every outcome. The judge must learn quality from the curve's *shape*, not be handed the answer.
+
+### `paired_gain`
+
+Per-task `after - before` over the keys present in both sides.
+
+### `patch_source`
+
+A unified diff between two sources -- the patch a human or a reviewer sees, and what an apply can reverse.
+
+### `policy_digest`
+
+The 64-hex version of a decision procedure: the bundle, the config, the verifier.
+
+### `policy_improve`
+
+Evolve a decision slot on verifiable reward and report the curve.
+
+### `portfolio_evolve`
+
+Evolve the reallocation rule on the archive's (or the caller's) windows.
+
+### `portfolio_problem`
+
+A `Problem` over one layer window.
+
+### `portfolio_report`
+
+Score the layers by return-per-cost and reallocate the next window.
+
+### `priority_grid_problem`
+
+A `Problem` over the priority grid.
+
+### `problem_from_tasks`
+
+A runnable inner `Problem` over exactly these tasks.
+
+### `rank_slots`
+
+The `k` slots to evolve next: paying slots first, plus exploration.
+
+### `rationale_evolve`
+
+Evolve the skill, roll out, distill its own successes back into it.
+
+### `reallocation_spec`
+
+The evolvable spec: the four numbers as a `ParamSlot`.
+
+### `record_harness`
+
+Record one harness outcome for a domain. Idempotent by `run_id`.
+
+### `recursive_self_improve`
+
+Run `self_improve` and `portfolio_evolve` alternately.
+
+### `red_team`
+
+Attack `value` by mutating the seed tasks outward and scoring each mutation. Returns the `(task, score)` failures -- the OOD region where the value does not generalise. A deterministic attacker: the same mutations in the same order, so the attack is reproducible.
+
+### `red_team_evolve`
+
+Evolve, attack the result, retrain on the failures it found.
+
+### `rollback_plan`
+
+Files to restore/delete to return `current` to `previous`.
+
+### `rsi_report`
+
+The archive's per-slot adoption history and a longitudinal verdict.
+
+### `rule_id`
+
+Content-address a proposal so identical proposals dedupe automatically.
+
+### `rule_tournament`
+
+Run a round-robin between the rules, rated by Elo.
+
+### `run_campaign`
+
+Run up to `sessions` sessions, keeping the best artifact.
+
+### `run_controller`
+
+Run sessions until budget, a kill switch, an error or stagnation.
+
+### `run_guarded`
+
+Run one spec with an injected acceptance policy and optional records.
+
+### `run_tournament`
+
+Run every `(algorithm, seed)` arm and return the measured ranking.
+
+### `safety_report`
+
+Check whether the archive is safe to keep seeding from.
+
+### `search_evolve`
+
+Search the state tree for the best value under a fixed budget.
+
+### `select_harness`
+
+Route a domain to the harness the archive's evidence says wins there.
+
+### `self_improve`
+
+Run the closed loop for `config.ticks` ticks.
+
+### `self_rewarding_meta_run`
+
+Evolve a decision slot with a judge that improves against truth.
+
+### `simulator_problem`
+
+A `Problem` that runs the simulator.
+
+### `simulator_score`
+
+The simulator against the real problem: how much the dream is worth.
+
+### `snapshot`
+
+Compose the archive's per-slot, per-port and health evidence.
+
+### `society_evolve`
+
+Evolve the society topology on correctness-minus-cost.
+
+### `society_problem`
+
+A `Problem` over multi-step tasks.
+
+### `society_spec`
+
+The evolvable spec: the value is a gated `society()` source compiled into a `SocietyGraph`. `SOCIETY_SEED` is the single-agent baseline -- the topology the search is asked to beat.
+
+### `source_ops`
+
+The deterministic cost of a candidate rule: arithmetic/call nodes in its source, counted from the AST. An attributable unit of work -- evaluating a rule costs what its expression tree costs, and counting it from the source is reproducible where wallclock is not.
+
+### `to_prometheus`
+
+A deterministic Prometheus text exposition (no timestamps).
+
+### `tournament_promote`
+
+Run the tournament and promote the winner into the archive.
+
+### `trajectory_challenger`
+
+A `MetaProblemChallenger` that mines the archive's recorded failures.
+
+### `verifiable_problem`
+
+Wrap a `(value, task) -> output` problem so the outcome's reward is verifiable: `1.0` on exact match with `gold`, `0.0` otherwise, with the output and gold carried in `detail` for `verifiable_reward`.
+
+### `verifiable_reward`
+
+The RL signal: `1.0` when the outcome's output exactly matches its `gold`, `0.0` otherwise. A rule that cannot be checked is not rewarded -- the DeepSeek-R1 verifiability contract.
+
+### `verified_rules`
+
+The archive's seedable rule records, gated by trust.
+
+### `verify_manifest`
+
+Rebuild the manifest from current inputs; return changed field names.
+
+### `windows_from_archive`
+
+Train/validation **layer windows** from the archive's rule records.

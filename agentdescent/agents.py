@@ -1,0 +1,1152 @@
+"""Provider-agnostic inference -- connect any agent or LLM to the framework.
+
+This is the general "talk to a model/agent" layer. It is deliberately kept
+**out of** :mod:`agentdescent.evolution`: skill evolution is just *one* application
+built on the framework, and how you reach a model has nothing to do with it.
+
+The whole contract is one type:
+
+    Completion = Callable[[str], str]      # prompt -> text
+
+Anything that maps a prompt to text is a completion -- an LLM call, a
+tool-using agent loop, a canned stub for tests. The adapters below build
+completions for Claude, an arbitrary callable, or a deterministic echo, and
+:func:`with_retries` wraps any of them with backoff. Higher layers
+(the evolution engine's LLMAgent, or your own) turn a completion
+into whatever task interface they need.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import threading
+import time
+import subprocess
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import (Any, Callable, Dict, List, Mapping, Optional, Protocol,
+                    Sequence, Tuple, runtime_checkable)
+
+from .evolvable import ContractError
+from ._subprocess import decode_output
+
+Completion = Callable[[str], str]
+
+
+@dataclass
+class Usage:
+    """What a run cost: calls, tokens, and wall-clock spent in the model.
+
+    A ``Completion`` is ``prompt -> text``, so token counts would be discarded at
+    the adapter boundary even though the providers return them. Pass one of these
+    to :func:`claude` / :func:`openai_compatible` and they record the **real**
+    counts from the API response; wrap anything else in :func:`metered` to at
+    least count calls and time.
+
+    Safe to share across worker threads.
+
+    ``pending`` / ``phase`` are live state for a long in-flight actor:
+    :meth:`begin` returns a token before the call, and the matching
+    :meth:`end` (or ``record(..., finishes=token)``) clears it after, so
+    ``status`` can show work in flight rather than looking idle at
+    ``calls=0`` for minutes (#358). A plain :meth:`record` never touches
+    pending work: a token-reporting provider sharing this ``Usage`` records
+    its own attempts, and those must not end the actor call wrapped around
+    them.
+    """
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    seconds: float = 0.0
+    failures: int = 0
+    #: Model seconds spent inside calls that ultimately **failed** -- retry
+    #: waits, hung connections, timeouts. Kept apart from `seconds` because the
+    #: two answer different questions: `seconds` is what the run cost, and
+    #: `seconds - failure_seconds` is what the run cost *net of endpoint
+    #: weather* -- the number a wall-clock comparison between two arms should
+    #: quote when one arm was unlucky. Measured need: a serial arm hit a
+    #: network outage mid-sweep and its 43-minute wall carried ~17 minutes of
+    #: stall that had nothing to do with the architecture under test.
+    failure_seconds: float = 0.0
+    #: In-flight invocations, token -> phase, in :meth:`begin` order. Read
+    #: through :attr:`pending` / :attr:`phase`.
+    _inflight: Dict[int, Optional[str]] = field(
+        default_factory=dict, init=False, repr=False, compare=False)
+    _next_token: int = field(default=0, init=False, repr=False, compare=False)
+    #: Optional listener fired after ``begin`` / ``end`` / ``record`` (outside
+    #: the lock, so it may run concurrently from several threads).
+    #: The run store uses this to rewrite ``status.json`` mid-call.
+    on_change: Optional[Callable[[], None]] = field(default=None, repr=False,
+                                                    compare=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def _notify(self) -> None:
+        cb = self.on_change
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            pass
+
+    @property
+    def pending(self) -> int:
+        """Work started by :meth:`begin` and not yet ended: actor invocations
+        and, since #380, the merge step (``phase="merge"``).
+
+        Visible on run ``status`` so a multi-minute first ``propose`` does not
+        look like a hung process at ``calls=0``."""
+        with self._lock:
+            return len(self._inflight)
+
+    @property
+    def phase(self) -> Optional[str]:
+        """Phase of the most recently begun invocation that is still in
+        flight (``"propose"``, ``"run"``, ...); ``None`` when nothing is.
+
+        Derived from the calls actually pending, so a ``propose`` that
+        finishes while an older ``run`` is still going reports ``run``."""
+        with self._lock:
+            return self._phase_locked()
+
+    def _phase_locked(self) -> Optional[str]:
+        for ph in reversed(list(self._inflight.values())):
+            if ph is not None:
+                return ph
+        return None
+
+    def begin(self, phase: Optional[str] = None) -> int:
+        """Mark an actor invocation as started; returns its token.
+
+        Pass the token to :meth:`end` (or ``record(..., finishes=token)``)
+        when the invocation finishes, success or failure, so a reader of
+        ``status`` can tell a long HTTP propose from a wedged process.
+        """
+        with self._lock:
+            self._next_token += 1
+            token = self._next_token
+            self._inflight[token] = phase
+        self._notify()
+        return token
+
+    def end(self, token: int) -> None:
+        """Finish the invocation :meth:`begin` returned ``token`` for.
+
+        Unknown or already-ended tokens are ignored."""
+        with self._lock:
+            found = token in self._inflight
+            self._inflight.pop(token, None)
+        if found:
+            self._notify()
+
+    def record(self, *, prompt_tokens: int = 0, completion_tokens: int = 0,
+               seconds: float = 0.0, failed: bool = False,
+               finishes: Optional[int] = None) -> None:
+        """Account one finished call. ``finishes`` is the :meth:`begin` token
+        of the invocation this record completes; without it, in-flight state
+        is left alone (an unpaired provider attempt is not the actor call)."""
+        with self._lock:
+            self.calls += 1
+            self.prompt_tokens += prompt_tokens
+            self.completion_tokens += completion_tokens
+            self.seconds += seconds
+            if failed:
+                self.failures += 1
+                self.failure_seconds += seconds
+            if finishes is not None:
+                self._inflight.pop(finishes, None)
+        self._notify()
+
+    def add_tokens(self, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+        """Add provider-reported tokens without counting a call or any time.
+
+        For an adapter that reports into a ``Usage`` which another layer already
+        counts calls and seconds on (see :meth:`token_sink`)."""
+        with self._lock:
+            self.prompt_tokens += prompt_tokens
+            self.completion_tokens += completion_tokens
+        self._notify()
+
+    def token_sink(self) -> "TokenSink":
+        """A ``usage=`` for a model adapter that adds only its **tokens** here.
+
+        The engine's meter counts one call (and its seconds) per actor invocation
+        on the run's ``Usage``. An adapter given that same object would count its
+        own provider attempts on top -- every call twice, and retries as extra --
+        which halves ``max_calls`` and doubles ``usd_per_call`` spend. A sink
+        takes the one thing only the adapter can see, the token counts. Used by
+        spec runs (#405); the Python API's ``claude(usage=u)`` is unchanged."""
+        return TokenSink(self)
+
+    def estimated_cost(self, per_1m_prompt: float, per_1m_completion: float) -> float:
+        """Cost at the given per-million-token prices (both provider-specific)."""
+        return (self.prompt_tokens * per_1m_prompt
+                + self.completion_tokens * per_1m_completion) / 1_000_000
+
+    def summary(self) -> str:
+        return (f"{self.calls} calls, {self.prompt_tokens:,} prompt + "
+                f"{self.completion_tokens:,} completion tokens, "
+                f"{self.seconds:.1f}s in the model"
+                + (f", {self.failures} failed ({self.failure_seconds:.1f}s lost)"
+                   if self.failures else ""))
+
+
+class TokenSink:
+    """What :meth:`Usage.token_sink` returns: ``record`` keeps only the tokens."""
+
+    def __init__(self, target: Usage) -> None:
+        self.target = target
+
+    def record(self, *, prompt_tokens: int = 0, completion_tokens: int = 0,
+               seconds: float = 0.0, failed: bool = False,
+               finishes: Optional[int] = None) -> None:
+        if prompt_tokens or completion_tokens:
+            self.target.add_tokens(prompt_tokens, completion_tokens)
+
+
+def metered(completion: Completion, usage: Usage) -> Completion:
+    """Count calls and model wall-clock for *any* completion.
+
+    Token counts are unavailable here -- a plain ``Completion`` never exposes
+    them -- so use the ``usage=`` argument of :func:`claude` /
+    :func:`openai_compatible` when you need exact tokens."""
+    def complete(prompt: str) -> str:
+        token = usage.begin()
+        t0 = time.time()
+        try:
+            out = completion(prompt)
+        except Exception:
+            usage.record(seconds=time.time() - t0, failed=True, finishes=token)
+            raise
+        except BaseException:
+            usage.end(token)
+            raise
+        usage.record(seconds=time.time() - t0, finishes=token)
+        return out
+    return complete
+
+
+# ---------------------------------------------------------------------------
+# Tool-using agents -- still just a Completion
+# ---------------------------------------------------------------------------
+#
+# A coding agent (Claude Code, Codex, OpenHands, aider, ...) differs from an API
+# model in that it *acts* -- runs commands, reads and edits files -- before it
+# answers. But its call contract is the same one: text in, text out. Keeping it a
+# ``Completion`` means every consumer (``LLMAgent``, ``evolve``, the examples)
+# accepts all of them with no special-casing.
+
+
+class AgentError(RuntimeError):
+    """A tool-using agent failed; the message carries its stderr / exit status."""
+
+
+@runtime_checkable
+class WorkspaceAgent(Protocol):
+    """A :data:`Completion` that can additionally be bound to a directory.
+
+    ``Completion`` deliberately stays ``prompt -> text`` for everything. But an
+    agent that *acts* often needs a place to act in, and a caller that stages
+    files (a document to grep, a repo to patch) needs to say where. This is that
+    one extra capability, kept optional so plain API models never implement it::
+
+        agent = claude_code()
+        answer = agent.in_workspace("/tmp/task-17")("summarise report.txt")
+
+    Consumers should feature-detect it (``isinstance(x, WorkspaceAgent)``) and
+    fall back to putting the material in the prompt.
+    """
+
+    def __call__(self, prompt: str) -> str: ...
+
+    def in_workspace(self, path: str) -> Completion: ...
+
+
+#: Environment variables a host agent sets in its own session and its children
+#: inherit. A worker that sees them believes it is *inside* that session:
+#: Claude Code refuses to start, DSH loads the parent's profile, and a worker
+#: whose host runs this package's MCP server would call it recursively.
+SESSION_MARKERS: Tuple[str, ...] = (
+    "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_CONFIG_DIR", "CODEX_", "DSH_",
+    "OPENAI_AGENT_", "MCP_",
+    # OpenCode reads three of these, and redirecting only the directory is not
+    # isolation: `OPENCODE_CONFIG` (a file) and `OPENCODE_CONFIG_CONTENT`
+    # (inline JSON) both win over `OPENCODE_CONFIG_DIR` -- measured, a config
+    # named by `OPENCODE_CONFIG` still supplied its MCP servers with the dir
+    # pointed at an empty directory. They are dropped by name rather than by an
+    # "OPENCODE_" prefix on purpose: `OPENCODE_API_KEY` is a provider
+    # credential, and a worker needs its keys.
+    "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT",
+    # Dropped so the redirect below can take: `setdefault` cannot override a
+    # value the parent already exported, and this one usually is exported.
+    # It is broader than the others -- every XDG-respecting tool the worker
+    # runs sees the workspace copy -- which is the point of an isolated worker.
+    "XDG_CONFIG_HOME",
+)
+
+#: Set for every worker so a tool the worker reaches (this package's own MCP
+#: server, when the plugin that hosts it is being evolved) can tell it is inside
+#: a run and refuse to start another. See ``agentdescent.mcp``.
+NESTED_MARKER = "AGENTDESCENT_NESTED"
+
+
+#: Each host's config-directory variable, and where an isolated worker's copy
+#: goes inside the rollout workspace. One mapping because there are two things
+#: to do with it -- set it, and *create* it -- and they were separate lists that
+#: drifted: OpenCode was added to the first and not the second, and a missing
+#: `OPENCODE_CONFIG_DIR` does not fail, it silently falls back to the user's
+#: real config, so the isolation read as working and was not.
+WORKER_CONFIG_DIRS: Dict[str, str] = {
+    "CLAUDE_CONFIG_DIR": "claude",
+    "CODEX_HOME": "codex",
+    "DSH_HOME": "dsh",
+    # OpenCode needs both, and the second is the one that works. Measured
+    # against opencode 1.18: `OPENCODE_CONFIG_DIR` supplies a config only when
+    # the user has none -- with a real `~/.config/opencode/opencode.jsonc`
+    # present, a worker pointed at another directory still saw the user's MCP
+    # servers, config file or no config file in the redirected one. OpenCode
+    # resolves its config under XDG, so `XDG_CONFIG_HOME` is what actually
+    # moves it: with that redirected the same worker sees "No MCP servers
+    # configured". `OPENCODE_CONFIG_DIR` stays for the case where XDG is
+    # honoured differently by a future version.
+    "OPENCODE_CONFIG_DIR": "opencode",
+    "XDG_CONFIG_HOME": "xdg",
+}
+
+
+def worker_env(workspace: Optional[str], extra: Optional[Mapping[str, str]] = None,
+               *, isolate: bool = True) -> Dict[str, str]:
+    """The environment a worker agent CLI runs with.
+
+    Starts from the caller's environment (a worker needs its provider keys and
+    PATH), drops every :data:`SESSION_MARKERS` variable, marks the process as
+    nested, and -- when there is a workspace -- sets ``PWD`` to it (the child's
+    ``cwd`` alone is not enough: some CLIs read ``$PWD``) and points each host's config
+    directory *inside* it (``CLAUDE_CONFIG_DIR``, ``CODEX_HOME``, ``DSH_HOME``,
+    ``OPENCODE_CONFIG_DIR``),
+    so the worker starts clean and cannot read the user's real plugins, memory or
+    MCP servers. ``extra`` wins over all of it. ``isolate=False`` keeps only the
+    nested marker and the ``PWD`` fix, for callers who want the worker to see
+    the user's setup.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not (isolate and any(k == m.rstrip("_") or k.startswith(m)
+                                   for m in SESSION_MARKERS))}
+    env[NESTED_MARKER] = "1"
+    if workspace:
+        # `cwd=` moves the process, not `$PWD`, and a runtime that resolves its
+        # project directory from `$PWD` (OpenCode, on Bun) would otherwise keep
+        # working in the directory the *caller* was launched from -- reading
+        # its files, the gold labels among them, and never seeing the staged
+        # candidate. Both `isolate` values: this is about where the worker runs,
+        # not about whose config it reads.
+        env["PWD"] = os.path.abspath(workspace)
+    if isolate and workspace:
+        home = os.path.join(workspace, ".agentdescent-worker")
+        for var, leaf in WORKER_CONFIG_DIRS.items():
+            env.setdefault(var, os.path.join(home, leaf))
+    if extra:
+        env.update(extra)
+    return env
+
+
+#: What OpenCode prints when it cannot resolve the provider or model named by
+#: `-m`. It is the same opaque `UnknownError` for `-m nosuch/model` and for a
+#: custom provider that is simply not visible to this process, so the text names
+#: nothing -- measured, opencode 1.19.3.
+_OPENCODE_PROVIDER_ERRORS = ("UnknownError", "ProviderModelNotFound",
+                             "ModelNotFoundError")
+
+
+def _opencode_provider_hint(command: Sequence[str], output: str, *,
+                            isolate: bool, env: Optional[Mapping[str, str]]) -> str:
+    """Why an isolated ``opencode`` worker most likely failed, or ``""``.
+
+    An isolated worker gets ``XDG_CONFIG_HOME`` and ``OPENCODE_CONFIG_DIR`` inside
+    the workspace, so a **custom provider** defined in the user's ``opencode.json``
+    -- an OpenAI-compatible endpoint such as Volcengine Ark, a local vLLM, a
+    company gateway -- is invisible, and every call dies with an
+    ``UnknownError`` that says nothing about why. Providers built into OpenCode
+    are unaffected. Only said for an isolated ``opencode`` worker whose caller has
+    not already pointed ``OPENCODE_CONFIG`` at something: then the cause is
+    elsewhere and this would mislead.
+    """
+    if not isolate or os.path.basename(str(command[0])) != "opencode":
+        return ""
+    if not any(marker in output for marker in _OPENCODE_PROVIDER_ERRORS):
+        return ""
+    if env and any(k in env for k in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT")):
+        return ""
+    return (
+        " -- hint: if -m names a custom provider (an OpenAI-compatible endpoint, a "
+        "local server, a gateway), note this worker runs isolated: it cannot read "
+        "~/.config/opencode (opencode.json), so that provider is invisible to it. Either set "
+        '"isolate": false to use your own OpenCode setup, or keep isolation and '
+        'point the worker at a provider-only config file: "env": '
+        '{"OPENCODE_CONFIG": "/abs/path/providers.json"} (keys via {env:VAR}, never '
+        "inline). An OPENCODE_CONFIG exported in the launching shell is dropped "
+        "for an isolated worker; pass it in `env`.")
+
+
+class _CliAgent:
+    """A command-line agent: a Completion that can be rebound to a workspace."""
+
+    def __init__(self, command, *, workspace=None, via_stdin=False,
+                 timeout=600.0, env=None, usage=None, isolate=True) -> None:
+        if not command:
+            raise ValueError("cli_agent needs a non-empty command")
+        self.command, self.workspace, self.via_stdin = list(command), workspace, via_stdin
+        self.timeout, self.env, self.usage, self.isolate = timeout, env, usage, isolate
+
+    def in_workspace(self, path: str) -> "Completion":
+        return _CliAgent(self.command, workspace=path, via_stdin=self.via_stdin,
+                         timeout=self.timeout, env=self.env, usage=self.usage,
+                         isolate=self.isolate)
+
+    def __call__(self, prompt: str) -> str:
+        argv = list(self.command) if self.via_stdin else [*self.command, prompt]
+        t0 = time.time()
+        env = worker_env(self.workspace, self.env, isolate=self.isolate)
+        if self.workspace:
+            # Created, not merely pointed at. `codex` refuses to start when
+            # CODEX_HOME does not exist ("Error finding codex home"), and
+            # `opencode` does something worse -- it falls back to the user's
+            # real config, so isolation silently does not happen.
+            for key in WORKER_CONFIG_DIRS:
+                if env.get(key, "").startswith(self.workspace):
+                    os.makedirs(env[key], exist_ok=True)
+        try:
+            # A worker that takes its prompt as an argument must not read the
+            # caller's stdin: `opencode run "<prompt>"` waits on an inherited
+            # pipe that never reaches EOF and burns the whole timeout. So stdin
+            # is the prompt (`via_stdin`) or nothing at all, never the caller's.
+            stdin = {"input": prompt.encode("utf-8")} if self.via_stdin else {"stdin": subprocess.DEVNULL}
+            proc = subprocess.run(
+                argv, **stdin,
+                capture_output=True, timeout=self.timeout,
+                cwd=self.workspace, env=env,
+            )
+            proc.stdout = decode_output(proc.stdout)
+            proc.stderr = decode_output(proc.stderr)
+        except UnicodeError as e:
+            if self.usage is not None:
+                self.usage.record(seconds=time.time() - t0, failed=True)
+            raise AgentError(f"{self.command[0]} could not exchange UTF-8 text: {e}") from e
+        except FileNotFoundError as e:
+            raise AgentError(
+                f"{self.command[0]!r} is not installed or not on PATH") from e
+        except subprocess.TimeoutExpired as e:
+            if self.usage is not None:
+                self.usage.record(seconds=time.time() - t0, failed=True)
+            raise AgentError(f"{self.command[0]} exceeded timeout={self.timeout}s") from e
+        if self.usage is not None:
+            self.usage.record(seconds=time.time() - t0, failed=proc.returncode != 0)
+        if proc.returncode != 0:
+            full = (proc.stderr or proc.stdout or "").strip()
+            detail = full[:400] or "no output"
+            hint = _opencode_provider_hint(self.command, full, isolate=self.isolate,
+                                           env=self.env)
+            raise AgentError(f"{self.command[0]} exited {proc.returncode}: {detail}{hint}")
+        return proc.stdout.strip()
+
+
+def cli_agent(command: Sequence[str], *, workspace: Optional[str] = None,
+              via_stdin: bool = False, timeout: float = 600.0,
+              env: Optional[Dict[str, str]] = None,
+              usage: Optional[Usage] = None, isolate: bool = True) -> "WorkspaceAgent":
+    """Run any **command-line** coding agent as a :data:`Completion`.
+
+    ``command`` is the argv prefix; the prompt is appended as the final argument,
+    or written to stdin when ``via_stdin`` is set. Whatever the agent writes to
+    stdout is the answer.
+
+    ::
+
+        cli_agent(["claude", "-p"])                        # Claude Code, print mode
+        cli_agent(["codex", "exec"])                       # Codex CLI
+        cli_agent(["claude", "-p"]).in_workspace("/tmp/w") # act inside a directory
+
+    ``timeout`` is not optional in spirit: an agent that hangs would otherwise
+    stall the round it belongs to (see ``evolve(round_timeout=)``). Failures raise
+    :class:`AgentError` carrying the agent's own stderr rather than a bare exit
+    code.
+
+    The child runs with :func:`worker_env`: the host session's markers dropped,
+    ``AGENTDESCENT_NESTED=1`` set, and each host's config directory pointed inside
+    the workspace. ``isolate=False`` keeps the caller's environment as it is
+    (bar the nested marker) for a worker that should see the user's own setup.
+    """
+    return _CliAgent(command, workspace=workspace, via_stdin=via_stdin,
+                     timeout=timeout, env=env, usage=usage, isolate=isolate)
+
+
+def claude_code(*, workspace: Optional[str] = None, extra_args: Sequence[str] = (),
+                **kwargs) -> Completion:
+    """Claude Code in non-interactive print mode, as a :data:`Completion`."""
+    return cli_agent(["claude", "-p", *extra_args], workspace=workspace, **kwargs)
+
+
+def codex(*, workspace: Optional[str] = None, extra_args: Sequence[str] = (),
+          **kwargs) -> Completion:
+    """OpenAI Codex CLI in non-interactive exec mode, as a :data:`Completion`."""
+    return cli_agent(["codex", "exec", *extra_args], workspace=workspace, **kwargs)
+
+
+def dsh(*, workspace: Optional[str] = None, extra_args: Sequence[str] = (),
+        **kwargs) -> Completion:
+    """DeepSeek Harness (``dsh``) headless profile, as a :data:`Completion`.
+
+    ``dsh --profile headless "<task>"`` runs one persisted session and prints the
+    last assistant message to stdout, which is exactly the shape
+    :func:`cli_agent` wants. Pass ``extra_args`` for ``--patch`` overlays or a
+    different profile.
+    """
+    return cli_agent(["dsh", "--profile", "headless", *extra_args],
+                     workspace=workspace, **kwargs)
+
+
+def opencode(*, workspace: Optional[str] = None, extra_args: Sequence[str] = (),
+             **kwargs) -> Completion:
+    """OpenCode's non-interactive ``run`` mode, as a :data:`Completion`.
+
+    ``opencode run "<task>"`` answers one message and exits, using the working
+    directory as the project -- which is what :func:`cli_agent`'s ``workspace``
+    binding gives it. Verified against opencode 1.18.
+
+    ``extra_args=["-m", "provider/model"]`` pins a model, and under the default
+    ``isolate=True`` that works only for providers built into OpenCode: a custom
+    provider (an OpenAI-compatible endpoint, a local server) lives in the user's
+    ``opencode.json``, which an isolated worker cannot read. Pass
+    ``env={"OPENCODE_CONFIG": "/abs/providers.json"}`` -- a file holding only the
+    ``provider`` block, keys through ``{env:VAR}`` -- or ``isolate=False``. A
+    failed isolated call says so in its :class:`AgentError`.
+    """
+    return cli_agent(["opencode", "run", *extra_args], workspace=workspace, **kwargs)
+
+
+def from_callable(fn: Completion) -> Completion:
+    """Identity adapter -- documents that any ``prompt -> text`` callable works."""
+    return fn
+
+
+def echo(transform: Optional[Callable[[str], str]] = None) -> Completion:
+    """A deterministic, no-network completion for tests and dry runs.
+
+    Returns the prompt unchanged, or ``transform(prompt)`` if given."""
+    def complete(prompt: str) -> str:
+        return transform(prompt) if transform else prompt
+    return complete
+
+
+class ProviderConfigError(ContractError, RuntimeError):
+    """The provider refused the request for a reason no retry can change (#635).
+
+    HTTP 401/403 (the key does not belong to this endpoint) and 404 or a body
+    saying ``UnsupportedModel`` / ``model_not_found`` (the endpoint does not
+    serve this model) answer every later request the same way. Quota / billing
+    exhaustion on a 429 is the same shape of failure and raises the
+    :class:`QuotaExhausted` subclass (#653). Treated as a transient, one such
+    run burned 25 identical 404s on a ``rounds=1, n_workers=1`` spec before
+    ending ``failed``. It is a :class:`ContractError` so the engines stop the
+    run on the first one, and a ``RuntimeError`` so callers that caught the old
+    untyped failure still do.
+    """
+
+
+class QuotaExhausted(ProviderConfigError):
+    """The account's quota or billing limit is used up until a human acts (#653).
+
+    Ark answers with HTTP 429 ``AccountQuotaExceeded`` (and a reset time);
+    OpenAI with ``insufficient_quota``. Both are permanent on the retry
+    timescale, so :func:`with_retries` must not back them off like a rate
+    limit. Real throttling (``rate_limit_exceeded``, bare 429 + ``Retry-After``)
+    stays on :class:`RateLimited`.
+    """
+
+
+class SubscriptionInactive(ProviderConfigError):
+    """The account has no active subscription or credit for this endpoint (#1006).
+
+    Ark Coding refuses an expired plan with HTTP 400 ``InvalidSubscription``
+    ("does not have a valid CodingPlan subscription, or your subscription has
+    expired"); OpenAI ``account_deactivated`` and Anthropic ``billing_error`` /
+    "credit balance is too low" are the same shape. They are not a throttled
+    quota and not a malformed request, so before this type they fell through
+    every 4xx hint as a bare ``RuntimeError``: ``with_retries`` spent three
+    attempts per call and ``diagnose`` sent the user to ``doctor``, which only
+    checks that the key is set. A subscription is renewed by a human, so this
+    fails on the first call and ``resume`` refuses it like a quota refusal.
+    """
+
+
+#: Body markers of a deterministic refusal, for gateways that answer it with a
+#: 400 rather than 401/403/404.
+_CONFIG_ERROR_MARKERS = ("unsupportedmodel", "model_not_found", "invalid_api_key",
+                         "modelnotfound", "invalidapikey", "authenticationerror")
+
+
+#: Body markers of an account-level subscription/billing refusal on any 4xx.
+#: Ark Coding names the expired plan ``InvalidSubscription`` on a 400 -- neither
+#: a 401/403 nor a 429, so neither existing hint caught it (#1006).
+_SUBSCRIPTION_ERROR_MARKERS = (
+    "invalidsubscription",        # Volcengine Ark Coding: expired plan
+    "account_deactivated",        # OpenAI: the account is not active
+    "accountdeactivated",
+    "billing_error",              # Anthropic: no credit
+    "billingerror",
+    "credit balance is too low",  # Anthropic billing_error's message
+)
+
+
+def _subscription_inactive_hint(code: int, detail: str, *,
+                                api_key_env: str) -> Optional[str]:
+    """Hint for a 4xx refusing the account's subscription/credit, or ``None``."""
+    if not 400 <= code <= 499:
+        return None
+    lowered = detail.lower()
+    if not any(m in lowered for m in _SUBSCRIPTION_ERROR_MARKERS):
+        return None
+    return (f"the account has no active subscription for this endpoint: renew "
+            f"it at the provider, or point {api_key_env} / model at another plan")
+
+
+#: Body markers / substrings of a permanent quota or billing exhaustion on a
+#: 429/503. Codes named explicitly so the list stays small and reviewable;
+#: the substrings ``quota`` and ``billing`` also catch phrasing such as
+#: "exceeded the weekly usage quota". Real throttling codes like
+#: ``rate_limit_exceeded`` do not match (#653).
+_QUOTA_ERROR_MARKERS = (
+    "accountquotaexceeded",   # Volcengine Ark Coding
+    "insufficient_quota",     # OpenAI
+    "insufficientquota",
+    "billing_hard_limit",
+    "billinghardlimit",
+    "exceeded_quota",
+)
+
+
+def _quota_exhausted_hint(detail: str, *, api_key_env: str) -> Optional[str]:
+    """Hint for a permanent quota/billing 429, or ``None`` for ordinary throttling."""
+    lowered = detail.lower()
+    if "quota" not in lowered and "billing" not in lowered             and not any(m in lowered for m in _QUOTA_ERROR_MARKERS):
+        return None
+    return (f"the account's quota for this model is used up: wait for the reset "
+            f"the provider names, or point {api_key_env} / model at another plan")
+
+
+def _provider_config_hint(code: int, detail: str, *, base: str, model: str,
+                          api_key_env: str, base_url_env: str) -> Optional[str]:
+    """The next step for a deterministic 4xx, or ``None`` when it is not one."""
+    lowered = detail.lower()
+    if code in (401, 403) or "invalid_api_key" in lowered or "invalidapikey" in lowered \
+            or "authenticationerror" in lowered:
+        return (f"check that {api_key_env} holds a key issued for {base} "
+                f"(or set {base_url_env} to the endpoint that key belongs to)")
+    if code == 404 or any(m in lowered for m in _CONFIG_ERROR_MARKERS):
+        return (f"endpoint {base} does not serve model {model!r}: check `model`, "
+                f"or point `default_base_url` / {base_url_env} at an endpoint that does")
+    return None
+
+
+class RateLimited(RuntimeError):
+    """The provider said "too many requests", and for how long if it bothered to.
+
+    Worth a type of its own because it wants a different retry from every other
+    failure: a transport error is worth retrying in half a second, and a rate
+    limit retried in half a second is three attempts spent inside two seconds
+    against a limiter measured in tens of them.
+    """
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        #: Seconds the provider asked for, from `Retry-After`, when it sent one.
+        self.retry_after = retry_after
+
+
+def with_retries(completion: Completion, attempts: int = 3,
+                 backoff: float = 0.5, sleep: Callable[[float], None] = time.sleep,
+                 rate_limit_backoff: float = 5.0,
+                 max_sleep: float = 60.0) -> Completion:
+    """Wrap a completion with exponential-backoff retries on any exception.
+
+    Rate limits back off on their own, much longer, schedule. Measured against a
+    throttling endpoint: the generic 0.5s/1.0s pair spent all three attempts
+    inside two seconds, every one of them refused, and the engine -- which
+    retires a worker after three consecutive failures -- lost every worker in
+    about a minute and ended the run with an empty tree. A `Retry-After` header
+    wins over both schedules when the provider sends one, and everything is
+    capped at ``max_sleep`` so a hostile or mistaken header cannot park a worker
+    for an hour.
+    """
+    def complete(prompt: str) -> str:
+        last: Optional[Exception] = None
+        for i in range(attempts):
+            try:
+                return completion(prompt)
+            except ProviderConfigError:
+                raise    # the same request gets the same refusal (#635)
+            except Exception as e:  # noqa: BLE001 - provider-agnostic retry
+                last = e
+                if i < attempts - 1:
+                    delay = backoff * (2 ** i)
+                    if isinstance(e, RateLimited):
+                        delay = max(delay, rate_limit_backoff * (2 ** i),
+                                    e.retry_after or 0.0)
+                    sleep(min(delay, max_sleep))
+        raise last  # type: ignore[misc]
+    return complete
+
+
+def claude(model: str = "claude-opus-4-8", max_tokens: int = 4096,
+           client: Optional[object] = None, usage: Optional[Usage] = None,
+           retries: int = 3, timeout: float = 120.0, api_key_env: Optional[str] = None,
+           **create_kwargs) -> Completion:
+    """A Claude-backed completion (requires ``pip install anthropic`` + creds).
+
+    ``api_key_env`` names the environment variable holding the key (read at call
+    time, like :func:`openai_compatible`), for a spec that cannot rely on
+    ``ANTHROPIC_API_KEY``. Without it the SDK resolves credentials as usual. It is
+    ignored when ``client`` is given. Before this, the name went into the
+    request body and the first call died with a ``TypeError`` (#406).
+
+    Pass ``client`` to reuse an existing ``anthropic.Anthropic`` instance;
+    otherwise a default one is constructed lazily (resolving credentials from
+    the environment / an ``ant auth login`` profile). Use a cheaper ``model``
+    (e.g. ``"claude-haiku-4-5"``) for call-heavy loops. Pass ``usage=Usage()`` to
+    accumulate the exact token counts the API reports.
+
+    ``max_tokens`` defaults high on purpose: a reasoning model spends the budget
+    on internal reasoning first, so too small a cap returns **empty visible
+    content** rather than a short answer. Measured on ``deepseek-v4-flash``, a
+    1024 cap returned nothing at all for 4 of 8 reflection prompts. You are billed
+    for tokens generated, not for the cap, so a generous limit costs nothing.
+
+    ``timeout`` bounds one request, and it is not optional in spirit. Every other
+    blocking boundary in this package has one -- ``_git`` at 120s, ``_CliAgent``
+    at 600s, ``runners._sh`` per call, :func:`openai_compatible` at 120s -- and
+    this was the exception. Without it the SDK's own 600s default applies, the
+    SDK retries it internally, and :func:`with_retries` retries *that*, so one
+    logical call against a stalled endpoint can block for well over half an hour
+    with nothing in the log.
+
+    Measured: a GEPA run against a hosted endpoint sat for **51 minutes on a
+    single round**, 1.07s of CPU across the whole time and one ESTABLISHED socket
+    -- a run that reports nothing and cannot be told apart from a slow one.
+    Raise it for an agentic backend that legitimately takes longer; the
+    equivalent knob on :func:`openai_compatible` has always been here."""
+    _client = client
+
+    def complete(prompt: str) -> str:
+        nonlocal _client
+        if _client is None:
+            from anthropic import Anthropic  # lazy, optional dependency
+            # max_retries=0: retrying is this function's job (`with_retries`
+            # below). Leaving the SDK's default 2 in place multiplies the two
+            # layers -- attempts x (1 + max_retries) x timeout -- and one
+            # logical call against a stalled endpoint blocked ~45 minutes.
+            if api_key_env:
+                key = os.environ.get(api_key_env)
+                if not key:
+                    raise RuntimeError(f"set {api_key_env} in your environment")
+                _client = Anthropic(max_retries=0, api_key=key)
+            else:
+                _client = Anthropic(max_retries=0)
+        t0 = time.time()
+        try:
+            msg = _client.messages.create(
+                model=model, max_tokens=max_tokens, timeout=timeout,
+                messages=[{"role": "user", "content": prompt}], **create_kwargs,
+            )
+        except Exception:
+            if usage is not None:
+                usage.record(seconds=time.time() - t0, failed=True)
+            raise
+        if usage is not None:
+            u = getattr(msg, "usage", None)
+            usage.record(prompt_tokens=getattr(u, "input_tokens", 0) or 0,
+                         completion_tokens=getattr(u, "output_tokens", 0) or 0,
+                         seconds=time.time() - t0)
+        return "".join(b.text for b in msg.content if b.type == "text")
+
+    # Retried by default: a transient socket error is ordinary, and it used to end
+    # whatever was running. Measured on a real run, one `RemoteDisconnected`
+    # during an example's final held-out evaluation -- a plain `completion(...)`
+    # call outside anything the engine protects -- discarded the entire run.
+    # `retries=0` opts out.
+    return with_retries(complete, attempts=retries) if retries > 1 else complete
+
+
+def _read_sse(response: Any) -> Dict[str, Any]:
+    """Reassemble an OpenAI-shaped SSE stream into the response it stands for.
+
+    Returns the same shape the non-streaming path parses -- ``choices[0].message``
+    plus ``usage`` -- so nothing downstream has to know which transport was used.
+
+    Deliberately forgiving about the stream and strict about nothing: a chunk
+    that will not parse is skipped rather than raised on, because one malformed
+    frame in a hundred is a provider quirk and not a reason to throw away a
+    completed answer. `reasoning_content` deltas are read and dropped: they are
+    what keeps the connection from going idle, and they are not the reply.
+    """
+    text: List[str] = []
+    usage_payload: Dict[str, Any] = {}
+    finish: Optional[str] = None
+    for raw in response:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        chunk_text = line[len("data:"):].strip()
+        if chunk_text == "[DONE]":
+            break
+        try:
+            chunk = json.loads(chunk_text)
+        except ValueError:
+            continue
+        if isinstance(chunk.get("usage"), dict):
+            usage_payload = chunk["usage"]
+        for choice in chunk.get("choices") or ():
+            delta = choice.get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                text.append(piece)
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+    return {
+        "choices": [{"message": {"role": "assistant", "content": "".join(text)},
+                     "finish_reason": finish}],
+        "usage": usage_payload,
+    }
+
+
+#: Names a caller reaches for to say "this endpoint" or "this key" that are *not*
+#: parameters of the ``*_compatible`` adapters. They used to fall into
+#: ``**create_kwargs`` and be sent as JSON body fields, so ``"base_url": "https://..."``
+#: in a spec was accepted, ignored, and the call went to the default OpenAI /
+#: Anthropic host carrying the *other* provider's key (#422).
+_URL_KWARGS = frozenset({"base_url", "api_base", "api_url", "base", "url", "endpoint"})
+_KEY_KWARGS = frozenset({"api_key", "apikey", "key"})
+
+
+def _is_timeout(e: BaseException) -> bool:
+    """True for a request that ran out of ``timeout``: a read timeout raised
+    directly, or a connect timeout that ``urllib`` wraps in ``URLError``."""
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return True
+    return (isinstance(e, urllib.error.URLError)
+            and isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)))
+
+
+def _timeout_message(base: str, model: str, timeout: float, *,
+                     can_stream: bool) -> str:
+    """What a reflector timeout says instead of a bare ``TimeoutError`` (#467).
+
+    It names the endpoint, the model and the seconds, and the knobs that fix it:
+    a reasoning model sends nothing while it thinks, so a non-streaming request
+    can sit silent past ``timeout``."""
+    fixes = ('set "stream": true on this block, raise "timeout", or turn the '
+             "provider's thinking off (e.g. \"thinking\": {\"type\": \"disabled\"})"
+             if can_stream else
+             'raise "timeout", or turn the provider\'s thinking off')
+    return (f"{base} did not answer within {timeout:g}s for model {model!r} "
+            f"(a reasoning model thinks silently before replying): {fixes}")
+
+
+def _reject_connection_kwargs(adapter: str, create_kwargs: Mapping[str, Any]) -> None:
+    """Refuse a connection parameter that would otherwise ride into the request body.
+
+    Raised when the factory is *called* (not on the first request), so ``plan`` /
+    ``evolve`` / MCP ``start`` refuse the spec by name before any call is made. The
+    message names the spelling that exists: ``default_base_url`` (a URL, not a
+    secret) or ``base_url_env`` (a variable *name*) for the endpoint, ``api_key_env``
+    (a variable *name*) for the key. Ordinary body extras (``temperature``,
+    ``thinking``, ...) are unaffected."""
+    for name in sorted(create_kwargs):
+        if name in _URL_KWARGS:
+            raise TypeError(
+                f"`{name}` is not a parameter of `{adapter}`; use `default_base_url` "
+                "(the endpoint URL) or `base_url_env` (the name of an environment "
+                "variable holding it). It would otherwise be sent as a field of the "
+                "JSON request body while the call goes to the default host")
+        if name in _KEY_KWARGS:
+            raise TypeError(
+                f"`{name}` is not a parameter of `{adapter}`; a key is never written in "
+                "a spec -- put it in an environment variable and name that variable in "
+                "`api_key_env`. It would otherwise be sent as a field of the JSON "
+                "request body while the call authenticates with the default key")
+
+
+def openai_compatible(model: str, *, base_url_env: str = "OPENAI_BASE_URL",
+                      api_key_env: str = "OPENAI_API_KEY",
+                      default_base_url: str = "https://api.openai.com/v1",
+                      max_tokens: int = 4096, timeout: float = 120.0,
+                      usage: Optional[Usage] = None, retries: int = 3,
+                      stream: bool = False,
+                      **create_kwargs) -> Completion:
+    """A completion for any OpenAI-compatible chat endpoint (GLM/Zhipu, proxies,
+    local servers, OpenAI itself).
+
+    The base URL and API key are read from the environment at call time -- they
+    never pass through code or arguments. Point it at GLM, for example, by
+    setting ``OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4`` and
+    ``OPENAI_API_KEY=<your key>`` in your shell, then use ``model="glm-4.6"``.
+
+    ``max_tokens`` defaults high on purpose -- see :func:`claude`: a reasoning
+    model starved of budget returns empty content, and at 1024 that happened for
+    half of one measured batch of reflection prompts.
+
+    ``stream=True`` sends the request as SSE and reassembles the text, which is
+    a **reliability** knob rather than a latency one: a non-streaming request to
+    a reasoning model sends no bytes at all while the model thinks, and any
+    gateway with an idle timeout closes the connection underneath it. Measured
+    against one such endpoint: a single request finished in 205 s, but four
+    concurrent ones -- queued behind each other, so each took longer -- were all
+    cut at 301 s with `RemoteDisconnected`, three of them within 0.2 s of each
+    other. The same prompts streamed ran past ten minutes with bytes arriving
+    continuously, because the reasoning deltas themselves keep the connection
+    warm. Usage still comes back: `stream_options.include_usage` puts it in the
+    final chunk, and an endpoint that ignores that field simply reports zero
+    tokens rather than failing.
+
+    Three parameters say where the call goes and with what: ``default_base_url``
+    (the endpoint, used when ``base_url_env`` is unset), ``base_url_env`` (the name
+    of the variable that overrides it) and ``api_key_env`` (the name of the variable
+    holding the key). Pointing at Volcengine Ark, for instance::
+
+        openai_compatible("deepseek-v4-flash", api_key_env="ARK_API_KEY",
+                          default_base_url="https://ark.cn-beijing.volces.com/api/coding/v3")
+
+    Without them the call goes to ``https://api.openai.com/v1`` carrying
+    ``OPENAI_API_KEY``. A connection-shaped keyword that is *not* one of these
+    (``base_url``, ``api_key``, ``url``, ...) raises ``TypeError`` instead of being
+    sent as a body field to the default host (#422).
+
+    Any other keyword argument goes into the request body, so ``temperature=0`` and
+    any provider-specific field work the same way they do on :func:`claude`."""
+    _reject_connection_kwargs("openai_compatible", create_kwargs)
+
+    def complete(prompt: str) -> str:
+        base = os.environ.get(base_url_env, default_base_url).rstrip("/")
+        key = os.environ.get(api_key_env)
+        if not key:
+            raise RuntimeError(f"set {api_key_env} (and {base_url_env}) in your environment")
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            **create_kwargs,
+        }
+        if stream:
+            payload["stream"] = True
+            payload.setdefault("stream_options", {"include_usage": True})
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{base}/chat/completions", data=body,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = _read_sse(resp) if stream else json.load(resp)
+        except urllib.error.HTTPError as e:
+            # The body carries the only useful part -- "rate limit: retry in 12s",
+            # "context length exceeded", "insufficient quota" -- and it lives on
+            # e.read(), so re-raising bare collapses every 4xx to "HTTP Error 429:
+            # Too Many Requests". `_git` and `_CliAgent` both surface the
+            # underlying detail; this was the one provider path that did not.
+            if usage is not None:
+                usage.record(seconds=time.time() - t0, failed=True)
+            try:
+                detail = e.read().decode("utf-8", "replace").strip()[:400]
+            except Exception:  # noqa: BLE001 - the body is best-effort
+                detail = ""
+            message = (f"{base} returned HTTP {e.code} for model {model!r}"
+                       + (f": {detail}" if detail else ""))
+            if e.code in (429, 503):
+                # Quota / billing exhaustion is permanent on this timescale
+                # (Ark AccountQuotaExceeded, OpenAI insufficient_quota); fail
+                # fast like other ProviderConfigError (#653). Real throttling
+                # keeps the RateLimited path below.
+                quota_hint = _quota_exhausted_hint(detail, api_key_env=api_key_env)
+                if quota_hint is not None:
+                    raise QuotaExhausted(f"{message} -- {quota_hint}") from e
+                # Told apart from every other 4xx so `with_retries` can wait the
+                # seconds a limiter wants instead of the half-second a transport
+                # blip wants. `Retry-After` is seconds or an HTTP date; only the
+                # numeric form is honoured, and a missing or unreadable one
+                # falls back to the rate-limit schedule.
+                header = ""
+                try:
+                    header = (e.headers.get("Retry-After") or "").strip()
+                except Exception:  # noqa: BLE001 - headers are best-effort
+                    header = ""
+                try:
+                    retry_after = float(header) if header else None
+                except ValueError:
+                    retry_after = None
+                raise RateLimited(message, retry_after) from e
+            subscription_hint = _subscription_inactive_hint(
+                e.code, detail, api_key_env=api_key_env)
+            if subscription_hint is not None:
+                raise SubscriptionInactive(
+                    f"{message} -- {subscription_hint}") from e
+            hint = _provider_config_hint(e.code, detail, base=base, model=model,
+                                         api_key_env=api_key_env,
+                                         base_url_env=base_url_env)
+            if hint is not None:
+                raise ProviderConfigError(f"{message} -- {hint}") from e
+            raise RuntimeError(message) from e
+        except Exception as e:
+            if usage is not None:
+                usage.record(seconds=time.time() - t0, failed=True)
+            if _is_timeout(e):
+                # A bare "The read operation timed out" names nothing (#467).
+                raise RuntimeError(_timeout_message(
+                    base, model, timeout, can_stream=not stream)) from e
+            raise
+        if usage is not None:
+            u = data.get("usage") or {}
+            usage.record(prompt_tokens=u.get("prompt_tokens", 0) or 0,
+                         completion_tokens=u.get("completion_tokens", 0) or 0,
+                         seconds=time.time() - t0)
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            # Some proxies answer HTTP 200 with {"error": ...}; without this the
+            # caller gets a bare KeyError naming nothing.
+            raise RuntimeError(
+                f"{base} returned a response with no choices for model {model!r}: "
+                f"{json.dumps(data)[:300]}") from None
+        # `content` is JSON null, not "", when a reasoning model spends its whole
+        # budget on `reasoning_content` -- DeepSeek's reasoner and GLM's thinking
+        # modes both do it. Returning None breaks the one contract in the package
+        # (`Completion` is prompt -> str) and surfaces as
+        # "'NoneType' object has no attribute 'strip'" from inside LLMAgent, which
+        # the engine then retries as a *backend transient*. Normalising to "" lets
+        # the empty-completion warning fire and say the true cause.
+        return message.get("content") or ""
+
+    return with_retries(complete, attempts=retries) if retries > 1 else complete
+
+
+def anthropic_compatible(model: str, *, base_url_env: str = "ANTHROPIC_BASE_URL",
+                         api_key_env: str = "ANTHROPIC_API_KEY",
+                         default_base_url: str = "https://api.anthropic.com",
+                         version: str = "2023-06-01",
+                         max_tokens: int = 4096, timeout: float = 120.0,
+                         usage: Optional[Usage] = None, retries: int = 3,
+                         **create_kwargs) -> Completion:
+    """A completion for any **Anthropic-format** endpoint, with no SDK dependency.
+
+    :func:`claude` speaks the same protocol through ``pip install anthropic``.
+    This is the twin of :func:`openai_compatible` on the other wire format, and it
+    exists for the same reason that one does: a gateway. Anthropic-format
+    endpoints now serve models that are not Claude -- vendor gateways, cloud
+    marketplaces, local servers -- and reaching them through the SDK means taking
+    an optional dependency, and a `base_url` override on a client whose defaults
+    (retries, timeouts) then have to be undone. `urllib` is already imported here.
+
+    The base URL and API key are read from the environment **at call time**, so
+    neither passes through code or arguments -- point it at a gateway with
+    ``ANTHROPIC_BASE_URL=https://host/anthropic`` and ``ANTHROPIC_API_KEY=<key>``
+    and pass that gateway's own ``model`` id.
+
+    ``max_tokens`` defaults high for the reason :func:`claude` gives: a reasoning
+    model spends its budget on internal reasoning first, and too small a cap
+    returns **empty visible content** rather than a short answer.
+
+    Only ``text`` blocks are returned. A reasoning model answers with
+    ``thinking`` blocks first and the visible answer after, and concatenating all
+    of them would put the reasoning into the artifact's output -- where a scorer
+    would grade it, a judge would read it, and a diff might commit it.
+
+    ``default_base_url``, ``base_url_env`` and ``api_key_env`` are the three
+    connection parameters (see :func:`openai_compatible`); a connection-shaped
+    keyword that is not one of them (``base_url``, ``api_key``, ...) raises
+    ``TypeError`` rather than being sent as a body field (#422). Any other keyword
+    goes into the request body.
+    """
+    _reject_connection_kwargs("anthropic_compatible", create_kwargs)
+
+    def complete(prompt: str) -> str:
+        base = os.environ.get(base_url_env, default_base_url).rstrip("/")
+        key = os.environ.get(api_key_env)
+        if not key:
+            raise RuntimeError(f"set {api_key_env} (and {base_url_env}) in your environment")
+        payload: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+            **create_kwargs,
+        }
+        req = urllib.request.Request(
+            f"{base}/v1/messages", data=json.dumps(payload).encode(),
+            headers={"x-api-key": key, "anthropic-version": version,
+                     "content-type": "application/json"})
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.load(resp)
+        except urllib.error.HTTPError as e:
+            # Same reasoning as `openai_compatible`: the body carries the only
+            # useful part of a 4xx and it lives on `e.read()`.
+            if usage is not None:
+                usage.record(seconds=time.time() - t0, failed=True)
+            try:
+                detail = e.read().decode("utf-8", "replace").strip()[:400]
+            except Exception:  # noqa: BLE001 - the body is best-effort
+                detail = ""
+            message = (f"{base} returned HTTP {e.code} for model {model!r}"
+                       + (f": {detail}" if detail else ""))
+            if e.code in (429, 503):
+                quota_hint = _quota_exhausted_hint(detail, api_key_env=api_key_env)
+                if quota_hint is not None:
+                    raise QuotaExhausted(f"{message} -- {quota_hint}") from e
+                header = ""
+                try:
+                    header = (e.headers.get("Retry-After") or "").strip()
+                except Exception:  # noqa: BLE001 - headers are best-effort
+                    header = ""
+                try:
+                    retry_after = float(header) if header else None
+                except ValueError:
+                    retry_after = None
+                raise RateLimited(message, retry_after) from e
+            subscription_hint = _subscription_inactive_hint(
+                e.code, detail, api_key_env=api_key_env)
+            if subscription_hint is not None:
+                raise SubscriptionInactive(
+                    f"{message} -- {subscription_hint}") from e
+            hint = _provider_config_hint(e.code, detail, base=base, model=model,
+                                         api_key_env=api_key_env,
+                                         base_url_env=base_url_env)
+            if hint is not None:
+                raise ProviderConfigError(f"{message} -- {hint}") from e
+            raise RuntimeError(message) from e
+        except Exception as e:
+            if usage is not None:
+                usage.record(seconds=time.time() - t0, failed=True)
+            if _is_timeout(e):
+                raise RuntimeError(_timeout_message(
+                    base, model, timeout, can_stream=False)) from e
+            raise
+        if usage is not None:
+            u = data.get("usage") or {}
+            usage.record(prompt_tokens=u.get("input_tokens", 0) or 0,
+                         completion_tokens=u.get("output_tokens", 0) or 0,
+                         seconds=time.time() - t0)
+        blocks = data.get("content")
+        if not isinstance(blocks, list):
+            raise RuntimeError(
+                f"{base} returned a response with no content for model {model!r}: "
+                f"{json.dumps(data)[:300]}")
+        return "".join(b.get("text") or "" for b in blocks
+                       if isinstance(b, dict) and b.get("type") == "text")
+
+    return with_retries(complete, attempts=retries) if retries > 1 else complete

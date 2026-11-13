@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentdescent"
+dynamic = ["version"]
+description = "Gradient descent, but the parameters are agents — a parallel, asynchronous framework for self-evolving agents (skills, prompts, harnesses)"
+readme = "README.md"
+requires-python = ">=3.9"
+# PEP 639. AgentDescent is MIT; `agentdescent/algorithms/rrsi/` includes files
+# adapted from google-research/rrsi, which are Apache-2.0 (see NOTICE).
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "LICENSES/*"]
+authors = [{ name = "AgentDescent" }]
+keywords = ["rsi", "self-evolving-agents", "parallel", "aggregation", "staleness"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+]
+# `agentdescent.audit.ppi` -- the prediction-powered estimator behind the
+# calibration layer -- is numpy. Everything else in the package still runs on the
+# standard library alone, and the CLI deliberately stays that way.
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+# `pyyaml` is only used by the dsh patch tests, which parse the block we
+# write the way dsh does. Without it `pytest tests/test_integrations.py`
+# fails on a clean checkout, which is the install the guide gives.
+# Markdown renders docs-link checks exactly as browser-visible HTML instead
+# of mistaking IDs inside code examples for real link targets.
+dev = ["pytest>=7.0", "pyyaml>=5.1", "Markdown>=3.3.6"]
+docs = ["mkdocs-material[imaging]>=9.5"]   # [imaging] builds the social cards
+# The MCP server (`agentdescent mcp`) needs the protocol SDK; the CLI does not.
+#
+# The marker is load-bearing. This project supports 3.9, every published `mcp`
+# requires >=3.10, and without the marker `pip install "agentdescent[mcp]"` --
+# the line the install docs give -- fails on 3.9 with a screen of "Ignored the
+# following versions" and installs *nothing*, not even the CLI. With it, 3.9
+# gets the CLI and an `agentdescent mcp` that says why it cannot serve.
+mcp = ["mcp>=1.2; python_version >= '3.10'"]
+
+[project.scripts]
+agentdescent = "agentdescent.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ThinkFlowLab/agentdescent"
+
+[tool.setuptools.dynamic]
+# Single-sourced: agentdescent/__init__.py is the only place the version
+# lives. It used to be duplicated here, and drifted -- __version__ said
+# 0.7.0 while every wheel, the PyPI page and the README badge said 0.2.0.
+version = { attr = "agentdescent.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["agentdescent*"]
+
+[tool.setuptools.package-data]
+# The shared skill and hooks the `install` command writes into a host.
+agentdescent = ["integrations/*.md", "integrations/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: takes several seconds (deselect with -m 'not slow'); the default run still includes it",
+    "engine: needs a real container engine (docker/podman) and is skipped without one",
+]
+# Put both the repo root and tests directory on sys.path. The root resolves
+# package imports; tests keeps legacy top-level test helpers importable after
+# making `tests` an explicit package for subprocess-based refs.
+pythonpath = [".", "tests"]

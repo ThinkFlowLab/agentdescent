@@ -1,0 +1,272 @@
+"""Does a pull request's current head carry a reviewer PASS?
+
+    PR=12 GH_REPO=owner/repo GH_TOKEN=... python3 review_gate.py   # what the workflow runs
+    python3 .github/scripts/review_gate.py --pr 12 [--repo owner/repo] [--sha <head>]
+
+``decide`` is the whole rule. A report counts when:
+  - it is a PR comment or a review body by a login in
+    ``.github/agent/review-policy.json``'s ``reviewers`` (the base branch's copy);
+  - it is not the PR author's own report, unless the author is in ``selfReview``;
+  - it carries the Verifier block (see .claude/skills/review-pr/SKILL.md) with a
+    ``Tip SHA:`` that is the head being judged and a ``Verdict:``;
+  - a reviewer's report with no Verifier block counts too, at the tip that
+    reviewer most recently named: a comment or a review body carries no thread
+    identity, so the follow-up attaches to that tip and supersedes the reports
+    before it there rather than disappearing (#928). When the reviewer's last
+    named tip is the head, the follow-up supersedes the head's PASS even if its
+    prose is about an earlier tip - the conservative direction, since the
+    collector has no thread ids to tell the two apart;
+  - a PASS without a ``Ran:`` entry or without a ``Not run:`` line still
+    counts, but is marked ``weak: no Ran:/Not run:`` so it is never invisible.
+The newest report at this tip decides, verdict or not, so a later FAIL, a
+withdrawal, an added requirement or an open question at the same tip voids an
+earlier PASS until a new PASS is written. A new commit moves the tip and every
+old report stops counting.
+
+The PR is read only through the GitHub API; no PR code is checked out or run.
+Exits 0 on a PASS at the tip, 1 otherwise (the workflow step is neutral).
+
+Standard library only, Python 3.9+, the ``gh`` CLI for the API. Ported from
+ThinkFlowLab/FlyBot ``.github/scripts/review-gate.mjs``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+SHORT = 12
+WEAK = "no Ran:/Not run:"
+HERE = os.path.dirname(os.path.abspath(__file__))
+POLICY = os.path.join(HERE, "..", "agent", "review-policy.json")
+
+
+def parse_report(body: Optional[str]) -> Dict[str, Any]:
+    """The LAST report in one body: a comment may quote an earlier review, and
+    only the last Verdict the reviewer stands behind is read. The tip belongs to
+    that verdict's own block, never to a line appended below it: a bare
+    ``Tip SHA:`` under an older PASS used to re-point the PASS at a commit it
+    never judged (#930). The tip may be written above the verdict (``Tip SHA:``
+    first, #774) or inside it (``Verdict: PASS (tip b0a30224)``, #776/#782); the
+    inline shape wins when both are present. A tip line after the block's
+    evidence (``Ran:`` / ``Not run:``) is prose, not the report's tip, so such a
+    body names no commit and the gate refuses it."""
+    lines = re.sub(r"[*`]", "", str(body or "")).split("\n")
+    out: Dict[str, Any] = {"tip": None, "verdict": None, "ran": [], "hasNotRun": False}
+    verdicts: List[Any] = []  # (line index, inline tip or None)
+    tips: List[Any] = []  # (line index, hex or None)
+    evidence: List[int] = []  # indices of Ran:/Not run: lines
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        m = re.match(r"^Tip(?: SHA)?\s*:\s*(.+)$", line, re.I)
+        if m:
+            hexes = re.search(r"[0-9a-f]{7,40}", m.group(1), re.I)
+            tips.append((i, hexes.group(0).lower() if hexes else None))
+        m = re.match(r"^Verdict\s*:\s*(PASS|FAIL|INC)\b(.*)$", line, re.I)
+        if m:
+            out["verdict"] = m.group(1).upper()
+            inline = re.search(r"(?:tip|at)\s*:?\s*([0-9a-f]{7,40})", m.group(2) or "", re.I) \
+                or re.search(r"\b([0-9a-f]{7,40})\b", m.group(2) or "", re.I)
+            verdicts.append((i, inline.group(1).lower() if inline else None))
+        m = re.match(r"^(?:(?:What\s+)?I\s+)?Ran\b\s*(?:\([^)]*\))?\s*:\s*(.*)$", line, re.I)
+        if m:
+            evidence.append(i)
+            out["ran"] = []
+            out["hasNotRun"] = False
+            first = m.group(1).strip()
+            if first and first != "-":
+                out["ran"].append(first)
+            for nxt in (l.strip() for l in lines[i + 1:]):
+                if re.match(r"^[-\u2022]\s*\S", nxt):
+                    out["ran"].append(nxt)
+                elif nxt == "" and out["ran"]:
+                    break
+                elif nxt != "":
+                    break
+        if re.match(r"^Not run\s*:", line, re.I):
+            evidence.append(i)
+            out["hasNotRun"] = True
+    if verdicts:
+        _, inline_tip = verdicts[-1]
+        if inline_tip:
+            out["tip"] = inline_tip
+        else:
+            start = verdicts[-2][0] + 1 if len(verdicts) > 1 else 0
+            end = next((j for j in evidence if j >= start), len(lines))
+            own = [sha for j, sha in tips if start <= j < end]
+            out["tip"] = own[-1] if own else None
+    else:
+        out["tip"] = tips[-1][1] if tips else None
+    return out
+
+
+def _login(r: Dict[str, Any]) -> str:
+    return str(r.get("login") or "").lower()
+
+
+def _where(r: Dict[str, Any]) -> str:
+    return f"{'review' if r.get('kind') == 'review' else 'comment'} by {r.get('login')}"
+
+
+def _ts(at: Optional[str]) -> float:
+    try:
+        return datetime.fromisoformat(str(at).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def decide(head: str, author: str, reports: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
+    """reports: [{login, body, at, kind}] from the comments and review bodies of one PR.
+
+    Reports are read in time order, comments and reviews together. A reviewer's
+    report with no Verifier block attaches to the tip that reviewer most recently
+    named, because a comment or review body carries no thread identity, so a
+    follow-up takes part in the ordering instead of vanishing; that is what lets
+    a newer withdrawal, requirement or question void an older PASS (#928). If
+    the last named tip is the head, a verdict-less follow-up supersedes the
+    head's PASS even when its prose is about an earlier tip: with no thread ids
+    in the collector, a report that cannot be placed is read conservatively.
+    Anything else that names no tip is not a report and is ignored."""
+    head_sha = str(head or "").lower()
+    author_login = str(author or "").lower()
+    reviewers = {str(l).lower() for l in policy.get("reviewers", [])}
+    self_review = {str(l).lower() for l in policy.get("selfReview", [])}
+    reasons: List[str] = []
+    judged: List[Dict[str, Any]] = []
+
+    # Equal timestamps keep the API order (oldest first), so the later comment wins.
+    ordered = sorted(enumerate(reports), key=lambda p: (_ts(p[1].get("at")), p[0]))
+    thread_tip: Optional[str] = None  # the tip the reviewer most recently named
+    for _, r in ordered:
+        parsed = parse_report(r.get("body"))
+        login = _login(r)
+        allowed = login in reviewers and (login != author_login or author_login in self_review)
+        if not parsed["tip"] and not parsed["verdict"]:
+            # A follow-up, not a Verifier block: the body carries no thread id,
+            # so it attaches to the tip this reviewer last named and, being
+            # newer, supersedes what came before there.
+            if not allowed or not thread_tip:
+                continue
+            judged.append({"login": r.get("login"), "verdict": None, "tip": thread_tip, "at": r.get("at"),
+                           "kind": r.get("kind"), "parsed": parsed, "follow_up": True,
+                           "counts": head_sha.startswith(thread_tip)})
+            continue
+        entry = {"login": r.get("login"), "verdict": parsed["verdict"], "tip": parsed["tip"], "at": r.get("at"),
+                 "kind": r.get("kind"), "parsed": parsed, "counts": False}
+        judged.append(entry)
+        if parsed["tip"]:
+            if allowed:
+                thread_tip = parsed["tip"]
+        else:
+            reasons.append(f"{_where(r)}: no Tip SHA")
+            continue
+        if not head_sha.startswith(parsed["tip"]):
+            reasons.append(f"{_where(r)}: names {parsed['tip'][:SHORT]}, not the tip {head_sha[:SHORT]}")
+            continue
+        if login == author_login and author_login not in self_review:
+            reasons.append(f"{_where(r)}: the pull request's own author is not a reviewer (not in selfReview)")
+            continue
+        if login not in reviewers:
+            reasons.append(f"{_where(r)}: not a reviewer listed in .github/agent/review-policy.json")
+            continue
+        entry["counts"] = True
+
+    counting = [e for e in judged if e["counts"]]
+    if not counting:
+        if not reviewers:
+            reason = "no reviewer is listed in .github/agent/review-policy.json"
+        else:
+            reason = "; ".join(reasons) if reasons else f"no Verifier report names the tip {head_sha[:SHORT]}"
+        return {"ok": False, "verdict": None, "by": None, "tip": None, "reason": reason, "judged": judged}
+
+    last = counting[-1]  # judged is in time order
+    parsed = last["parsed"]
+    base = {"verdict": last["verdict"], "by": last["login"], "tip": last["tip"], "judged": judged}
+    if last["verdict"] is None:
+        return dict(base, ok=False, weak=None,
+                    reason=f"{last['login']}'s newer {last['kind']} at this tip carries no verdict, "
+                           "so the earlier PASS is superseded")
+    if last["verdict"] != "PASS":
+        return dict(base, ok=False, weak=None, reason=f"{last['login']} says {last['verdict']} at this tip")
+    # An evidence-less PASS still counts - the owner's agent writes one - but it is
+    # marked so the missing Ran:/Not run: stays visible in the result and the report.
+    weak = None if (parsed["ran"] and parsed["hasNotRun"]) else WEAK
+    reason = f"{last['login']}'s PASS names this tip" + (f" (weak: {WEAK})" if weak else "")
+    return dict(base, ok=True, weak=weak, reason=reason)
+
+
+def render(result: Dict[str, Any], pr: Any, head: str, author: str) -> str:
+    out = [
+        f"### Reviewed tip: {'PASS at ' + head[:SHORT] if result['ok'] else 'not reviewed'}",
+        "",
+        (f"{result['by']} passed this tip." + (f" Weak: {result['weak']}." if result.get("weak") else ""))
+        if result["ok"] else f"No PASS names this tip: {result['reason']}.",
+        "",
+        f"Pull request #{pr}, author {author}, head `{head[:SHORT]}`.",
+    ]
+    seen = [e for e in result["judged"] if e["counts"] or e["verdict"]]
+    if seen:
+        out += ["", "Verifier reports read:"]
+        out += [f"- {e['login']} ({e['kind']}): {e['verdict'] or 'no verdict'} at {(e['tip'] or 'no tip')[:SHORT]}"
+                + ("" if e["counts"] else " (not counted)") for e in seen[:10]]
+    out += ["", "_Report only: this check never blocks, labels, approves or merges. Rules: "
+                "`.github/agent/review-policy.json`; merge policy: AGENTS.md › Merge policy._"]
+    return "\n".join(out)
+
+
+def _gh(*args: str) -> str:
+    return subprocess.run(["gh", *args], check=True, capture_output=True, text=True).stdout
+
+
+def _list(path: str) -> List[Dict[str, Any]]:
+    out = _gh("api", "--paginate", "--jq", ".[]", path)
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Does the PR's tip carry a PASS? (report only)")
+    ap.add_argument("--repo", default=os.environ.get("GH_REPO"))
+    ap.add_argument("--pr", type=int, default=int(os.environ["PR"]) if os.environ.get("PR") else None)
+    ap.add_argument("--sha", help="judge this tip instead of the current head")
+    ap.add_argument("--policy", default=os.environ.get("REVIEW_POLICY", POLICY))
+    args = ap.parse_args(argv)
+    if not args.repo or not args.pr:
+        ap.error("set GH_REPO and PR, or pass --repo owner/name --pr N")
+    with open(args.policy, encoding="utf-8") as fh:
+        policy = json.load(fh)
+    pull = json.loads(_gh("api", f"repos/{args.repo}/pulls/{args.pr}"))
+    head = args.sha or pull["head"]["sha"]
+    author = (pull.get("user") or {}).get("login", "")
+    reports = [{"kind": "comment", "login": (c.get("user") or {}).get("login"), "body": c.get("body"),
+                "at": c.get("created_at")}
+               for c in _list(f"repos/{args.repo}/issues/{args.pr}/comments?per_page=100")]
+    reports += [{"kind": "review", "login": (v.get("user") or {}).get("login"), "body": v.get("body"),
+                 "at": v.get("submitted_at")}
+                for v in _list(f"repos/{args.repo}/pulls/{args.pr}/reviews?per_page=100")
+                if (v.get("body") or "").strip()]
+    result = decide(head, author, reports, policy)
+    print(f"review-gate (report only): PR #{args.pr} tip {head[:SHORT]} - "
+          + (f"PASS by {result['by']}" if result["ok"] else result["reason"]))
+    text = render(result, args.pr, head, author)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    else:
+        print("\n" + text)
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (subprocess.CalledProcessError, ValueError, KeyError, OSError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        print(f"review-gate: {str(detail).strip()[:500]}", file=sys.stderr)
+        sys.exit(1)

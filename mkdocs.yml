@@ -1,0 +1,238 @@
+site_name: AgentDescent
+# Written for search, not for us: "RSI" is jargon nobody types into a search box,
+# and the phrases people do type -- self-evolving agents, an implementation of a
+# named method -- were in none of these pages' metadata.
+site_description: >-
+  A parallel, asynchronous framework for self-evolving LLM agents, with runnable
+  reproductions of twenty-three published self-evolution algorithms.
+# Required for canonical URLs, an absolute-URL sitemap, and the social cards
+# below -- without it mkdocs emits neither, and the social plugin warns.
+site_url: https://thinkflowlab.github.io/agentdescent/
+repo_url: https://github.com/ThinkFlowLab/agentdescent
+repo_name: ThinkFlowLab/agentdescent
+docs_dir: docs
+site_dir: site
+
+plugins:
+  # `search` is listed explicitly because declaring any plugin replaces the
+  # default set, and dropping it silently removes the docs site's own search.
+  - search
+  # Renders an og:image per page, so a link shared anywhere shows the page title
+  # instead of a bare URL. Needs mkdocs-material[imaging]; the docs workflow
+  # installs it and the cairo library it loads at runtime.
+  - social
+
+theme:
+  name: material
+  custom_dir: site_overrides
+  logo: assets/mark.svg
+  font: false
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.indexes
+    - content.code.copy
+    - toc.follow
+
+nav:
+  - Home: index.md
+  # Keep the demo reachable in Material's mobile drawer when header links hide.
+  - Interactive demo: https://thinkflowlab.github.io/agentdescent/#demo
+  - Documentation: docs.md
+  - Getting started:
+    - Install and first run: install.md
+    - Start here — the plugin, step by step: plugin-quickstart.md
+    - Use it from your agent (DSH / Claude Code / Codex / OpenCode / Grok Bot): plugins.md
+    - MCP / CLI Path A: mcp-path-a.md
+    - Set it up and test it: testing-guide.md
+    - Quickstart — dataset to skill: quickstart-skill.md
+    - Quickstart — evolve a directory: quickstart-directory.md
+    - Quickstart — evolve an agent's code: quickstart-agent-code.md
+  - Core concepts:
+    - Concepts: concepts.md
+    - Architecture: architecture.md
+    - The data model: data-model.md
+    - Governance (L0 / L1 / L2): governance.md
+    - Capability map: capabilities.md
+    - The main path: main-path.md
+  - The evolve method: evolution.md
+  - Modules — design and usage:
+    - Module map: modules.md
+    - Experimental modules: experimental.md
+    - Strategies — what evolves: strategies.md
+    - Evolving a directory: directory-evolution.md
+    - Agents & LLMs: agents.md
+    - Document backends: backends.md
+    - The aggregator (the optimizer): aggregator.md
+    - Population engine: population.md
+    - The ledger: ledger.md
+    - The verifier: verifier.md
+    - Sparse audit (cheap verifier vs truth): audit.md
+    - Statistical evidence: stats-eval.md
+    - Decision log: decisions.md
+    - Deployment safety — kill/canary/rollback: safety-controller.md
+    - RSI metrics — acceptance and cost: metrics.md
+    - Diagnose a run: diagnose.md
+    - Session controller — when to stop: controller.md
+    - Run manifest — reproducibility: manifest.md
+    - Evaluation service — budgeted oracle: evaluation.md
+    - Safety case — is this archive seedable?: safety.md
+    - JEV — a distilled verifier student: jev.md
+    - Verifier–curriculum co-evolution: verifier-curriculum.md
+    - The data layer: dataloader.md
+    - Rewards: rewards.md
+    - Reference orchestrator & domain: orchestrator.md
+  - Running at scale:
+    - Parallelism (DP / TP): parallelism.md
+    - Where rollouts run: execution.md
+    - Sandboxes: sandboxes.md
+    - Async — no round barrier: async.md
+    - Duration-aware scheduling: duration-scheduling.md
+    - Budget allocation: budget.md
+    - The RSI loop kernel: loop-kernel.md
+    - Trusted promotion: trusted-promotion.md
+    - Trusted evidence: trust-evidence.md
+    - Module audit: module-audit.md
+    - Adaptive compute: compute-policy.md
+    - Capability foundry: capability-foundry.md
+    - Continual experience: continual-experience.md
+    - Skill bank lifecycle: skill-bank.md
+  - Product surfaces:
+    - Release a candidate: release.md
+    - GitHub proposal publisher: github.md
+    - Trajectory evidence: traces.md
+    - Governed harness change: governed-harness.md
+    - Tenant cycle: tenant.md
+    - Operations console: ops.md
+    - The RSI platform cycle: platform.md
+    - Capability loop: capability-loop.md
+    - Meta campaign: meta-campaign.md
+    - Experience store: experience-cli.md
+  - The decision plane (policies):
+    - Choosing policies: policies.md
+    - Using the slots — a guide: policy-guide.md
+    - Task sampling: sampling.md
+    - Candidate selection: selection.md
+    - HGM scheduling: hgm.md
+    - Proposal policies: proposal-policies.md
+    - Conflict policies: conflict-policies.md
+    - Fusion policies: fusion-policies.md
+    - Acceptance policies: acceptance-policies.md
+    - Leakage guard: leakage.md
+    - Marginal-gain stopping: stopping.md
+    - Approval gate — high-risk changes: approval.md
+    - Edit predictions: predictions.md
+    - Guard pipeline: guards.md
+    - Guarded runtime: runtime.md
+    - Risk policy: risk-policy.md
+    - Promotion policies: promotion-policies.md
+    - Staleness policies: staleness.md
+    - The aggregator_factory exit: aggregator-factory.md
+    - Meta-evolution — evolving the slots: meta-evolution.md
+  - API reference: api.md
+  - Run everything, and extend it: usage.md
+  - Examples and results:
+    - Complete example — skill evolution: skill-evolution.md
+    - Efficiency experiments: efficiency.md
+    - Measured results: results.md
+    - Runtime matrix: matrix-overview.md
+    - Runtime matrix — report: matrix-report.md
+    - Molecule search — porous crystals: porous-molecules.md
+    - Cross-run consolidation: consolidation.md
+    - Harness composition: harness-composition.md
+    - Skill compilation: skill-compilation.md
+    - Harness manifest: harness-manifest.md
+    - Portfolio governance: portfolio.md
+    - Portfolio evolution — evolve the spend rule: portfolio-evolve.md
+    - Self-improvement loop: self-improve.md
+    - Longitudinal RSI report: rsi.md
+    - The meta stack on the CLI: meta-cli.md
+    - Self-evolution bench — every rung, end to end: self-evolution-bench.md
+    - Verified seeding — gate on trust: verified-seed.md
+    - Joint multi-slot evolution: joint-meta.md
+    - Solver-challenger self-play: selfplay.md
+  - Self-evolution algorithms:
+    - Overview — twenty-three ports: self-evolution-examples.md
+    - Named algorithms (spec / plugin): algorithms.md
+    - Register a named Algorithm card: algorithm-authoring.md
+    - Algorithm decision tree: algorithm-decision-tree.md
+    - Algorithm tournament: tournament.md
+    - Campaign — iterate a spec: campaign.md
+    - Porting checklist: porting-checklist.md
+    - MethodPolicy porting checklist: porting-methodpolicy.md
+    - Port fidelity: port-fidelity.md
+    - ACE — context evolution: algo-ace.md
+    - Dynamic Cheatsheet — test-time memory: algo-dynamic-cheatsheet.md
+    - GEPA — prompt evolution: algo-gepa.md
+    - EvoSkill — skill discovery: algo-evoskill.md
+    - SkillOpt — skill-document training: algo-skillopt.md
+    - gskill — repository skill: algo-gskill.md
+    - ADAS — meta agent search: algo-adas.md
+    - DGM — Darwin Gödel Machine: algo-dgm.md
+    - OpenEvolve — program evolution: algo-openevolve.md
+    - ERA — empirical-software search: algo-era.md
+    - PromptBreeder — genetic prompts: algo-promptbreeder.md
+    - AFlow — workflow search: algo-aflow.md
+    - Reflexion — episodic memory: algo-reflexion.md
+    - Self-Refine — feedback refinement: algo-self-refine.md
+    - TextGrad — textual gradients: algo-textgrad.md
+    - Voyager — skill library: algo-voyager.md
+    - SkillWeaver — web APIs: algo-skillweaver.md
+    - Absolute Zero — zero-data self-play: algo-absolute-zero.md
+    - R-Zero — challenger/solver: algo-r-zero.md
+    - Agent0 — tool curriculum: algo-agent0.md
+    - SICA — self-edit: algo-sica.md
+    - Gödel Agent — self-modification: algo-godel-agent.md
+    - Genesis — persistent recursive worlds: algo-genesis.md
+    - RRSI — regularized harness selection: algo-rrsi.md
+  - Design records:
+    - Evolving a directory: design-directory-evolution.md
+    - Plugin for DSH, Claude Code, Codex and other agents: plugin-design.md
+    - Meta-evolution — evolving the slots: design-meta-evolution.md
+
+markdown_extensions:
+  - admonition
+  - meta
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra_css:
+  - assets/experience.css
+  - assets/quickstart.css
+  - assets/docs-theme.css
+extra_javascript:
+  - assets/experience.js
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ThinkFlowLab/agentdescent

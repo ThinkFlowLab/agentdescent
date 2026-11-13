@@ -1,0 +1,656 @@
+"""The command-line contract shared by the faithful algorithm ports.
+
+Algorithm-specific vocabulary stays in each port. In particular, iteration
+flags such as ``--rounds``, ``--generations``, ``--iterations``, and ``--steps``
+must not be normalised here: they are part of the upstream algorithm's language.
+
+Declaring a flag in one place is only half of a contract -- the code that
+*honours* it has to live here too, or a port can grow a ``--yes`` it never reads
+and every test still passes. So the behaviours behind the shared flags are
+functions, not prose: ``confirm`` for ``--yes``, ``completion_for`` for
+``--provider``/``--model``, ``worker_count`` for ``--serial``, and the early
+``--dry-run`` return that each port's ``main`` performs before touching data.
+
+``score_tasks`` is here for the same reason: every port had written the same
+sequential held-out loop, and every port paid the same silent wall-clock for it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import threading
+from typing import Callable, Dict, Mapping, Optional
+
+from agentdescent.agents import Usage, claude, openai_compatible
+
+
+PROVIDER_CHOICES = ("claude", "claude-cli", "openai", "glm")
+# Providers served by the OpenAI-compatible adapter; 'glm' is a legacy alias.
+OPENAI_COMPATIBLE = ("openai", "glm")
+DEFAULT_MODEL = "claude-haiku-4-5"
+
+
+def add_standard_args(
+    parser: argparse.ArgumentParser,
+    *,
+    model_default: Optional[str] = DEFAULT_MODEL,
+    model_help: str = "model id",
+    max_seconds_default: float = 30.0,
+    max_tokens_default: Optional[int] = None,
+    timeout_default: Optional[float] = None,
+    async_ratio_default: int = 3,
+    eval_concurrency_default: Optional[int] = 8,
+    include_val_cap: bool = True,
+) -> argparse.ArgumentParser:
+    """Add the provider/runtime flags shared by every algorithm port.
+
+    Defaults that describe an algorithm's measured setup remain caller-owned.
+    DGM, for example, deliberately defaults ``model`` to ``None`` because its
+    surrogate can run without an API, while async wall-clock budgets differ by
+    workload.
+
+    ``async_ratio_default`` is caller-owned for the same reason: the lag budget
+    counts *artifact versions*, so how much wall-clock it buys depends entirely
+    on how long the caller's rollout takes. Three is sensible when a rollout is
+    a model call taking seconds; :mod:`examples._method_runner` sets one,
+    because that is the value every row in ``bench/results/`` was measured at.
+
+    ``eval_concurrency_default=None`` says "this runner has a rule of its own;
+    only override it when the flag is given". The MethodPolicy runner needs
+    that: its ``--serial`` control scores the gate one task at a time, and a
+    plain default of 8 would quietly make the control arm partly parallel --
+    the confound ``bench/matrix_run.py`` already documents for the other ports.
+
+    ``include_val_cap=False`` withholds ``--val-cap`` from a port whose splits
+    are frozen before the parser ever runs. Accepting it there would be exactly
+    the defect this module exists to prevent: a flag that parses, reports
+    nothing, and moves nothing.
+    """
+    parser.add_argument(
+        "--provider",
+        default="claude",
+        choices=PROVIDER_CHOICES,
+        help=("claude via the API, `claude-cli` via the locally "
+              "authenticated Claude Code binary, or any OpenAI-compatible "
+              "endpoint (DeepSeek, GLM, vLLM, ...) via OPENAI_BASE_URL + "
+              "OPENAI_API_KEY; 'glm' is a legacy alias"),
+    )
+    parser.add_argument("--model", default=model_default, help=model_help)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--async",
+        dest="asynchronous",
+        action="store_true",
+        help="run barrier-free (async_evolve)",
+    )
+    parser.add_argument(
+        "--async-ratio", type=int, default=async_ratio_default,
+        help=f"staleness lag budget (default {async_ratio_default})")
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=max_seconds_default,
+        help="async wall-clock budget",
+    )
+    parser.add_argument(
+        "--pipelined-gate",
+        action="store_true",
+        help=("--async only: run a merge's measurement phase on its own threads "
+              "instead of on the merger, so the merger keeps draining while the "
+              "gate runs (see async_evolve(pipelined_gate=))"),
+    )
+    parser.add_argument(
+        "--gate-workers", type=int, default=2,
+        help="threads for --pipelined-gate (default 2)")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the plan without loading data or accessing the network",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip confirmation before real model API calls",
+    )
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="run the upstream algorithm's own semantics: one worker, no merge",
+    )
+    parser.add_argument(
+        "--budget-rollouts",
+        type=int,
+        default=None,
+        help=("total rollouts, held fixed as workers vary -- required to compare "
+              "--serial against a parallel run (see budget_kwargs)"),
+    )
+    if include_val_cap:
+        parser.add_argument(
+            "--val-cap",
+            type=int,
+            default=None,
+            help=("cap the gate/D_pareto split without shrinking test -- the only "
+                  "lever on the rollout/evaluation ratio (see capped_val)"),
+        )
+    parser.add_argument(
+        "--eval-concurrency",
+        type=int,
+        default=eval_concurrency_default,
+        help=("held-out evaluations in flight at once; wall-clock only"
+              + (" -- unset, the runner's own rule applies"
+                 if eval_concurrency_default is None
+                 else f" (default {eval_concurrency_default})")),
+    )
+    parser.add_argument(
+        "--reflective-merge",
+        action="store_true",
+        help=("merge contradicting diffs with a model instead of ranking them on "
+              "the cheap layer (see agentdescent.fusion.reflective_merge)"),
+    )
+    parser.add_argument(
+        "--eval-cache",
+        default="",
+        metavar="DIR",
+        help=("memoise held-out evaluations to this directory, shared across "
+              "processes (see eval_cache_kwargs). Off by default: a cache that "
+              "outlives the run changes what a rerun measures"),
+    )
+    parser.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help=("ask the backend not to emit reasoning tokens (Anthropic-shaped "
+              "endpoints only). A throughput knob, and a quality one -- see "
+              "completion_for"),
+    )
+    # Opt-in, by naming a default. Nine ports already declare `--max-tokens`
+    # themselves, each with a number it measured -- 4096, 16000, 32000 -- and
+    # declaring it here unconditionally is an argparse conflict that takes those
+    # ports' entry points down at import. So a port that wants the shared flag asks
+    # for it, the way `include_val_cap` withholds one from a port whose splits are
+    # already frozen.
+    if max_tokens_default is not None:
+        parser.add_argument(
+            "--max-tokens",
+            type=int,
+            default=max_tokens_default,
+            help=(f"output-token cap for one model call (default "
+                  f"{max_tokens_default}). Raise it for a reasoning model, whose "
+                  f"thinking is spent from the same budget -- see completion_for"),
+        )
+    if timeout_default is not None:
+        parser.add_argument(
+            "--timeout",
+            type=float,
+            default=timeout_default,
+            help=(f"seconds for one model call (default {timeout_default:g}). A "
+                  f"reasoning model given a large --max-tokens legitimately exceeds "
+                  f"120s, and the retry wrapper turns each timeout into three"),
+        )
+    return parser
+
+
+def merge_kwargs(args: argparse.Namespace, complete) -> dict:
+    """``policies=`` for ``--reflective-merge``, or nothing.
+
+    The default aggregator resolves a contradiction by **scoring both sides on
+    the cheap layer and dropping the loser**. On a one-key artifact -- GEPA's
+    ``InstructionSlot``, and so this dataset -- *every* pair of proposals
+    contradicts, so that ranking runs on every pair, every round, and the merge
+    step it feeds then has a single candidate and never merges at all.
+
+    :func:`~agentdescent.fusion.reflective_merge` replaces both halves of that:
+    :class:`~agentdescent.fusion.KeepContradictions` stops the pairwise scoring,
+    and :class:`~agentdescent.fusion.ReflectiveFusion` asks a model for the
+    **union of the deltas** and hands it straight to the acceptance gate. One
+    model call in place of a sweep per pair, and the round's proposals survive
+    together instead of all but one being dropped.
+
+    It is a change to *how diffs are merged*, which is the column
+    ``docs/port-fidelity.md`` calls changeable -- but it is not free of meaning:
+    the union that goes forward is not the pairwise winner, so a row measured
+    with this on has to say so.
+    """
+    if not getattr(args, "reflective_merge", False):
+        return {}
+    from agentdescent import Policies
+    from agentdescent.fusion import reflective_merge
+    return {"policies": Policies(**reflective_merge(complete))}
+
+
+def capped_val(trainval, val_frac: float, val_cap: Optional[int]):
+    """Trim the gate's split without touching train or test.
+
+    The loaders split at fixed ratios, so a ``--fetch``/``--pool`` knob moves all
+    three at once -- and the two that matter pull in **opposite** directions.
+    **val** is what a run costs: every admitted candidate is scored across it, so
+    it multiplies by every proposal. **test** is what a run can *resolve*: it is
+    scored once, at the end, and a split under 20 tasks cannot separate anything.
+    Chasing a 20-task test split by raising the fetch buys a 20-task gate nobody
+    asked for.
+
+    Measured on GEPA/HotpotQA: a rollout costs 3 model calls and the D_pareto
+    sweep it triggers costs ``len(val)``. At ``val=20`` the rollout is 3/23 of the
+    work, so the part ``n_workers`` can parallelise is 13% of the run and the
+    speedup ceiling is ~1.13x **whatever the budget** -- both sides scale
+    together. Halving val is the only lever that moves that ratio.
+
+    ``evolve()`` splits by position -- the last ``held_out_frac`` of the sequence
+    -- so capping is a slice of the tail plus a recomputed fraction. Train keeps
+    everything the cap drops rather than discarding it.
+
+    The gate gets noisier, and that is a real cost rather than a free one:
+    acceptance decisions rest on fewer tasks. Lifted from
+    ``bench/baselines_run.py``, where the equal-budget work needed exactly this.
+    """
+    if not val_cap:
+        return list(trainval), val_frac
+    n = len(trainval)
+    n_val = max(1, round(n * val_frac))
+    if n_val <= val_cap:
+        return list(trainval), val_frac
+    train, val = list(trainval[:n - n_val]), list(trainval[n - n_val:])
+    kept, spare = val[:val_cap], val[val_cap:]
+    tasks = train + spare + kept          # the cap's leftovers become train
+    return tasks, len(kept) / len(tasks)
+
+
+def budget_kwargs(args: argparse.Namespace) -> dict:
+    """``max_rollouts=`` for ``evolve()``, or nothing when no budget was asked for.
+
+    **A speedup measured without this is not a speedup.** Six of the eight ports
+    pass a fixed ``rounds`` and let ``n_workers`` multiply it, so an ``N=8`` arm
+    performs *eight times* the rollouts of the ``--serial`` arm. Comparing their
+    wall-clocks then reports eight times the model spend as parallel efficiency,
+    and comparing their final quality credits the extra spend to parallelism.
+    That is the confound :mod:`agentdescent.baselines` exists to remove, and
+    ``docs/results.md`` already carries a warning that a speedup table cannot
+    distinguish merging from sampling.
+
+    OpenEvolve is the exception and got it right on its own: it derives
+    ``rounds = iterations // workers``, so its total work is fixed and workers
+    only change how it is divided. That is why its speedup row means something
+    different from the other six unless they are budgeted -- which is a fact the
+    matrix has to state, not one a reader should have to find.
+
+    The engine has enforced this since ``evolve(max_rollouts=)`` shipped, and no
+    port passed it. Left ``None`` by default, because a port run on its own is
+    not a comparison and should keep the configuration its own docs describe;
+    the moment two arms are compared, both need it.
+
+    The synchronous path checks at the round barrier, so an ``N`` -worker arm
+    overshoots by up to ``N-1`` rollouts. ``result.rollouts`` is what was
+    actually spent -- report that rather than the budget.
+    """
+    return ({"max_rollouts": args.budget_rollouts}
+            if getattr(args, "budget_rollouts", None) else {})
+
+
+def report_engine(result) -> None:
+    """Print the engine's own counters in the one format the matrix parses.
+
+    ``bench/matrix_run.py`` reads a port through its stdout, and until this line
+    existed the ports printed *their* numbers (test score, usage) but never the
+    engine's: measured rollouts rather than the budget, and staleness with its
+    denominator. The async arm's quality column is unreadable without the
+    latter -- "the score dropped" with no ``stale_discarded`` beside it cannot
+    distinguish a lag-budget problem from a reflector problem, which need
+    opposite fixes. One shared implementation, because seven hand-rolled copies
+    of a parsed format is how the ACE ``model usage  :`` two-space bug happened.
+    """
+    print(f"engine counters: rollouts={result.rollouts}  "
+          f"stale_considered={result.stale_considered}  "
+          f"stale_discarded={result.stale_discarded}  "
+          f"redispatched={result.redispatched}", flush=True)
+    # The stage profile, on the same one-line format and for the same reason the
+    # line above exists: without it "the async arm got faster" cannot be told
+    # apart from "the gate stopped running". `merge_gate_seconds` is a subset of
+    # `merge_seconds`, and `worker_starved_seconds` is summed across workers --
+    # see `EvolutionResult.gate_share()` / `.merger_occupancy()`.
+    print(f"stage profile: wallclock={result.wallclock:.1f}  "
+          f"merge_seconds={result.merge_seconds:.1f}  "
+          f"merge_gate_seconds={result.merge_gate_seconds:.1f}  "
+          f"worker_starved_seconds={result.worker_starved_seconds:.1f}  "
+          f"eval_seconds={result.eval_seconds:.1f}", flush=True)
+
+
+def eval_cache_kwargs(args: argparse.Namespace) -> dict:
+    """``policies=Policies(eval_cache=...)`` for ``--eval-cache``, or nothing.
+
+    The engine has shipped :class:`~agentdescent.evalcache.FileCache` -- "two
+    processes on one machine stop paying twice for the same gate" -- and every
+    port used the in-process default, so every gate was re-paid on every run.
+
+    ADAS is the clearest case: its seed archive is seven *hand-designed* programs
+    scored over the whole validation split before round 0, and each program is
+    itself several model calls, so a run begins by spending several hundred calls
+    on an evaluation whose inputs never change. A three-arm, three-seed sweep pays
+    that nine times, and a calibration session pays it once per attempt.
+
+    Off by default, and that is not timidity: a persistent cache makes a rerun
+    return the first run's numbers. That is exactly what you want while sizing a
+    configuration and exactly what you do not want when the question is run-to-run
+    variance -- which, on these workloads, is often the question. Turn it on for
+    a sweep whose cells share a dataset and a seed; leave it off when measuring
+    spread.
+    """
+    directory = getattr(args, "eval_cache", "")
+    if not directory:
+        return {}
+    from agentdescent import Policies
+    from agentdescent.evalcache import FileCache
+    return {"policies": Policies(eval_cache=FileCache(directory))}
+
+
+def is_openai_compatible(args: argparse.Namespace) -> bool:
+    """Whether ``--provider`` selects the OpenAI-compatible adapter."""
+    return args.provider in OPENAI_COMPATIBLE
+
+
+def confirm(args: argparse.Namespace) -> bool:
+    """Whether the run may proceed to real model API calls.
+
+    Honours ``--yes``, and treats a non-interactive stdin as consent so a port
+    stays scriptable in CI. Prints ``aborted.`` when the answer is no, so the
+    caller only has to ``return``.
+    """
+    if args.yes or not sys.stdin.isatty():
+        return True
+    if input("\nProceed with real API calls? [y/N] ").strip().lower() in ("y", "yes"):
+        return True
+    print("aborted.")
+    return False
+
+
+def score_tasks(solve, artifact: str, tasks, reward, *,
+                concurrency: int = 8) -> float:
+    """Score an artifact on a task list, concurrently.
+
+    Every port reports a final held-out number by looping over the split one task
+    at a time. That is the *reported metric*, so it runs after `evolve()` returns
+    and outside everything the engine parallelises -- `eval_concurrency` bounds
+    the gate and never reaches here. On a reasoning model at ~38s a call, a
+    20-task split is thirteen minutes of wall-clock per scoring pass, in silence,
+    and a sweep pays it twice per arm: once for `final_reward` and once for the
+    test split.
+
+    Concurrency changes no result. Each task is scored independently, `reward` is
+    pure, and the sum is order-independent -- so this is wall-clock only, which is
+    why it is a plain default rather than a knob a caller has to discover.
+
+    Sequential below two tasks, so a small split does not pay for a pool.
+    """
+    tasks = list(tasks)
+    if not tasks:
+        return 0.0
+    if len(tasks) < 2 or concurrency < 2:
+        return sum(reward(t, solve(artifact, t)) for t in tasks) / len(tasks)
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(tasks))) as pool:
+        outputs = list(pool.map(lambda t: solve(artifact, t), tasks))
+    return sum(reward(t, o) for t, o in zip(tasks, outputs)) / len(tasks)
+
+
+def worker_count(args: argparse.Namespace, requested: int) -> int:
+    """The number of workers to run, after ``--serial``.
+
+    Every port here parallelises an algorithm that was published as a **serial**
+    loop, and until this flag existed none of them could run that loop. So every
+    claim about parallelising them -- speedup, and more importantly whether the
+    final quality survives -- had no baseline in the repository at all. A speedup
+    without the serial arm is a measurement of nothing.
+
+    One worker, and the merge that goes with it disappears: with a single
+    proposal per step there is nothing to fuse and nothing to resolve, which is
+    what makes this the upstream semantics rather than a narrow version of ours.
+
+    Refused together with ``--async``, loudly. The barrier-free runtime's
+    concurrency *is* ``n_workers``, so ``--serial --async`` is not the upstream
+    algorithm: it is a one-worker asynchronous run, where a diff can still be
+    proposed against a head the merger has since moved. Reporting that as the
+    serial baseline would put staleness into the control arm, which is the one
+    place it must not be.
+    """
+    if not getattr(args, "serial", False):
+        return requested
+    if getattr(args, "asynchronous", False):
+        raise SystemExit(
+            "--serial and --async are contradictory: the barrier-free runtime's "
+            "concurrency is n_workers, so --serial --async is a one-worker "
+            "asynchronous run rather than the upstream serial algorithm -- its "
+            "diffs can still go stale against a moved head. Drop one of them.")
+    return 1
+
+
+#: Variables that hand the Claude Code CLI a provider the *host* chose.
+#:
+#: A managed Claude Code session -- the web app, a CI runner, a cloud container -- does
+#: not authenticate the way a laptop does. Instead of an API key it is handed a session
+#: ingress: a URL and a short-lived token the harness holds. `CLAUDE_CODE_REMOTE` is
+#: what puts the CLI in that mode, and in that mode it uses the ingress and **ignores
+#: whatever credentials are in the environment**. Which is the right default -- it stops
+#: a stray `ANTHROPIC_API_KEY` from silently redirecting a managed session's traffic.
+#:
+#: It also makes it impossible to point a *child* CLI somewhere else from inside such a
+#: session, which is exactly what `--executor claude-code` does. The child inherits the
+#: variable, ignores the `ANTHROPIC_BASE_URL` and key it was given, and 401s. What it
+#: reports is "Authentication error · This may be a temporary network issue, please try
+#: again" -- neither temporary nor a network issue. A run of 28 sessions failed 23 of
+#: them and wrote zero files this way, and the accompanying stderr
+#: (`[claude-code:unrecognized_model] ... "query_source":"generate_session_title"`) is a
+#: red herring: that is the session-title side query, not the agent turn, and it is
+#: emitted just the same on runs that work.
+#:
+#: `CLAUDE_CODE_REMOTE` alone is the switch -- measured, by bisection, against a
+#: third-party Anthropic-compatible endpoint. The rest is the same host's plumbing for
+#: the same decision; dropping it too costs nothing and does not leave a child half in
+#: one mode and half in the other.
+HOST_PROVIDER_VARS = (
+    "CLAUDE_CODE_REMOTE",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
+    "SESSION_INGRESS_URL",
+    "CLAUDE_CODE_POST_FOR_SESSION_INGRESS_V2",
+)
+
+
+def cli_env(base_url: Optional[str] = None, api_key: Optional[str] = None,
+            env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """The environment to spawn a Claude Code CLI child in.
+
+    Pass through unchanged unless an endpoint is actually being overridden. When one
+    is -- either explicitly here, or because the surrounding environment already names
+    a non-Anthropic `ANTHROPIC_BASE_URL` -- drop :data:`HOST_PROVIDER_VARS` so the
+    child reads the key it was given rather than the host's session ingress, and set
+    both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`, since which one a given
+    endpoint wants is not something worth discovering twice.
+
+    Nothing here writes a credential anywhere but this process's child: the key comes
+    from the environment and goes into an `env=` dict.
+    """
+    out = dict(os.environ if env is None else env)
+    url = base_url or out.get("ANTHROPIC_BASE_URL", "")
+    key = api_key or out.get("ANTHROPIC_API_KEY") or out.get("ANTHROPIC_AUTH_TOKEN")
+    third_party = url and "api.anthropic.com" not in url
+    if not third_party:
+        return out
+    for name in HOST_PROVIDER_VARS:
+        out.pop(name, None)
+    out["ANTHROPIC_BASE_URL"] = url
+    if key:
+        out["ANTHROPIC_API_KEY"] = key
+        out["ANTHROPIC_AUTH_TOKEN"] = key
+    return out
+
+
+def claude_cli(model: str = "haiku", *, usage: Optional[Usage] = None,
+               timeout: float = 300.0, binary: str = "claude"):
+    """A ``Completion`` that shells out to the locally authenticated Claude Code CLI.
+
+    The SDK path needs an ``ANTHROPIC_API_KEY``. The CLI is authenticated another way
+    entirely -- an OAuth session, a subscription, a corporate login -- and on a machine
+    where that is the credential that exists, there was no way to run a port at all.
+    A one-shot `claude -p` with every tool denied is a plain prompt-to-text function,
+    which is exactly what a ``Completion`` is.
+
+    Two honest caveats, because they change the output and not only the plumbing. The
+    CLI wraps the prompt in **its own** system prompt, its tool definitions and any
+    `CLAUDE.md` it finds, so a call carries tens of thousands of cached input tokens
+    that the API path would not, and the reply is coloured by an agent harness rather
+    than being a bare completion. And the cost lands on the CLI's credentials, not on
+    an API key any budget flag here can see.
+    """
+    import json as _json
+    import subprocess
+    import time
+
+    def complete(prompt: str) -> str:
+        argv = [binary, "-p", "--output-format", "json", "--model", model,
+                "--max-turns", "1", "--allowedTools", ""]
+        started = time.time()
+        try:
+            done = subprocess.run(argv, input=prompt, capture_output=True, text=True,
+                                  timeout=timeout, env=cli_env())
+        except FileNotFoundError as exc:
+            if usage is not None:
+                usage.record(failed=True, seconds=time.time() - started)
+            raise RuntimeError(
+                f"{binary!r} is not on PATH; install the Claude Code CLI or "
+                f"pass --provider claude / openai instead"
+            ) from exc
+        except subprocess.TimeoutExpired:
+            if usage is not None:
+                usage.record(failed=True, seconds=time.time() - started)
+            raise RuntimeError(f"{binary} timed out after {timeout:.0f}s")
+        elapsed = time.time() - started
+        if done.returncode != 0:
+            if usage is not None:
+                usage.record(failed=True, seconds=elapsed)
+            raise RuntimeError(f"{binary} exited {done.returncode}: "
+                               f"{(done.stderr or '').strip()[:300]}")
+        try:
+            envelope = _json.loads(done.stdout)
+        except ValueError:
+            if usage is not None:
+                usage.record(failed=True, seconds=elapsed)
+            raise RuntimeError(f"{binary} did not return JSON: "
+                               f"{done.stdout.strip()[:300]}")
+        if envelope.get("is_error"):
+            if usage is not None:
+                usage.record(failed=True, seconds=elapsed)
+            raise RuntimeError(f"{binary} reported an error: "
+                               f"{str(envelope.get('result'))[:300]}")
+        if usage is not None:
+            counts = envelope.get("usage") or {}
+            # Cache reads and cache writes are prompt tokens that were really sent;
+            # `input_tokens` alone counts only the uncached remainder and would report
+            # 10 for a call that carried 28,000.
+            usage.record(prompt_tokens=sum(int(counts.get(k) or 0) for k in
+                                           ("input_tokens",
+                                            "cache_creation_input_tokens",
+                                            "cache_read_input_tokens")),
+                         completion_tokens=int(counts.get("output_tokens") or 0),
+                         seconds=elapsed)
+        return envelope.get("result") or ""
+
+    return complete
+
+
+class ConcurrencyGauge:
+    """How many model calls were actually in flight at once, and at most.
+
+    `Usage` records calls, tokens and seconds, and none of those answer "how hard did
+    this run lean on the endpoint". The arithmetic that looks like it should --
+    `usage.seconds / wallclock` -- does not: `seconds` covers the whole process
+    including phases that run before `evolve()` does, while the `wallclock` a stage
+    profile reports covers only the stage, so the ratio comes out above the worker
+    count and means nothing. This counts the thing directly.
+
+    `agentdescent/` is not the place for it: the engine's concurrency is its own
+    business and an example asking what it *observed* is the example's business.
+    """
+
+    __slots__ = ("peak", "_live", "_lock")
+
+    def __init__(self) -> None:
+        self.peak = 0
+        self._live = 0
+        self._lock = threading.Lock()
+
+    def wrap(self, complete: Callable[[str], str]) -> Callable[[str], str]:
+        def gauged(prompt: str) -> str:
+            with self._lock:
+                self._live += 1
+                if self._live > self.peak:
+                    self.peak = self._live
+            try:
+                return complete(prompt)
+            finally:
+                with self._lock:
+                    self._live -= 1
+
+        return gauged
+
+
+def completion_for(args: argparse.Namespace, *, usage: Optional[Usage] = None,
+                   **kwargs):
+    """Build the ``Completion`` that ``--provider`` and ``--model`` select.
+
+    Extra keyword arguments reach whichever factory is chosen, so pass only
+    options both accept; branch in the caller for genuinely one-sided ones (ADAS
+    does this for the OpenAI-only ``--timeout``).
+
+    ``--no-thinking`` becomes ``thinking={"type": "disabled"}`` on the Anthropic
+    path, where the endpoint's reasoning preamble dominates latency. Measured on
+    GLM-5.2 behind an Anthropic-shaped endpoint: a GEPA reflective-proposal call
+    went 23.5s -> 5.4s and 783 output tokens -> 37, and both replies were usable
+    instructions -- the shorter one simply terser. **That is a change to the
+    model's output, not only its speed**, so a run that uses it has to say so:
+    it belongs in the reported configuration next to the model id, and it must
+    be identical across every arm of a comparison or the arms are not comparable.
+
+    Silently ignored on the OpenAI-compatible path rather than translated. The
+    equivalent knob there is per-vendor (``enable_thinking``,
+    ``chat_template_kwargs``, a ``/no_think`` prefix), and guessing wrong would
+    leave reasoning *on* while the run reports it off -- which is the failure
+    that matters, since the wall-clock would then be attributed to the scheduler.
+    """
+    gauge = getattr(args, "_concurrency", None)
+    if args.provider == "claude-cli":
+        if getattr(args, "no_thinking", False):
+            # Silently dropping it is the failure this module exists to prevent: the
+            # run would report thinking off while the CLI kept it on.
+            print("note: --no-thinking has no effect with --provider claude-cli; the "
+                  "CLI decides its own reasoning budget", file=sys.stderr)
+        if getattr(args, "max_tokens", None):
+            print("note: --max-tokens has no effect with --provider claude-cli; the "
+                  "CLI sets its own output cap", file=sys.stderr)
+        built = claude_cli(model=args.model, usage=usage,
+                           timeout=float(getattr(args, "timeout", None) or 300.0))
+        return gauge.wrap(built) if gauge is not None else built
+    if is_openai_compatible(args):
+        if getattr(args, "max_tokens", None):
+            kwargs.setdefault("max_tokens", int(args.max_tokens))
+        built = openai_compatible(model=args.model, usage=usage, **kwargs)
+        return gauge.wrap(built) if gauge is not None else built
+    if getattr(args, "no_thinking", False):
+        kwargs.setdefault("thinking", {"type": "disabled"})
+    # A reasoning model spends `max_tokens` on thinking *first* and emits visible
+    # content from what is left, so the default 4096 is not 4096 of answer. Measured:
+    # deepseek-v4-flash answering this package's architect prompt at the default
+    # returned 1708 characters of a JSON object and stopped mid-word -- unparsable,
+    # and the run reported "architect designed 0 nodes, 1 replies unusable" rather
+    # than anything that looked like a token cap. Turning thinking off is the other
+    # lever and a worse one: it changes what the model produces, not just how much.
+    if getattr(args, "max_tokens", None):
+        kwargs.setdefault("max_tokens", int(args.max_tokens))
+    # --timeout reaches this path too: claude()'s 120s default assumes Claude
+    # latencies, and a thinking model behind an Anthropic-shaped endpoint
+    # (GLM-5.2 on GSM-Hard) legitimately exceeds it -- a baseline eval died at
+    # 120s x 3 retries before any evolution happened.
+    if getattr(args, "timeout", None):
+        kwargs.setdefault("timeout", float(args.timeout))
+    built = claude(model=args.model, usage=usage, **kwargs)
+    return gauge.wrap(built) if gauge is not None else built

@@ -1,0 +1,733 @@
+"""Git-backed versioned Ledger (design doc, sections 3.1 and 4.5).
+
+The Ledger is the "parameter server" of the framework, with one crucial extra
+property that a classic parameter server lacks: a *commit history*.  That extra
+semantics is exactly what makes rebase / staleness handling possible (design
+doc, section 1, precision boundary #1).
+
+Concretely:
+
+* Each artifact is stored as a JSON blob under ``artifacts/<id>.json`` in a real
+  git repository.
+* A per-artifact integer version is kept in ``versions.json`` and bumped on every
+  commit that touches the artifact.  The collection of these integers is the
+  *version vector* that diffs are stamped against.
+* Two branches exist: ``dev`` (fast branch, absorbs everything that passes the
+  statistical test) and ``stable`` (slow branch, an EMA-style confirmation of
+  dev -- design doc, section 4.5).
+* Commits use compare-and-swap: a writer declares the base version it read, and
+  the commit is rejected if the head has moved past it.  Multi-artifact
+  contract-breaking diffs commit atomically (2PC-style: stage all, then a single
+  git commit).
+
+Because AgentDescent's reference implementation runs the workers in-process, the
+git operations are serialized through a single lock; the CAS check is what makes
+the *logical* concurrency safe.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from contextlib import contextmanager
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+from .evolvable import Diff, Evolvable, VersionVector
+
+
+class CASConflict(Exception):
+    """Raised when a commit's declared base version is stale."""
+
+
+class ContractRejected(Exception):
+    """Raised when a commit would change an artifact's contract major.
+
+    An artifact's :class:`~agentdescent.evolvable.Contract` is what *other*
+    artifacts depend on. Bumping its major is a breaking change, and letting one
+    through the ordinary commit path would silently invalidate every dependant --
+    so it is refused here and has to go through a deliberate re-registration."""
+
+
+# A serializer turns an Evolvable into a JSON-friendly dict; the deserializer
+# reconstructs it.  The ledger is otherwise domain-agnostic.
+Serializer = Callable[[Evolvable], dict]
+Deserializer = Callable[[str, int, dict], Evolvable]
+
+
+@dataclass
+class Snapshot:
+    """An immutable view of one branch at one point in time."""
+
+    artifacts: Dict[str, Evolvable]
+    version: VersionVector
+
+    def get(self, artifact_id: str) -> Optional[Evolvable]:
+        return self.artifacts.get(artifact_id)
+
+
+class GitError(RuntimeError):
+    """A git command failed; the message carries git's own stderr."""
+
+
+#: What a ledger read or write can fail with -- a third category alongside
+#: ``ContractError`` (a caller bug: propagate) and a backend failure (absorb and
+#: report). The ledger is *infrastructure*: a held ``index.lock``, a full
+#: ``$TMPDIR``, a killed ``git``. Its failure ends the run but must still leave a
+#: partial result behind, so the drivers catch this tuple rather than letting it
+#: escape (which used to discard a completed run -- even when the failing call was
+#: only fetching the cosmetic ``ledger_log``).
+LedgerFailure = (GitError, OSError, json.JSONDecodeError)
+
+
+# Config the ledger imposes on every invocation, overriding whatever the user has
+# in ~/.gitconfig. These commits are the ledger's bookkeeping, not the user's, and
+# a scratch repo in $TMPDIR has no business honouring personal git preferences:
+# `commit.gpgsign = true` -- a common setting -- failed the genesis commit, so
+# `evolve()` raised before running a single task, from a call that mentions git
+# nowhere. `core.hooksPath` would likewise run the user's pre-commit hook against
+# a temp directory it knows nothing about.
+_GIT_OVERRIDES = (
+    "-c", "commit.gpgsign=false",
+    "-c", "tag.gpgsign=false",
+    "-c", "core.hooksPath=",
+    "-c", "gc.auto=0",
+)
+# 120s is enormous for the operations here (all local, all tiny) and exists only
+# so a wedged git -- an NFS stall, a held index.lock -- surfaces as a GitError
+# instead of hanging the process. Every call holds the ledger lock, so one
+# blocked git would otherwise stall every worker.
+_GIT_TIMEOUT = 120.0
+
+
+def _git(repo: str, *args: str) -> str:
+    """Run a git command, surfacing *why* it failed.
+
+    ``capture_output=True`` swallows stderr, so a failure used to read only
+    "returned non-zero exit status 128" -- the actual cause (a missing repo, an
+    index lock held by another process) was discarded.
+
+    The environment is isolated (see ``_GIT_OVERRIDES``): system and user config
+    must not decide whether the ledger can write, and ``GIT_TERMINAL_PROMPT=0``
+    keeps a credential prompt from wedging a run that has no terminal.
+    """
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, *_GIT_OVERRIDES, *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            env=env,
+        )
+    except FileNotFoundError as e:
+        # Otherwise a machine without git fails with a bare OSError traceback,
+        # while every other missing-executable path in the package names it.
+        raise GitError(
+            "'git' is not installed or not on PATH; the Ledger stores artifacts "
+            "in a git repository, so it is required") from e
+    except subprocess.TimeoutExpired as e:
+        raise GitError(
+            f"git {' '.join(args)} in {repo} exceeded {_GIT_TIMEOUT}s and was "
+            "abandoned (a held index.lock or a stalled filesystem)") from e
+    if out.returncode != 0:
+        detail = (out.stderr or out.stdout or "").strip() or "no output"
+        raise GitError(f"git {' '.join(args)} failed in {repo}: {detail}")
+    return out.stdout.strip()
+
+
+#: Guards the repository between processes. Lives in `.git/` -- see `_exclusive`
+#: -- and is named so a human who finds it knows what left it behind.
+_LOCK_NAME = ".agentdescent-repo.lock"
+
+
+def _replace_file(path: str, data: bytes) -> None:
+    """Atomically put ``data`` at ``path``; never leave the temp sibling behind."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _acquire_file_lock(path: str, timeout: float = 120.0):
+    """Block until this process owns the repository."""
+    try:
+        import fcntl
+    except ImportError:                       # pragma: no cover -- Windows
+        return _acquire_dir_lock(path, timeout)
+    handle = open(path, "w")
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if time.time() >= deadline:
+                handle.close()
+                # `LedgerFailure` is the tuple the drivers catch, not a class --
+                # raising it was a TypeError, so this diagnostic never reached
+                # anyone. TimeoutError is an OSError subclass, so it is still a
+                # member of that tuple and the drivers still catch it.
+                raise TimeoutError(
+                    f"could not lock {path} within {timeout:g}s; another process "
+                    "is holding the ledger. If none is running, remove the file.")
+            time.sleep(0.01)
+
+
+def _release_file_lock(handle, path: str) -> None:
+    if handle is None:
+        return
+    if isinstance(handle, str):               # the directory fallback
+        try:
+            os.rmdir(handle)
+        except OSError:
+            pass
+        return
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):            # pragma: no cover
+        pass
+    handle.close()
+
+
+def _acquire_dir_lock(path: str, timeout: float) -> str:  # pragma: no cover
+    """`mkdir` is atomic everywhere; that is the whole requirement."""
+    directory = path + ".d"
+    deadline = time.time() + timeout
+    while True:
+        try:
+            os.mkdir(directory)
+            return directory
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"could not lock {directory} within {timeout:g}s")
+            time.sleep(0.01)
+
+
+class Ledger:
+    """A git-backed, version-vectored artifact store with dual branches."""
+
+    STABLE = "stable"
+    DEV = "dev"
+
+    def __init__(
+        self,
+        repo_path: str,
+        serialize: Serializer,
+        deserialize: Deserializer,
+        author: str = "agentdescent <bot@agentdescent.local>",
+    ) -> None:
+        self.repo_path = repo_path
+        self._serialize = serialize
+        self._deserialize = deserialize
+        self._author = author
+        self._lock = threading.RLock()
+        self._current_branch: Optional[str] = None   # see _checkout()
+        #: artifact id -> the Contract it was registered with. Commits are checked
+        #: against it, which is the only place the contract mechanism is enforced.
+        self._contracts: Dict[str, Any] = {}
+        self._closed = False
+        self._init_repo()
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def close(self) -> None:
+        """Refuse further use of this ledger. Idempotent.
+
+        A driver that owns a throwaway repo removes it when it returns, but a
+        round abandoned on ``round_timeout`` leaves worker threads running that
+        Python cannot cancel -- and one of those, finishing later, would commit
+        into the deleted directory and *recreate* it (``_write_all`` calls
+        ``makedirs(exist_ok=True)``). Closing first turns that late write into an
+        ordinary error inside the straggler's own thread, where the driver already
+        absorbs it."""
+        with self._lock:
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise GitError(
+                f"this Ledger has been closed and its repository at "
+                f"{self.repo_path} removed; a rollout abandoned by round_timeout "
+                "finished after the run returned")
+
+    # -- repository bootstrap -------------------------------------------------
+
+    def _init_repo(self) -> None:
+        os.makedirs(self.repo_path, exist_ok=True)
+        if not os.path.isdir(os.path.join(self.repo_path, ".git")):
+            _git(self.repo_path, "init", "-q")
+            _git(self.repo_path, "config", "user.name", "agentdescent")
+            _git(self.repo_path, "config", "user.email", "bot@agentdescent.local")
+            os.makedirs(os.path.join(self.repo_path, "artifacts"), exist_ok=True)
+            self._write_versions({})
+            _git(self.repo_path, "add", "-A")
+            _git(self.repo_path, "commit", "-q", "-m", "genesis")
+            # create dev branch off the genesis commit
+            _git(self.repo_path, "branch", "-f", self.DEV)
+            _git(self.repo_path, "branch", "-m", self.STABLE)
+        self._exclude_non_ledger_files()
+
+    def _exclude_non_ledger_files(self) -> None:
+        """Keep `checkpoints/` and `trajectories/` out of the index.
+
+        Both are per-process *derived* data, not ledger state: they live in the
+        working tree, and `_commit` runs `git add -A`. Committed, they break
+        the ledger in two ways. A branch switch *deletes* them -- a dev-only
+        file does not exist on stable -- so a resume finds nothing. Worse, the
+        next round rewrites the now-tracked file, and `checkout` refuses to
+        clobber a modified tracked file: every `snapshot(STABLE)` and
+        `promote_to_stable` after that dies with "local changes would be
+        overwritten".
+
+        ``trajectories/`` is the :mod:`~agentdescent.trajectory` store's home
+        when the engine records rollouts. Rollouts are derived data too, and
+        the same argument applies verbatim: a branch switch must not delete the
+        run's evidence, and a rewrite must not break a checkout.
+
+        The exclusion goes in `.git/info/exclude`, not a working-tree
+        `.gitignore`, for the reason the repo lock lives in `.git/` too: that
+        directory is git's own space and is never part of a branch. A
+        `.gitignore` would itself be committed, would therefore exist on the
+        branch that committed it and not the other, and would come and go with
+        every checkout -- an ignore rule that disappears exactly when a branch
+        switch is what needs it.
+
+        Written on **every** `__init__`, not just at genesis: a ledger created
+        by an earlier version already has its `.git/`, so an init-only write
+        would skip precisely the long-lived repos a resume exists for.
+        (The names mirror `checkpoint.CHECKPOINT_DIR` and the trajectory
+        store's home; spelled out here to keep the ledger free of those
+        imports.)
+        """
+        path = os.path.join(self.repo_path, ".git", "info", "exclude")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path) as f:
+                    existing = set(f.read().splitlines())
+            except FileNotFoundError:
+                existing = set()
+            missing = [rule for rule in ("checkpoints/", "trajectories/")
+                       if rule not in existing]
+            if not missing:
+                return
+            with open(path, "a") as f:
+                for rule in missing:
+                    f.write(f"{rule}\n")
+        except OSError:
+            # A read-only or otherwise hostile `.git/` is not a reason to
+            # refuse the ledger: nothing writes checkpoints or trajectories
+            # unless the caller turned them on, and those paths degrade on
+            # their own.
+            pass
+
+    # -- low-level version bookkeeping ---------------------------------------
+
+    @contextmanager
+    def _exclusive(self):
+        """Hold the repository against other **processes**, not just threads.
+
+        `self._lock` is a `threading.RLock`: it makes one process's workers take
+        turns and says nothing to a second process. Two of those interleave a
+        read-modify-write of `versions.json` and one commit disappears -- the
+        lost update CAS exists to prevent, arriving by a route CAS cannot see,
+        because both writers read the same head and both were right when they
+        read it.
+
+        An advisory file lock, held across read-check-write-commit, makes the
+        section atomic between processes. CAS still does its job: a writer that
+        read the head before the other's commit finds it advanced and is told to
+        rebase.
+
+        `fcntl` where there is one, an atomically-created directory where there
+        is not -- `mkdir` is atomic on every filesystem worth running this on,
+        which is the only property required.
+
+        **This section does not nest.** `self._lock` is an `RLock` and would let
+        the same thread back in, but `flock` is held by an *open file
+        description*: a second `open()` from this process is a different one, so
+        a nested acquire blocks against itself and fails after the timeout rather
+        than deadlocking outright. Every public method holds it exactly once and
+        calls no other public method, which is what keeps that unreachable.
+        """
+        # Inside `.git/`, not the working tree: a lock file in the tree gets
+        # committed by `add -A`, and then blocks the next `checkout` as an
+        # untracked file that would be overwritten. `.git/` is git's own space
+        # and is never part of a branch.
+        path = os.path.join(self.repo_path, ".git", _LOCK_NAME)
+        with self._lock:                      # threads first, and cheaper
+            handle = None
+            try:
+                handle = _acquire_file_lock(path)
+                yield
+            finally:
+                _release_file_lock(handle, path)
+
+    def _versions_path(self) -> str:
+        return os.path.join(self.repo_path, "versions.json")
+
+    def _read_versions(self) -> VersionVector:
+        try:
+            with open(self._versions_path()) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def _write_versions(self, vv: VersionVector) -> None:
+        """Write, then rename. A truncated `versions.json` is a lost ledger.
+
+        `open(..., "w")` truncates first and fills after, so a reader in another
+        process -- or the same one after a crash -- can see an empty or partial
+        file where the version vector should be. Renaming over the target is
+        atomic on POSIX, so a reader sees the old vector or the new one."""
+        self._write_all([self._stage_versions(vv)])
+
+    def _stage_versions(self, vv: VersionVector) -> Tuple[str, str]:
+        return self._versions_path(), json.dumps(vv, indent=2, sort_keys=True)
+
+    def _stage_artifact(self, artifact: Evolvable, version: int) -> Tuple[str, str]:
+        """Encode an artifact's payload without touching the working tree.
+
+        Encoding first is what keeps a serializer refusal (a ``set``, a ``Path``,
+        any non-JSON value) from leaving a torn ``artifacts/<id>.json`` behind:
+        streaming ``json.dump`` into a truncated file used to stop half-way, and
+        the next unrelated commit's ``git add -A`` swept the torn file in, so
+        every later ``snapshot()`` raised (#265)."""
+        payload = {"version": version, "state": self._serialize(artifact)}
+        return (self._artifact_path(artifact.id),
+                json.dumps(payload, indent=2, sort_keys=True))
+
+    def _write_all(self, files: List[Tuple[str, str]]) -> None:
+        """Write every ``(path, text)`` atomically, or leave all as they were.
+
+        Each file goes through a sibling temp and ``os.replace``. If any write
+        fails, the files this call already replaced get their previous bytes
+        back (or are removed if they were new), so a failed operation leaves the
+        working tree exactly as it found it -- nothing half-written for a later
+        ``git add -A`` to commit. That is what makes ``commit_atomic`` all or
+        nothing on disk, not only in its CAS check (#265)."""
+        # switching branches can drop an empty (untracked) artifacts/ dir.
+        os.makedirs(os.path.join(self.repo_path, "artifacts"), exist_ok=True)
+        prior: List[Tuple[str, Optional[bytes]]] = []
+        try:
+            for path, text in files:
+                try:
+                    with open(path, "rb") as f:
+                        old: Optional[bytes] = f.read()
+                except FileNotFoundError:
+                    old = None
+                prior.append((path, old))
+                _replace_file(path, text.encode("utf-8"))
+        except BaseException:
+            for path, old in reversed(prior):
+                try:
+                    if old is None:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    else:
+                        _replace_file(path, old)
+                except OSError:
+                    pass
+            raise
+
+    def _artifact_path(self, artifact_id: str) -> str:
+        return os.path.join(self.repo_path, "artifacts", f"{artifact_id}.json")
+
+    def _checkout(self, branch: str) -> None:
+        """Switch branches, skipping the subprocess when already there.
+
+        Every read (`snapshot`, `head_version`) used to fork a ``git checkout``
+        even when the branch was already current -- ~19 ms each, serialised on
+        ``self._lock``, which capped the whole pipeline at ~50 ledger ops/sec no
+        matter how many workers were running. All callers hold the lock, so this
+        instance is the only writer of the working tree and can track it.
+
+        The cache is safe because every caller reaches this inside
+        :meth:`_exclusive`, which holds the repository against other processes as
+        well as other threads -- so while this instance is looking at the working
+        tree, it is the only thing that is. Before that lock existed, two
+        instances sharing a path raced over the tree and lost commits to git
+        rather than to CAS: `index.lock`, or a checkout refusing to overwrite a
+        file the other had just written.
+        """
+        if self._current_branch == branch:
+            return
+        _git(self.repo_path, "checkout", "-q", branch)
+        self._current_branch = branch
+
+    # -- public API -----------------------------------------------------------
+
+    def register(self, artifact: Evolvable, branch: str = DEV) -> None:
+        """Add a brand-new artifact at version 1 on both branches.
+
+        Also records the artifact's contract, which :meth:`commit` then enforces.
+        Re-registering an existing artifact is a no-op for its state, and is the
+        one supported way to move a contract to a new major."""
+        self._contracts[artifact.id] = getattr(artifact, "contract", None)
+        with self._exclusive():
+            self._ensure_open()
+            for br in (self.STABLE, self.DEV):
+                self._checkout(br)
+                vv = self._read_versions()
+                if artifact.id not in vv:
+                    staged = self._stage_artifact(artifact, version=1)
+                    vv[artifact.id] = 1
+                    self._write_all([staged, self._stage_versions(vv)])
+                    self._commit(f"register {artifact.id}")
+
+    def _dump_artifact(self, artifact: Evolvable, version: int) -> None:
+        self._write_all([self._stage_artifact(artifact, version)])
+
+    def _commit(self, message: str) -> str:
+        _git(self.repo_path, "add", "-A")
+        # allow empty so idempotent registrations do not explode
+        _git(self.repo_path, "commit", "-q", "--allow-empty", "-m", message)
+        return _git(self.repo_path, "rev-parse", "HEAD")
+
+    def snapshot(self, branch: str = DEV) -> Snapshot:
+        """Materialize every artifact on ``branch`` into live Evolvables."""
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(branch)
+            vv = self._read_versions()
+            artifacts: Dict[str, Evolvable] = {}
+            for artifact_id, version in vv.items():
+                with open(self._artifact_path(artifact_id)) as f:
+                    payload = json.load(f)
+                artifacts[artifact_id] = self._deserialize(
+                    artifact_id, payload["version"], payload["state"]
+                )
+            return Snapshot(artifacts=artifacts, version=dict(vv))
+
+    def head_version(self, branch: str = DEV) -> VersionVector:
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(branch)
+            return self._read_versions()
+
+    def commit(
+        self,
+        new_state: Evolvable,
+        base_version: VersionVector,
+        branch: str = DEV,
+        message: str = "",
+    ) -> Tuple[str, int]:
+        """Compare-and-swap commit of a single artifact.
+
+        ``base_version`` is the version the writer read for this artifact.  If
+        the head has advanced past it, :class:`CASConflict` is raised and the
+        caller must rebase (design doc, section 4.2).
+
+        The vector **must** mention this artifact: defaulting a missing entry to
+        the current head would make the check unfalsifiable, so a writer that
+        declared no base would always win -- precisely the lost update CAS
+        exists to prevent."""
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(branch)
+            vv = self._read_versions()
+            aid = new_state.id
+            head = vv.get(aid, 0)
+            if aid not in base_version:
+                raise CASConflict(
+                    f"{aid}: base_version must declare the version this write was "
+                    f"based on (got {dict(base_version)!r}); head={head}")
+            expected = base_version[aid]
+            if head != expected:
+                raise CASConflict(
+                    f"{aid}: head={head} but diff based on {expected}"
+                )
+            self._assert_contract(new_state)
+            new_version = head + 1
+            staged = self._stage_artifact(new_state, new_version)
+            vv[aid] = new_version
+            self._write_all([staged, self._stage_versions(vv)])
+            commit_hash = self._commit(message or f"update {aid} -> v{new_version}")
+            return commit_hash, new_version
+
+    def _assert_contract(self, new_state: Evolvable) -> None:
+        """Refuse a commit that would change the registered contract.
+
+        The check the design calls for and the codebase never made: `Contract`,
+        `Contract.is_compatible_with` and `ContractRejected` all existed, nothing
+        called any of them, and the docstrings described an enforcement that was
+        not there. Comparing against the contract recorded at
+        :meth:`register` needs no change to any serializer.
+
+        The **invariants** are compared too, as defence in depth: the gate reads
+        rules off the base artifact, which the loop writes to the ledger payload
+        -- so a bug that dropped them on the apply/serialize round-trip would
+        silently disable the rule while the run kept counting `invariant_checked`.
+        Refusing a commit whose candidate's invariants differ from the registered
+        (operator-supplied) contract turns that silent evaporation into a loud
+        `ContractRejected`, independent of where the candidate's contract came
+        from. The comparison is by value (``Invariant`` is a frozen dataclass),
+        so a re-registration that moves the major is the sanctioned way to change
+        rules, exactly as before."""
+        known = self._contracts.get(new_state.id)
+        incoming = getattr(new_state, "contract", None)
+        if known is None or incoming is None:
+            return
+        if not known.is_compatible_with(incoming):
+            raise ContractRejected(
+                f"{new_state.id}: contract major {incoming.major} is incompatible "
+                f"with the registered major {known.major}. A breaking contract "
+                "change must be re-registered deliberately, not merged.")
+        if known.invariants != incoming.invariants:
+            raise ContractRejected(
+                f"{new_state.id}: commit would change the registered contract's "
+                f"governance invariants from {list(known.invariants)} to "
+                f"{list(incoming.invariants)}. Invariants are operator-supplied "
+                "and must be changed by re-registering the artifact, not by a "
+                "merged diff.")
+
+    def commit_atomic(
+        self,
+        new_states: List[Evolvable],
+        base_version: VersionVector,
+        branch: str = DEV,
+        message: str = "",
+    ) -> Tuple[str, VersionVector]:
+        """Two-phase, all-or-nothing commit of several artifacts.
+
+        **Not in any engine path.** `evolve()` and both async runtimes register a
+        single artifact, so there is never a second one to commit with. Provided
+        and tested for the multi-artifact library the design targets.
+
+        Used for contract-breaking diffs that must land together with their
+        adapter diffs (design doc, section 6, "atomic adaptation transaction").
+        Phase 1 validates every CAS precondition; phase 2 writes and commits in
+        a single git commit."""
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(branch)
+            vv = self._read_versions()
+            # phase 1: validate all (every id must declare its base -- see commit())
+            for st in new_states:
+                head = vv.get(st.id, 0)
+                if st.id not in base_version:
+                    raise CASConflict(
+                        f"{st.id}: base_version must declare the version this write "
+                        f"was based on (got {dict(base_version)!r}); head={head}")
+                expected = base_version[st.id]
+                if head != expected:
+                    raise CASConflict(
+                        f"{st.id}: head={head} but diff based on {expected}"
+                    )
+            # phase 2: encode all, write all (or none), then one commit
+            staged = []
+            for st in new_states:
+                nv = vv.get(st.id, 0) + 1
+                staged.append(self._stage_artifact(st, nv))
+                vv[st.id] = nv
+            self._write_all(staged + [self._stage_versions(vv)])
+            ids = ",".join(s.id for s in new_states)
+            commit_hash = self._commit(message or f"atomic update {ids}")
+            return commit_hash, dict(vv)
+
+    def promote_to_stable(self, artifact_id: str) -> Optional[int]:
+        """EMA-style confirmation: copy dev's current artifact onto stable.
+
+        Called by the aggregator's dual-branch logic after an artifact has
+        survived ``promote_after_k`` rounds on dev without a commit or a measured
+        regression (design doc, section 4.5). A commit restarts that clock -- the
+        new version has survived nothing yet -- so a *converged* artifact is the
+        one most likely to be promoted, which is the point."""
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(self.DEV)
+            dev_vv = self._read_versions()
+            if artifact_id not in dev_vv:
+                return None
+            with open(self._artifact_path(artifact_id)) as f:
+                payload = json.load(f)
+            dev_state = self._deserialize(
+                artifact_id, payload["version"], payload["state"]
+            )
+            self._checkout(self.STABLE)
+            svv = self._read_versions()
+            nv = svv.get(artifact_id, 0) + 1
+            staged = self._stage_artifact(dev_state, nv)
+            svv[artifact_id] = nv
+            self._write_all([staged, self._stage_versions(svv)])
+            self._commit(f"promote {artifact_id} to stable v{nv}")
+            return nv
+
+    def log(self, branch: str = DEV, limit: int = 20) -> List[str]:
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(branch)
+            out = _git(
+                self.repo_path, "log", f"-{limit}", "--pretty=format:%h %s"
+            )
+            return out.splitlines() if out else []
+
+    # -- multiple live heads (issue #75) --------------------------------------
+    #
+    # `DEV` is the primary head and the one every existing caller reads. A
+    # multi-head run forks additional branches under `HEAD_PREFIX` so that a
+    # caller reading only `dev` still gets the primary head, and `live_heads()`
+    # can find the forks from git itself.
+
+    #: The fork namespace. ``head/0``, ``head/1``, ... are live heads beside
+    #: ``dev``. Not ``dev/0``: git cannot have both a branch ``dev`` (a ref file)
+    #: and ``dev/0`` (which needs ``dev`` to be a ref *directory*).
+    HEAD_PREFIX = "head/"
+
+    def fork(self, name: str, from_branch: str = DEV) -> str:
+        """Create or reset ``name`` to hold ``from_branch``'s current state.
+
+        The branch is a *live head*: workers may be started from it, it has its
+        own version vector, and a commit against it does not touch ``dev``.
+        ``name`` must be a live-head name (``head/<slot>``); forking over
+        ``stable`` or another caller's branch is refused rather than silently
+        repointing it."""
+        if not name.startswith(self.HEAD_PREFIX):
+            raise ValueError(
+                f"fork name must start with {self.HEAD_PREFIX!r}, got {name!r}; "
+                "`dev` and `stable` are not forks and resetting them here would "
+                "move a head other callers are reading.")
+        with self._exclusive():
+            self._ensure_open()
+            self._checkout(from_branch)
+            _git(self.repo_path, "branch", "-f", name)
+            return name
+
+    def live_heads(self) -> List[str]:
+        """Every live head branch: ``dev`` first, then the ``head/`` forks."""
+        with self._exclusive():
+            self._ensure_open()
+            out = _git(self.repo_path, "branch", "--list",
+                       "--format=%(refname:short)")
+            names = [n.strip() for n in (out or "").splitlines() if n.strip()]
+            forks = sorted(n for n in names if n.startswith(self.HEAD_PREFIX))
+            return [self.DEV] + forks
+
+    def discard_head(self, name: str) -> None:
+        """Delete a forked head branch.
+
+        ``dev`` and ``stable`` are refused: deleting them is not a population
+        operation, and a caller who means to reset them should use ``fork``
+        from an explicit source."""
+        if not name.startswith(self.HEAD_PREFIX):
+            raise ValueError(
+                f"discard_head refuses {name!r}: only {self.HEAD_PREFIX}* "
+                "branches are forks.")
+        with self._exclusive():
+            self._ensure_open()
+            if self._current_branch == name:
+                self._checkout(self.DEV)
+            _git(self.repo_path, "branch", "-D", name)

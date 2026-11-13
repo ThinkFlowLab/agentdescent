@@ -1,0 +1,481 @@
+"""The MCP server: the tool bodies without the SDK, and the wiring with it."""
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+import pytest
+
+from agentdescent import runstore
+from agentdescent.mcp import PATH_A_TOOLS, TOOL_DESCRIPTIONS, Tools, build_server
+from agentdescent.cli import NESTED_ENV
+
+from tests.test_evolvespec import _dir_spec  # noqa: F401
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AGENTDESCENT_SURFACE_WRITE_DIRS", str(tmp_path))
+    return str(tmp_path / "runs")
+
+
+def _wait(rd, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = rd.status()
+        if st.state in ("done", "failed", "cancelled"):
+            return st
+        time.sleep(0.2)
+    raise AssertionError(rd.status())
+
+
+# ---------------------------------------------------------------------------
+# tool bodies, no SDK
+# ---------------------------------------------------------------------------
+
+
+def test_plan_reports_a_bad_spec_by_field(store, tmp_path):
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path)).to_dict()
+    ok = t.plan(spec)
+    assert ok["ok"] and ok["tasks"] == 12 and ok["estimate"]["agent_calls_upper_bound"] > 0
+    spec["score"] = "sideways"
+    bad = t.plan(spec)
+    assert bad["ok"] is False and "score" in bad["error"]
+    assert "ok" in t.plan({"kind": "text"}) and t.plan({"kind": "text"})["ok"] is False
+
+
+def test_start_status_show_apply_flow(store, tmp_path):
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path)).to_dict()
+    started = t.start(spec)
+    assert started["ok"] and started["run_id"] and started["state"] == "running"
+    rd = runstore.get(started["run_id"], store=store)
+    _wait(rd)
+    st = t.status(started["run_id"])
+    assert st["state"] == "done" and st["recent_rounds"]
+    assert t.status()["runs"][0]["run_id"] == started["run_id"]
+    shown = t.show(started["run_id"])
+    assert shown["final_reward"] == 1.0 and "+MODE: reverse" in shown["diff"]
+    assert shown["apply_plan"]["written"] == ["rules.md"]
+    plan = t.apply(started["run_id"], dry_run=True)
+    assert plan["written"] == ["rules.md"]
+    done = t.apply(started["run_id"])
+    assert done["backup"]
+    with open(os.path.join(spec["target"], "rules.md")) as fh:
+        assert "MODE: reverse" in fh.read()
+
+
+def test_start_refuses_a_bad_spec_without_creating_a_run(store, tmp_path):
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path)).to_dict()
+    spec["agent"] = "echo"
+    out = t.start(spec)
+    assert out["ok"] is False and "WorkspaceAgent" in out["error"]
+    assert runstore.list_runs(store=store) == []
+
+
+def test_start_budget_without_usd_per_call_creates_no_run(store, tmp_path):
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path)).to_dict()
+    before = set(os.listdir(store)) if os.path.isdir(store) else set()
+    out = t.start(spec, budget_usd=5.0)
+    assert out["ok"] is False
+    assert "budget_usd needs usd_per_call" in out["error"]
+    assert "run_id" not in out
+    after = set(os.listdir(store)) if os.path.isdir(store) else set()
+    assert after == before
+
+
+def test_start_is_a_stub_inside_a_worker(store, tmp_path, monkeypatch):
+    monkeypatch.setenv(NESTED_ENV, "1")
+    t = Tools(store)
+    out = t.start(_dir_spec(str(tmp_path)).to_dict())
+    assert out["ok"] and out["nested"] and out["run_id"] == "nested-stub"
+    assert runstore.list_runs(store=store) == []
+
+
+def test_unknown_run_ids_are_errors_not_exceptions(store):
+    t = Tools(store)
+    assert "error" in t.status("nope")
+    assert "error" in t.show("nope")
+    assert "error" in t.apply("nope")
+    assert "error" in t.cancel("nope")
+    assert "error" in t.resume("nope")
+
+
+def test_resources_are_json(store, tmp_path):
+    t = Tools(store)
+    assert json.loads(t.runs_resource()) == []
+    assert "error" in json.loads(t.rounds_resource("nope"))
+
+
+def test_standalone_mcp_guide_lists_path_a_and_advanced_sets():
+    guide = (
+        Path(__file__).resolve().parents[1] / "docs" / "testing-guide.md"
+    ).read_text()
+    path_a = re.search(r"Expected tools \(Path A default\): `([^`]+)`", guide)
+    assert path_a is not None
+    assert set(path_a.group(1).split()) == set(PATH_A_TOOLS)
+    assert len(PATH_A_TOOLS) == 13
+    full = re.search(r"full set is also registered: `([^`]+)`", guide)
+    assert full is not None
+    assert set(full.group(1).split()) == set(TOOL_DESCRIPTIONS)
+    assert len(TOOL_DESCRIPTIONS) == 40
+
+
+def test_every_tool_has_a_description_written_for_the_model():
+    for name, text in TOOL_DESCRIPTIONS.items():
+        assert len(text) > 60, name
+    assert "DESTRUCTIVE" in TOOL_DESCRIPTIONS["apply"]
+    assert "FIRST" in TOOL_DESCRIPTIONS["doctor"]
+    assert "WITHOUT running" in TOOL_DESCRIPTIONS["plan"]
+
+
+def test_demo_is_on_path_a_and_runs_offline_without_provider_keys(store, monkeypatch):
+    """#903: hosts can smoke an algorithm with no provider key via MCP demo."""
+    for name in list(os.environ):
+        if name.endswith("_API_KEY") or name in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+            monkeypatch.delenv(name, raising=False)
+    assert "demo" in PATH_A_TOOLS
+    out = Tools(store).demo(algorithm="gepa")
+    assert out["ok"] is True, out
+    assert out["algorithm"] == "gepa"
+    assert out["kind"] == "text"
+    assert out["initial_reward"] is not None
+    assert out["final_reward"] > out["initial_reward"]
+    assert out["run_id"]
+    assert "COLUMN: amount" in out["learned"]
+    assert any("show" in step for step in out["next"])
+
+
+def test_demo_refuses_unknown_cards_like_cli(store, capsys):
+    """#903: MCP demo errors match the CLI wording."""
+    from agentdescent import cli
+
+    t = Tools(store)
+    unknown = t.demo(algorithm="nope")
+    assert unknown.get("ok") is False
+    assert "unknown algorithm 'nope'" in unknown["error"]
+    assert "archive_selection" in unknown["error"]
+    code = cli.main(["--store", store, "demo", "--algorithm", "nope"])
+    err = capsys.readouterr().err
+    assert code == 2 and unknown["error"] in err
+
+
+def test_demo_evoskill_runs_offline_like_cli(store):
+    """#934: evoskill is no longer a real-model-only card on demo or MCP."""
+    t = Tools(store)
+    out = t.demo(algorithm="evoskill")
+    assert out.get("ok") is True, out
+    assert out["algorithm"] == "evoskill"
+    assert out["kind"] == "skill_library"
+    assert out["initial_reward"] == 0.0
+    assert out["final_reward"] == 1.0
+    assert out["outcomes"].get("evoskill-select", 0) >= 1
+    assert "SKILL.md" in out["learned"] and "COLUMN: amount" in out["learned"]
+    assert any(s.startswith("agentdescent algorithms run evoskill ") for s in out["next"])
+
+
+def test_demo_kind_errors_are_actionable(store):
+    t = Tools(store)
+    plugin = t.demo(kind="plugin")
+    assert plugin.get("ok") is False
+    assert "plugin" in plugin["error"] and "offline" in plugin["error"]
+    mismatch = t.demo(algorithm="gepa", kind="skill_dir")
+    assert mismatch.get("ok") is False
+    assert "gepa" in mismatch["error"] and "text" in mismatch["error"]
+
+
+# ---------------------------------------------------------------------------
+# with the SDK
+# ---------------------------------------------------------------------------
+
+
+def test_server_registers_path_a_by_default_and_both_resources(store):
+    pytest.importorskip("mcp")
+    import asyncio
+
+    server = build_server(store, advanced=False)
+
+    async def go():
+        tools = {t.name for t in await server.list_tools()}
+        assert tools == set(PATH_A_TOOLS)
+        assert "audit_status" not in tools
+        uris = {str(r.uri) for r in await server.list_resources()}
+        assert "agentdescent://runs" in uris
+        templates = await server.list_resource_templates()
+        assert any("rounds" in str(t.uri_template if hasattr(t, "uri_template") else t.uriTemplate)
+                   for t in templates)
+        res = await server.call_tool("status", {})
+        return res
+
+    res = asyncio.run(go())
+    assert res is not None
+
+
+def test_server_registers_every_tool_when_advanced(store):
+    pytest.importorskip("mcp")
+    import asyncio
+
+    server = build_server(store, advanced=True)
+
+    async def go():
+        tools = {t.name for t in await server.list_tools()}
+        assert tools == set(TOOL_DESCRIPTIONS)
+        assert "audit_status" in tools and "plan" in tools
+
+    asyncio.run(go())
+
+
+def test_advanced_env_opts_into_full_tool_set(store, monkeypatch):
+    pytest.importorskip("mcp")
+    import asyncio
+    from agentdescent.mcp import ADVANCED_ENV
+
+    monkeypatch.setenv(ADVANCED_ENV, "1")
+    server = build_server(store)  # advanced=None → env
+
+    async def go():
+        return {t.name for t in await server.list_tools()}
+
+    assert asyncio.run(go()) == set(TOOL_DESCRIPTIONS)
+
+
+def test_status_with_no_runs_still_says_something(store):
+    """A bare list serialises to zero content blocks when empty.
+
+    An agent that asked "what is running?" on a fresh machine got back nothing
+    at all over the wire -- indistinguishable from a call that failed. The
+    wrapper names the store and carries an explicit empty list.
+    """
+    payload = Tools(store).status()
+    assert payload["runs"] == [] and payload["store"] == store
+
+
+def test_the_server_reports_its_version(monkeypatch):
+    """`initialize` answered with an empty version string, so any host that
+    shows one showed a blank. Only passed where the constructor takes it: mcp
+    1.x funnels unknown keywords into `Settings`, which rejects them."""
+    pytest.importorskip("mcp")
+    import inspect as _inspect
+
+    from agentdescent import __version__
+
+    server = build_server()
+    cls = type(server)
+    if "version" not in _inspect.signature(cls.__init__).parameters:
+        pytest.skip("this mcp does not take a server version")
+    settings = getattr(server, "settings", None)
+    reported = getattr(server, "version", None) or getattr(settings, "version", None)
+    assert reported == __version__, reported
+
+
+def test_serve_without_the_sdk_says_how_to_get_it(monkeypatch):
+    import builtins
+    import agentdescent.mcp as m
+
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name.startswith("mcp"):
+            raise ImportError("no mcp")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+    with pytest.raises(ImportError, match=r"agentdescent\[mcp\]"):
+        m._server_class()
+
+
+def test_start_refuses_missing_agent_cli_without_creating_a_run(store, tmp_path, monkeypatch):
+    """MCP start must return ok:false before create when the CLI binary is gone (#346)."""
+    import agentdescent.cli as cli_mod
+
+    real = cli_mod.doctor_report
+
+    def fake():
+        rep = real()
+        clis = dict(rep["agent_clis"])
+        for name in ("claude", "codex", "dsh", "opencode"):
+            clis[name] = None
+        return {**rep, "agent_clis": clis}
+
+    monkeypatch.setattr(cli_mod, "doctor_report", fake)
+
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path)).to_dict()
+    spec["agent"] = {"ref": "claude_code"}
+    before = set(os.listdir(store)) if os.path.isdir(store) else set()
+    out = t.start(spec)
+    assert out["ok"] is False
+    assert "claude_code" in out["error"] and "claude" in out["error"]
+    assert "run_id" not in out
+    after = set(os.listdir(store)) if os.path.isdir(store) else set()
+    assert after == before
+
+    plan = t.plan(spec)
+    assert plan["ok"] is False
+    assert "claude" in plan["error"]
+
+
+_CLI_HOSTS = (
+    ("claude_code", "claude"),
+    ("codex", "codex"),
+    ("dsh", "dsh"),
+    ("opencode", "opencode"),
+)
+
+
+def _fake_all_clis_absent(monkeypatch):
+    import agentdescent.cli as cli_mod
+
+    real = cli_mod.doctor_report
+
+    def fake():
+        rep = real()
+        clis = dict(rep["agent_clis"])
+        for name in ("claude", "codex", "dsh", "opencode"):
+            clis[name] = None
+        return {**rep, "agent_clis": clis}
+
+    monkeypatch.setattr(cli_mod, "doctor_report", fake)
+
+
+@pytest.mark.parametrize("field", ("agent", "reflect"))
+@pytest.mark.parametrize("ref,binary", _CLI_HOSTS)
+def test_nested_start_stub_when_proposed_cli_absent(
+        store, tmp_path, monkeypatch, field, ref, binary):
+    """Nested start keeps the refused stub even if the CLI is missing (#351)."""
+    _fake_all_clis_absent(monkeypatch)
+    monkeypatch.setenv(NESTED_ENV, "1")
+
+    create_calls, launch_calls = [], []
+
+    def _no_create(*a, **k):
+        create_calls.append((a, k))
+        raise AssertionError("create/launch must not run in nested mode")
+
+    def _no_launch(*a, **k):
+        launch_calls.append((a, k))
+        raise AssertionError("create/launch must not run in nested mode")
+
+    monkeypatch.setattr(runstore, "create", _no_create)
+    monkeypatch.setattr(runstore, "launch", _no_launch)
+
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path / f"{field}-{ref}")).to_dict()
+    spec[field] = {"ref": ref}
+    before = set(os.listdir(store)) if os.path.isdir(store) else set()
+    out = t.start(spec)
+    assert out["ok"] is True
+    assert out["nested"] is True
+    assert out["state"] == "refused"
+    assert out["run_id"] == "nested-stub"
+    assert create_calls == [] and launch_calls == []
+    after = set(os.listdir(store)) if os.path.isdir(store) else set()
+    assert after == before
+    assert runstore.list_runs(store=store) == []
+
+
+@pytest.mark.parametrize("field", ("agent", "reflect"))
+@pytest.mark.parametrize("ref,binary", _CLI_HOSTS)
+def test_non_nested_start_still_refuses_missing_cli(
+        store, tmp_path, monkeypatch, field, ref, binary):
+    """Non-nested missing-CLI start stays fail-closed before create (#346/#351)."""
+    _fake_all_clis_absent(monkeypatch)
+    monkeypatch.delenv(NESTED_ENV, raising=False)
+
+    create_calls, launch_calls = [], []
+
+    def _no_create(*a, **k):
+        create_calls.append((a, k))
+        raise AssertionError("create/launch must not run when CLI missing")
+
+    def _no_launch(*a, **k):
+        launch_calls.append((a, k))
+        raise AssertionError("create/launch must not run when CLI missing")
+
+    monkeypatch.setattr(runstore, "create", _no_create)
+    monkeypatch.setattr(runstore, "launch", _no_launch)
+
+    t = Tools(store)
+    spec = _dir_spec(str(tmp_path / f"{field}-{ref}")).to_dict()
+    spec[field] = {"ref": ref}
+    before = set(os.listdir(store)) if os.path.isdir(store) else set()
+    out = t.start(spec)
+    assert out["ok"] is False
+    assert ref in out["error"] and binary in out["error"]
+    assert "run_id" not in out
+    assert "nested" not in out
+    assert create_calls == [] and launch_calls == []
+    after = set(os.listdir(store)) if os.path.isdir(store) else set()
+    assert after == before
+
+
+def test_apply_from_installs_an_on_disk_artifact(store, tmp_path):
+    """MCP apply(from=..., to=...) matches CLI apply --from (#540)."""
+    t = Tools(store)
+    src = tmp_path / "evolved.md"
+    src.write_text("new prompt\n")
+    dest = tmp_path / "prompt.md"
+    dest.write_text("old prompt\n")
+
+    plan = t.apply(source=str(src), to=str(dest), dry_run=True)
+    assert plan["written"] == [str(dest)] and plan.get("noop") is False
+    assert dest.read_text() == "old prompt\n"
+
+    done = t.apply(source=str(src), to=str(dest))
+    assert dest.read_text() == "new prompt\n"
+    assert done["backup"] == [str(dest) + ".bak-0"]
+    assert (tmp_path / "prompt.md.bak-0").read_text() == "old prompt\n"
+
+    again = t.apply(source=str(src), to=str(dest))
+    assert again["noop"] is True
+
+
+def test_apply_from_argument_errors_are_payloads(store, tmp_path):
+    t = Tools(store)
+    src = tmp_path / "x.md"
+    src.write_text("x")
+    assert "from needs to" in t.apply(source=str(src))["error"]
+    assert "not both" in t.apply("someid", to=str(tmp_path / "y.md"),
+                                 source=str(src))["error"]
+    assert "run_id" in t.apply()["error"] or "from PATH" in t.apply()["error"]
+    missing = t.apply(source=str(tmp_path / "missing"), to=str(tmp_path / "y.md"))
+    assert "does not exist" in missing["error"]
+
+
+def test_apply_from_refuses_symlinks(store, tmp_path):
+    t = Tools(store)
+    src, dest = tmp_path / "final", tmp_path / "skill"
+    src.mkdir(); dest.mkdir()
+    (src / "SKILL.md").write_text("ok\n")
+    (dest / "SKILL.md").write_text("old\n")
+    (src / "abs").symlink_to("/etc/hostname")
+    err = t.apply(source=str(src), to=str(dest))
+    assert "symlink" in err["error"] and "abs" in err["error"]
+    assert not (dest / "abs").exists()
+    assert (dest / "SKILL.md").read_text() == "old\n"
+
+
+def test_apply_tool_schema_exposes_from_not_from_underscore(store):
+    """Hosts must see the MCP arg as `from` (CLI parity), not `from_` (#540)."""
+    pytest.importorskip("mcp")
+    import asyncio
+    server = build_server(store)
+
+    async def _schema():
+        tools = await server.list_tools()
+        apply = next(t for t in tools if t.name == "apply")
+        schema = getattr(apply, "input_schema", None) or getattr(apply, "inputSchema")
+        props = schema["properties"]
+        assert "from" in props and "from_" not in props
+        assert "run_id" in props and "to" in props
+        # run_id is optional now (from+to is the other mode)
+        required = schema.get("required") or []
+        assert "run_id" not in required
+
+    asyncio.run(_schema())

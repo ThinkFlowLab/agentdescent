@@ -1,0 +1,88 @@
+{
+ "experiment": "SICA self-editing policy source on AgentDescent, GSM-Hard",
+ "model": "deepseek-v4-flash",
+ "provider": "claude",
+ "reference": "MaximeRobeyns/self_improving_coding_agent@ed8275dc",
+ "config": {
+  "arm": "async_pipeline",
+  "budget_rollouts": 80,
+  "workers": 8,
+  "async_ratio": 1,
+  "async_ratio_note": "recorded as 2 until v0.4.2. These cells were transcribed from standard_main's stdout, and that path dropped --async-ratio before it reached the runtime, so the run took run_port's default of 1 -- the 2 was what the command line asked for. See docs/self-evolution-examples.md#the-methodpolicy-command-line.",
+  "staleness": "full",
+  "reflective_merge": true,
+  "temperature": 0.7,
+  "thinking": "disabled",
+  "domain": "GSM-Hard (reasoning-machines/gsm-hard), 64/64/64 shuffled splits",
+  "selection": "Archive(sampling='best')",
+  "reflective_merge_note": "validated: ReflectiveFusion runs the strategy validator and falls back to ranking on rejection"
+ },
+ "cells": [
+  {
+   "seed": 0,
+   "test": [
+    0.703,
+    0.75
+   ],
+   "validation": [
+    0.562,
+    0.625
+   ],
+   "accepted": 3,
+   "invalid": 3,
+   "wall_s": 425.0,
+   "engine_s": 141.4,
+   "calls": 942
+  },
+  {
+   "seed": 1,
+   "test": [
+    0.625,
+    0.625
+   ],
+   "validation": [
+    0.578,
+    0.625
+   ],
+   "accepted": 0,
+   "invalid": 1,
+   "wall_s": 441.3,
+   "engine_s": 138.0,
+   "calls": 880
+  },
+  {
+   "seed": 2,
+   "test": [
+    0.594,
+    0.625
+   ],
+   "validation": [
+    0.641,
+    0.719
+   ],
+   "accepted": 2,
+   "invalid": 1,
+   "wall_s": 460.9,
+   "engine_s": 131.8,
+   "calls": 876
+  }
+ ],
+ "summary": {
+  "test_gain": {
+   "per_seed": [
+    0.047,
+    0.0,
+    0.031
+   ],
+   "mean": 0.026
+  },
+  "validation_gain": {
+   "per_seed": [
+    0.063,
+    0.047,
+    0.078
+   ],
+   "mean": 0.063
+  }
+ }
+}

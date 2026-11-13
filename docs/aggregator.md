@@ -1,0 +1,375 @@
+# The aggregator (the optimizer)
+
+> **Plugs into [`evolve`](evolution.md) via** `agg_config=` (tune the reference
+> aggregator) or `aggregator_factory=` (replace it entirely).
+
+The aggregator is the framework's **optimizer** — the discrete-space analogue of
+an optimizer step. It's the one place the training analogy breaks: *gradients
+add, diffs do not*, so aggregation is not averaging but **conflict resolution +
+statistical acceptance + transactional commit**. Every accepted change to the
+shared ledger goes through it.
+
+---
+
+*Module:* [`agentdescent.aggregator`](https://github.com/ThinkFlowLab/agentdescent/blob/main/agentdescent/aggregator.py)
+· *API:* [`Aggregator`, `AggregatorConfig`, `MergeOutcome`, …](api.md#the-aggregator-the-optimizer)
+· *Neighbours:* [verifier](verifier.md) scores candidates · [ledger](ledger.md) commits them ·
+[staleness](staleness.md) decides what to do with an out-of-date diff ·
+[governance](governance.md) decides how hard to gate.
+
+## Replacing a decision
+
+The seven decisions a merge makes are objects, and each can be swapped without
+touching `Aggregator`:
+
+```python
+from agentdescent import Policies, evolve
+from agentdescent.policies import AcceptDecision
+
+class AcceptEverything:
+    def accept(self, ctx):
+        return AcceptDecision(True, "committed")
+
+evolve(tasks, reward, agent=agent, policies=Policies(acceptance=AcceptEverything()))
+```
+
+The catalogue of every seam, its default, and every implementation lives on
+[Choosing policies](policies.md), with one page per decision kind. What each
+default *knows* that a replacement must be told is recorded on the kind pages
+([acceptance](acceptance-policies.md), [promotion](promotion-policies.md), …).
+
+Not replaceable, deliberately: the audit gate. It asks whether the cheap layer is
+still trustworthy -- a question about the measuring instrument, which belongs to
+the infrastructure rather than the algorithm.
+
+
+## What it does (per artifact bucket)
+
+Evidence cards are bucketed by artifact; a bucket fires on batch size `B` or a
+`T_max` timeout. Then, in order:
+
+1. **Staleness filter** — per-diff `η` vs `α`; the [staleness policy](evolution.md#7-staleness-staleness_policy) decides `ACCEPT / REBASE / DISCARD`.
+2. **Conflict resolution** — contradictory diffs (same key, different value) are projected out PCGrad-style; keep the better of the pair, iterating until no surviving pair contradicts. Key *overlap* alone is not a conflict — identical proposals are duplicates and dedupe.
+3. **Fusion** — complementary diffs are fused (model-soup style) and the union goes to the gate. With `fusion_tournament=True` it is first run against the singles on held-out and the best wins; see [below](#is-ranking-the-fusion-worth-a-sweep-per-candidate).
+4. **Audit gate** — the candidate is submitted to the `AuditScheduler`; a high-blast-radius / low-trust merge is forced through the oracle, which can **veto it outright** (`oracle-rejected`) before the acceptance test runs. *The optimizer audits itself.* This is a blocking gate on the accept path, not a post-commit spot-check.
+5. **Statistical acceptance** — commit only if `P(Δ > 0) > 1 − δ` under a Beta posterior comparison (not a point threshold); `δ` anneals with version.
+6. **Commit** — compare-and-swap on `dev`, one artifact per merge. A **contract-breaking** diff is the exception: it lands through the `Ledger`'s `commit_atomic` (2PC across several artifacts, the design's "atomic adaptation transaction" — the sanctioned route for a deliberate contract change, since `commit()` refuses one), and the engine re-measures any artifact whose `Contract.depends_on` names the changed artifact. In a single-artifact run that path still never fires, because there is nothing to commit together.
+7. **Dual-branch promotion** — `dev → stable` after *K* **regression-free rounds** on dev. One round is one `step()`. A commit restarts the clock (the new version has survived nothing yet) and so does an oracle rejection. So a *converged* artifact — one that stopped committing because nothing beats it — is the one most likely to be promoted, which is the point. A run that ends cleanly also publishes its head via `finalize()`, so stopping on `target_reward` does not leave `stable` a confirmation short.
+
+Deep dive on the *why*: [concepts §4](concepts.md#4-the-aggregator-a-discrete-space-optimizer).
+
+### Is ranking the fusion worth a sweep per candidate?
+
+It is **off by default**, and this is the argument.
+
+Write out what the tournament decides that step 5 does not:
+
+| | union → gate | tournament |
+|---|---|---|
+| fusion worse than the artifact | gate rejects | rejected |
+| fusion beats every single | fusion commits | fusion commits |
+| fusion beats the artifact, loses to a single | fusion commits | that single commits |
+
+One cell. So the tournament is a **selection refinement, not a safety
+mechanism** — the safety is step 5, which scores the candidate on the *full*
+held-out set and refuses a measured regression. And that one cell is recoverable:
+`fuse_diffs` is `ops.update()`, so the union is a **superset** of every single
+diff. Committing it unranked loses no proposal; it carries some that looked
+negative this round, and the next round proposes from there.
+
+Against that, the ranking costs one cheap held-out sweep per candidate, every
+round, unconditionally. An unconditional cost against a conditional and
+recoverable gain is the wrong default.
+
+Note where the remaining cost lands. After step 2 the survivors are pairwise
+non-contradicting, so on the default path the union always builds and step 3
+spends **nothing**. Ranking that genuinely has to happen — choosing between two
+diffs that *do* contradict — happens in step 2, where a choice is unavoidable.
+
+### Reading step 3: did fusion actually help?
+
+The objection is "two local improvements might be worse together than either
+alone". Step 5 stops it either way; what only the tournament can do is **measure**
+it, because `best_single_score` exists only where a single was actually scored.
+`RoundStat.fused` counted **committed** fusions, which cannot answer it: a tally
+of successes with the denominator missing.
+
+The win rate is a property of the workload, not of the mechanism — it depends on
+how coarse the artifact's key space is and on how much the workers' proposals
+overlap, so one dataset's number does not transfer to the next. That is why this
+project publishes no figure for it: a number measured on one benchmark would be
+read as a fact about merging. It is a diagnostic to run on the workload in front
+of you, rather than a tax on every run:
+
+```python
+result = evolve(tasks, reward, agent=agent, n_workers=4,
+                fusion_tournament=True)
+```
+
+The shipped `FusionPolicy` then records a `FusionTrial` per tournament — it was
+already computing the scores to rank the candidates — and `result.fusion_stats()`
+reads them back:
+
+```python
+stats = result.fusion_stats()
+print(stats.summary())
+# fusion: won 12/31 (39%), mean gain -0.004, 9 losses (worst -0.070,
+#         1 below baseline), 10 ties
+```
+
+| field | what it answers |
+|---|---|
+| `trials` / `contested` | how many merges ran, and how many had a fusion that was **ranked** against the singles |
+| `unranked` | unions committed without being compared — every merge on the default path, and every one on the [reflective path](#when-a-dictionary-update-cannot-merge-reflectivefusion) |
+| `single_candidate` / `contradiction` | why the rest did not — one survivor, or survivors that contradicted |
+| `nothing_to_fuse` | the survivors **agreed**, so `ops.update()` returned one of them and nothing was combined. Counted apart from `contradiction` because the fix is the opposite one: the workers are duplicating each other, not the key space being too coarse |
+| `win_rate` | fused wins over `contested`; `None` when nothing was contested, so "never ran" cannot be read as "always lost" |
+| `mean_gain` | mean `fused − best single` |
+| `negative` / `mean_loss` / `worst_loss` | the losing tail — the number the objection is actually about |
+| `below_baseline` | fusions worse than the artifact they started from, as opposed to merely ranked below the best single |
+| `ties` | fusion exactly matching the best single; high here with an empty tail means the cheap layer cannot separate the candidates |
+
+Ties do not count as fusion wins: `max` keeps the first of equal scores, so a
+fusion that merely matches the best single loses. That is the conservative reading
+and it matters — counting ties as wins would inflate the rate on exactly the
+workloads where the held-out set is too small to tell the candidates apart.
+
+A replaced `FusionPolicy` is not obliged to keep `trials`; then `stats.trials` is
+`0` and `win_rate` is `None`, which reads as "not instrumented" rather than as a
+verdict.
+
+### When a dictionary update cannot merge — `ReflectiveFusion`
+
+The full treatment — what the model is asked, what the union costs and gives
+up, and why it ships only as a pair with `KeepContradictions` — moved to
+[fusion policies](fusion-policies.md#the-deep-dive-when-a-dictionary-update-cannot-merge).
+
+## Tuning — `agg_config=` (`AggregatorConfig`)
+
+Keep the reference pipeline, change its knobs:
+
+```python
+from agentdescent import AggregatorConfig
+
+evolve(tasks, reward, agent=agent, agg_config=AggregatorConfig(
+    batch_trigger=2,      # fire a merge once this many proposals collect for an artifact
+    max_wait_rounds=1,    # ...or after this many rounds (so cold artifacts don't starve)
+    base_delta=0.5,       # acceptance risk: commit iff P(Δ>0) > 1-δ, annealed by version
+    alpha_head=5,         # staleness tolerance for hot artifacts
+    alpha_tail=1,         # ...and for cold ones
+    trust_region_ops=6,   # max edits per diff
+    promote_after_k=3,    # dev -> stable after K regression-free rounds (EMA)
+    fusion_tournament=False,  # rank the fusion against the singles first
+))
+```
+
+| Field | Controls |
+|---|---|
+| `batch_trigger` / `max_wait_rounds` | when a bucket fires (size vs timeout) |
+| `base_delta` | acceptance strictness (`1 − δ` threshold), annealed by version |
+| `alpha_head` / `alpha_tail` | staleness tolerance `α` (hot vs cold artifacts) |
+| `trust_region_ops` | diff-size cap (the trust region) |
+| `promote_after_k` | dev→stable after this many regression-free rounds (EMA) |
+| `fusion_tournament` | rank candidates against their fusion before putting one forward — off, [and why](#is-ranking-the-fusion-worth-a-sweep-per-candidate) |
+| `anneal_half_life` | how fast the acceptance threshold tightens with version |
+| `accept_samples` | Monte-Carlo draws behind each acceptance decision |
+
+!!! note "`anneal_half_life` sets the shape of a long run"
+    `base_delta` was exposed; the half-life that turns it into the actual
+    threshold was a default argument inside `stats.annealed_delta`, reachable from
+    nothing a caller touches. It decides how quickly committing gets harder:
+
+    | artifact version | `P(Δ>0)` must exceed |
+    |---|---|
+    | 1 | 0.505 |
+    | 64 | 0.750 |
+    | 128 | 0.875 |
+    | 256 | 0.969 |
+    | 400+ | 0.990 (floor) |
+
+    Version counts *commits*, so a run with many small accepted diffs reaches the
+    floor much sooner than one with a few large ones.
+
+!!! tip "Making the cheap layer actually cheap — `evolve(cheap_eval_tasks=)`"
+    The aggregator scores candidates twice for two different reasons, and only one
+    of them needs to be exact:
+
+    | | what it decides | cost |
+    |---|---|---|
+    | **cheap layer** | which candidate to *put forward* — conflict resolution, and the fusion tournament when `fusion_tournament=True` | once **per candidate** |
+    | **acceptance test** (`eval_counts`) | whether to *commit* it | once per merge |
+
+    `evolve()` used to pin the cheap layer to the whole held-out set, so rule /
+    learned / oracle were one full sweep wearing three names — and on an LLM
+    workload `eval_fn` **runs the agent**, so a round paid a full sweep for every
+    candidate it merely wanted to rank. `oracle_budget` capped nothing either: its
+    documented fallback (`rule_eval`) returned the very value it was trying to
+    avoid buying.
+
+    `cheap_eval_tasks=N` scores N held-out tasks for ranking. The acceptance test
+    still uses the full set — as does the regression guard beside it — so this
+    trades ranking precision, never commit safety.
+    The sample is **fixed for the run** — it used to be redrawn on every call,
+    which is harmless only while the "sample" is the whole set, and silently scores
+    candidate A on `{1,3,5}` against candidate B on `{2,4,6}` the moment it is not.
+
+    **The default is now 8**, or the whole held-out set when that is smaller. It
+    was `None` meaning "exact", which made the paragraph above describe the
+    shipped behaviour rather than a bug that had been fixed: the knob existed and
+    nothing in `bench/` or `examples/` passed it, so every real run paid the full
+    price. What 8 costs is resolution — 8 binary-scored tasks resolve 0.125, so
+    candidates closer than that rank by whichever the sample favours. Pass
+    `len(held_out)` to get the old behaviour back.
+
+---
+
+## Replacing — `aggregator_factory=` (`AggregatorProtocol`)
+
+To change the *logic*, not just the knobs, plug in your own aggregator. The
+contract is two methods:
+
+```python
+from typing import Protocol, List
+from agentdescent import EvidenceCard
+from agentdescent import MergeReport
+
+class AggregatorProtocol(Protocol):
+    def ingest(self, card: EvidenceCard) -> None: ...     # a worker's diff + evidence
+    def step(self) -> List[MergeReport]: ...              # decide what to merge now
+```
+
+!!! note "Your aggregator is checked, and its mistakes are not hidden"
+    The factory's result must have callable `ingest` and `step` — missing either
+    raises before the first rollout, naming what is absent. `step()` must return a
+    list of `MergeReport`; returning `None` or a list of something else raises
+    `AggregatorContractError` naming your class, instead of surfacing as
+    `'NoneType' object is not iterable` from inside the driver.
+
+    That error, `RewardContractError` and `ProposalContractError` all derive from
+    **`ContractError`**, and both engines let it propagate. A *backend* failure (a
+    rate limit, a dead endpoint) is absorbed and reported through `result.error` so
+    a long run keeps its partial results — a broken contract in your own code is
+    not, because the run is meaningless either way and hiding it wastes the budget.
+
+`evolve` builds the aggregator through a **factory** that receives the runtime
+deps it owns — `(ledger, verifier, audit, config, staleness_policy)` — and
+returns any `AggregatorProtocol`:
+
+```python
+from agentdescent import Aggregator
+
+class StrictAggregator(Aggregator):
+    def _tournament(self, artifact, diffs):
+        # e.g. never fuse -- evaluate only single diffs
+        return super()._tournament(artifact, [diffs[0]] if diffs else diffs)
+
+def factory(ledger, verifier, audit, config, staleness_policy):
+    return StrictAggregator(ledger, verifier, audit, config,
+                            staleness_policy=staleness_policy)
+
+evolve(tasks, reward, agent=agent, aggregator_factory=factory)
+```
+
+### Override points on the reference `Aggregator`
+
+The easiest customization is subclassing and overriding one decision; each stage
+above is a method:
+
+| Method | Stage you're changing |
+|---|---|
+| `_staleness_filter(artifact, head, cards)` | which stale diffs survive / rebase |
+| `_resolve_conflicts(artifact, cards)` | how contradictions are dropped |
+| `_tournament(artifact, diffs)` | fusion + candidate selection |
+| `_process(artifact_id)` | the acceptance test / commit block |
+| `ingest` / `step` | buffering + when merges fire |
+
+### From scratch
+
+You don't have to subclass — anything with `ingest` + `step` works. A trivial
+"accept-everything, no merge" aggregator (for a baseline):
+
+```python
+class NaiveAggregator:
+    def __init__(self, ledger, verifier, audit, config, staleness_policy):
+        self.ledger, self._pending = ledger, []
+    def ingest(self, card): self._pending.append(card)
+    def step(self):
+        # ... apply each pending diff to the ledger head, no conflict/acceptance ...
+        self._pending.clear()
+        return []
+
+evolve(tasks, reward, agent=agent, aggregator_factory=NaiveAggregator)
+```
+
+Use this to A/B your own merge/acceptance policy against the reference optimizer
+while keeping the rest of the loop (agents, strategy, parallelism, governance)
+unchanged.
+
+## The async optimizer variant — SGD-style descent
+
+On the [barrier-free async path](evolution.md#the-barrier-free-runtime-async_evolve)
+the expensive step is usually the **held-out eval** (an agent rollout per
+validation item). Validating *every* candidate — the reference greedy hill-climb
+and most frontier optimizers — makes held-out the wall-clock bottleneck when
+workers propose faster than one full eval completes.
+
+An aggregator can **amortise** it, exactly like mini-batch SGD amortises the
+validation pass over many gradient steps:
+
+1. **Apply** each incoming diff as a cheap *update step* (`ingest` accumulates,
+   `step` commits the moved head so workers immediately build on it) — **no eval**.
+2. **Validate every `N` steps.** Score the accumulated head on held-out once per
+   *N* applied updates, not once per update.
+3. **Keep or roll back.** If the mini-batch improved held-out, checkpoint it;
+   otherwise **roll back** the head to the last validated checkpoint.
+
+This costs ~`N`× fewer held-out evals — and it is a **different acceptance rule**
+from the per-candidate frontier, not a scheduling change.
+
+!!! danger "Which is why no port picks it off the schedule any more"
+    [EvoSkill](algo-evoskill.md) used to install exactly this on its async path
+    and the strict `TopKFrontierAggregator` on its sync one. That made the async
+    cell of the [runtime matrix](matrix-overview.md) measure a *different
+    optimizer* that happened to run barrier-free: no frontier at all, one
+    checkpoint in its place, and admission by mini-batch rather than by
+    candidate. It is removed; the frontier now runs on every arm, and
+    `tests/test_matrix_report.py::test_the_evoskill_frontier_is_the_algorithm_on_every_arm`
+    reads the source and fails if an aggregator is keyed off the schedule again.
+
+    Amortised validation remains a legitimate thing to build — the sketch below
+    is the whole of it — but it belongs in a run that declares it as its
+    acceptance rule, never in the async arm of a comparison whose sync arm uses
+    another.
+
+```python
+class SgdMerger:                       # apply-then-periodically-validate, roll back on no gain
+    def __init__(self, ledger, verifier, ctx, artifact_id):
+        self.ledger, self.verifier, self.ctx, self.aid = ledger, verifier, ctx, artifact_id
+        self.cards, self.checkpoint, self.ckpt_score, self.steps = [], {}, 0.0, 0
+    def ingest(self, card): self.cards.append(card)
+    def step(self):
+        head = self.ledger.snapshot(Ledger.DEV).get(self.aid)
+        cards, self.cards = self.cards, []
+        for c in cards:                                    # 1. apply updates, no eval
+            head = head.apply(c.diff); self.steps += 1
+        self._commit(head.state)                           #    move the head; workers build on it
+        if self.steps >= self.ctx.val_every:               # 2. validate every N steps
+            score = self._eval(head)
+            if score > self.ckpt_score:                    # 3. keep ...
+                self.checkpoint, self.ckpt_score = dict(head.state), score
+            else:                                          #    ... or roll back to checkpoint
+                self._commit(self.checkpoint)
+            self.steps = 0
+        return [...]
+```
+
+Because `apply()` only *merges* ops, a rollback that must **drop** skills added
+since the checkpoint commits a full replacement artifact (exact state), not a
+diff. The pending-intake [lag budget](evolution.md#the-barrier-free-runtime-async_evolve)
+keeps the mini-batch bounded so one `step()` never faces an unbounded pile.
+
+## Example optimizers (from the algorithm ports)
+
+The canonical catalogue — the shipped `Aggregator`, the reusable
+`PopulationAggregator`, and every port-specific optimizer — lives on the
+[`aggregator_factory` page](aggregator-factory.md#implemented).

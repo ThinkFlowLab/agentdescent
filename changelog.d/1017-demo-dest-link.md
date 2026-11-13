@@ -1,10 +1,7 @@
-### `demo --dir` refuses a link at a fixture leaf
-
-`agentdescent demo --dir <dir>` wrote every fixture and its `spec.json` with a
-plain `open(..., "w")`, so a symlink named exactly like a leaf was followed: the
-demo's bytes landed outside `--dir` and the file the link pointed at was
-overwritten. The demo now preflights every leaf it is about to write through
-`filetree.dest_problem` — the same rule `init` (`#1008`) and the tree writer
-(`#977`) already use — and refuses with `error: cannot write …: '<leaf>' is a
-symlink` (exit `2`) before the first byte, so a refused run leaves no partial
-fixture. A link *above* `--dir` is still allowed.
+Fixed
+`agentdescent demo --dir` now refuses a symlink planted at a fixture leaf or at
+`spec.json` instead of following it: the run exits `2` with
+`cannot write …: '<leaf>' is a symlink` before the first byte, so the demo's
+bytes can no longer land outside `--dir` or overwrite the file the link points
+at. The check is `filetree.dest_problem`, the same rule `init` (#1008) and the
+tree writer (#977) use, and a link above `--dir` is still allowed (#1017).

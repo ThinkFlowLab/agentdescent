@@ -1,11 +1,10 @@
 """A run that mostly failed is not evidence of a promotion (#993).
 
-A crashed call is raised out of the run or lands as a scored ``0``, so a run in
-which a third of the tasks never answered can still hand a clean mean gain --
-and a promotion -- to the promoter. The bundle therefore carries a ``RunHealth``
-record: failures are counted beside the gain, the gain is the mean over the
-tasks that answered, and above the threshold the gate fails. Without health
-data the bundle keeps today's keys, values and hash.
+A crashed call lands as a scored ``0``, so a run in which a third of the tasks
+never answered could still hand a clean gain to the promoter. The bundle
+carries a ``RunHealth`` record instead: the gain is the mean over the tasks that
+answered and above the threshold the gate fails. Without health data the bundle
+keeps today's keys and hash.
 """
 
 import hashlib
@@ -19,8 +18,7 @@ from agentdescent.trust_evidence import build_trust_evidence
 
 
 TASKS = 40
-#: sha256 of the default bundle's JSON, captured at the base commit. A default
-#: bundle whose keys or values move stops matching this.
+#: sha256 of the default bundle's JSON at the base commit: keys or values move, it breaks.
 DEFAULT_BUNDLE_SHA256 = (
     "84b1e05a76f0c2751520b60646b62fe95e07c7cd7215aaaf6cc04d3231c920af")
 
@@ -100,6 +98,15 @@ def test_no_health_data_keeps_todays_bundle():
     assert "run_health" not in evidence.to_dict()
     assert hashlib.sha256(blob.encode()).hexdigest() == DEFAULT_BUNDLE_SHA256
     assert evidence.eval_result.delta == pytest.approx(0.325)
+
+
+def test_an_unchanged_artifact_reports_no_gain_even_with_health():
+    evidence = replace(_evidence(failed_tasks=_failed_ids(14)),
+                       artifact_changed=False)
+
+    assert evidence.eval_result.delta == 0.0
+    assert evidence.eval_result.passed is False
+    assert evidence.eval_result.detail.count("run health") == 1
 
 
 def test_malformed_run_health_is_a_caller_error():

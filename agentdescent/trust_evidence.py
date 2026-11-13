@@ -81,12 +81,10 @@ def _artifact_metadata(artifact_changed: Optional[bool],
 class RunHealth:
     """How much of a run produced a real answer (#993).
 
-    ``failed_tasks`` are the task ids whose call never produced an answer -- a
-    provider error, a harness or sandbox failure, an exception. They are not
-    scored as zero: the bundle drops them from the paired scores and reports
-    the gain over the tasks that answered, with the failure count beside it.
-    Above ``threshold`` the run fails its gate, because a run that mostly did
-    not measure is not evidence of an improvement.
+    ``failed_tasks`` never produced an answer, so they are not scored as zero:
+    the gain is the mean over the tasks that answered. Above ``threshold`` the
+    run fails its gate, because a run that mostly did not measure is not
+    evidence of an improvement.
     """
 
     attempted: int
@@ -111,7 +109,6 @@ class RunHealth:
 
     @property
     def failed(self) -> int:
-        """How many tasks produced no answer."""
         return len(self.failed_tasks)
 
     @property
@@ -130,7 +127,6 @@ class RunHealth:
 
 
 def _run_health(value: Any) -> RunHealth:
-    """Coerce the metadata form of a health record into `RunHealth`."""
     if isinstance(value, RunHealth):
         return value
     if not isinstance(value, Mapping):
@@ -162,7 +158,9 @@ def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
     delta = (sum(answered.values()) / n) if n else 0.0
     interval = bootstrap_ci({task: 0.0 for task in answered}, answered)
     censored = health.censored or n == 0
-    detail = (f"{result.detail}; run health: {health.failed} of "
+    # ``replace`` on a bundle that already has the note keeps one copy.
+    detail = result.detail.split("; run health: ")[0]
+    detail = (f"{detail}; run health: {health.failed} of "
               f"{health.attempted} tasks failed at the provider or harness "
               f"(rate {health.failure_rate:.2f} vs threshold "
               f"{health.threshold:.2f}); gain is the mean over {n} answered "
@@ -191,8 +189,6 @@ class TrustEvidence:
     #: caller did not compare them, so the bundle keeps the behaviour it had
     #: before this field existed.
     artifact_changed: Optional[bool] = None
-    #: Above the threshold the eval gate cannot pass, so `promote()` cannot
-    #: return `promote` on a run that mostly did not happen.
     run_health: Optional[RunHealth] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -226,14 +222,12 @@ class TrustEvidence:
         elif health is not None:
             health = _run_health(health)
         if health is not None:
-            # Every construction path gets the same treatment, including
-            # ``dataclasses.replace`` on a bundle that already exists.
+            # Every construction path gets this, ``dataclasses.replace`` too.
             object.__setattr__(self, "run_health", health)
             if metadata.get("run_health") != health.to_dict():
                 metadata["run_health"] = health.to_dict()
             updated = _drop_failed_tasks(self.eval_result, health)
             if self.artifact_changed is False:
-                # #991's zeroing wins: an unchanged artifact reports no gain.
                 updated = replace(updated, delta=0.0, passed=False)
             object.__setattr__(self, "eval_result", updated)
 

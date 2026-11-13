@@ -110,6 +110,10 @@ class FalsificationAcceptance:
     is untouched: this rule *replaces* the count-only gate for callers that opt
     in, and the aggregator only builds probes for a policy that declares
     ``needs_probes``.
+
+    All three partitions are required and non-empty: the aggregator builds a
+    probe context only when each has a task, so an empty one would leave every
+    candidate deferred and nothing ever committed or rejected (#938).
     """
 
     #: The aggregator reads this to decide whether to build a
@@ -126,6 +130,15 @@ class FalsificationAcceptance:
         if not archived:
             raise ValueError("FalsificationAcceptance needs a non-empty archived "
                              "partition: it is the regression guard")
+        if not falsification:
+            # Not a style rule: the aggregator builds probes only when all three
+            # partitions are non-empty, so an empty one makes every candidate
+            # defer (#938). A gate that admits nothing, silently, is worse than
+            # a spec that refuses to start.
+            raise ValueError("FalsificationAcceptance needs a non-empty "
+                             "falsification partition: an empty one is never "
+                             "measured, so every candidate would defer instead "
+                             "of being committed or rejected")
         if not 0.0 <= min_gain < 1.0:
             raise ValueError(f"min_gain must be in [0, 1), got {min_gain}")
         self.target = tuple(target)

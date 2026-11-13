@@ -1774,8 +1774,14 @@ class Aggregator:
             # would let "probes never ran" quietly look like "the candidate was
             # neutral".
             _observe_outcome(False)
-            return report(None, None, decision.detail,
-                          MergeOutcome(decision.category))
+            try:
+                defer_outcome = MergeOutcome(decision.category)
+            except ValueError:
+                # A third-party policy may defer under a category this build does
+                # not know. A deferral with no known category is still "nothing
+                # was measured", and raising here would kill the merge thread.
+                defer_outcome = MergeOutcome.PROBES_UNAVAILABLE
+            return report(None, None, decision.detail, defer_outcome)
 
         if not decision.accept:
             _observe_outcome(False)

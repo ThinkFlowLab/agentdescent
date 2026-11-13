@@ -21,7 +21,7 @@ import pytest
 from agentdescent.aggregator import Aggregator, AggregatorConfig
 from agentdescent.defaults import DefaultAcceptance
 from agentdescent.evolvable import Diff, EvidenceCard
-from agentdescent.evolution import Task
+from agentdescent.evolution import EvolvingArtifact, Task
 from agentdescent.acceptance import (
     FalsificationAcceptance, ProbeContext, ProbePartitions,
 )
@@ -213,3 +213,72 @@ def test_the_commit_record_is_the_shape_the_shared_writer_takes():
     record = _policy().accept(_ctx(probes)).provenance
     assert isinstance(record, dict)
     assert isinstance(record["rule_id"], str) and record["rule_id"]
+
+
+# -- the two contract holes from the first review ---------------------------
+
+
+def test_an_empty_falsification_partition_is_refused_at_construction():
+    """An empty partition is never measured, so the gate would defer forever.
+
+    ``_probe_context`` builds a context only when all three partitions are
+    non-empty, and ``accept`` defers when there is no context -- so
+    ``falsification=()`` is a spec that admits nothing, silently. The spec is
+    refused instead, naming the argument (#938).
+    """
+    with pytest.raises(ValueError) as excinfo:
+        FalsificationAcceptance(target=(_task("tgt-1"),), falsification=(),
+                                archived=(_task("arc-1"),))
+    message = str(excinfo.value)
+    assert "falsification" in message
+    assert "empty" in message.lower()
+
+
+class _DeferringWithOwnCategory:
+    """A third-party policy that defers with a category this build does not know."""
+
+    needs_probes = False
+
+    def accept(self, ctx) -> AcceptDecision:
+        return AcceptDecision(False, "third-party-hold",
+                              "deferred by a policy outside this build",
+                              defer=True)
+
+
+def test_an_unknown_defer_category_reports_probes_unavailable(tmp_path):
+    """A deferral must not raise inside ``_decide``.
+
+    The defer branch maps the policy's category through ``MergeOutcome``; an
+    unknown string from a third-party policy raises ``ValueError`` in the merge
+    thread. A deferral with no known category is still "nothing was measured",
+    so it reports ``probes-unavailable`` and leaves the prior alone (#938).
+    """
+    from agentdescent.aggregator import _Candidate
+
+    def serialize(a):
+        return {"state": a.state, "blast_radius": a.blast_radius}
+
+    def deserialize(aid, version, state):
+        return EvolvingArtifact(aid, state.get("state", {}), version,
+                                state.get("blast_radius", 0.2))
+
+    ledger = Ledger(str(tmp_path / "repo"), serialize, deserialize)
+    ledger.register(EvolvingArtifact("artifact", {"k": "v0"}, blast_radius=0.2))
+    verifier = ThreeLayerVerifier(
+        eval_fn=lambda artifact, tasks: 1.0, held_out=[_task("held-1")],
+        budget=VerifierBudget(oracle_calls_remaining=5))
+    agg = Aggregator(ledger, verifier, AuditScheduler(), AggregatorConfig(),
+                     acceptance=_DeferringWithOwnCategory())
+    snap = ledger.snapshot(Ledger.DEV)
+    base = snap.get("artifact")
+    diff = Diff(diff_id="d", target="artifact", ops={"k": "v1"}, author="w")
+    candidate = base.apply(diff)
+    c = _Candidate(artifact_id="artifact", artifact=base, candidate=candidate,
+                   diff=diff, cards=[], survivor_cards=[], head=snap.version,
+                   fused=False, considered=1, survived=1, discarded=0,
+                   conflicts=0, base_counts=(2.0, 0.0), cand_counts=(3.0, 0.0),
+                   base_cheap=1.0, cand_cheap=1.0)
+    report = agg._decide(c)
+    assert report.category == "probes-unavailable"
+    assert report.committed_version is None
+    assert ledger.head_version(Ledger.DEV).get("artifact") == 1

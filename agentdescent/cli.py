@@ -2195,7 +2195,13 @@ def _selection_not_merging(comp) -> Optional[str]:
     worker proposals contradict by construction and collapse to one candidate,
     so no fusion is built. Asked against the *composed* bundle rather than the
     spec's `policies` block, because the default never appears in the latter.
+
+    An ``aggregator_factory`` (gepa's Pareto pool) replaces that conflict
+    pipeline: each surviving proposal enters its pool on its own, so nothing
+    collapses and naming `reflect` would not change it -- stay quiet (#1039).
     """
+    if comp.kwargs.get("aggregator_factory") is not None:
+        return None
     installed = comp.kwargs.get("policies")
     if installed is not None and (installed.fusion is not None
                                   or installed.conflict is not None):

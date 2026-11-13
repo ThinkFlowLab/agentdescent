@@ -113,6 +113,40 @@ def test_an_unchanged_artifact_reports_no_gain_even_with_health():
     assert rebuilt.eval_result.detail.count("artifact unchanged") == 1
 
 
+def test_an_empty_detail_keeps_one_artifact_note_and_one_hash():
+    raw = _raw()
+    empty = replace(raw, eval_result=replace(raw.eval_result, detail=""))
+    built = replace(empty, artifact_changed=False)
+    rebuilt = replace(replace(built, artifact_changed=False),
+                      artifact_changed=False)
+
+    assert built.eval_result.detail.count("artifact unchanged") == 1
+    assert rebuilt.eval_result.detail.count("artifact unchanged") == 1
+    assert rebuilt.eval_result.detail == built.eval_result.detail
+    assert (promote(built.to_promotion_request("skill-1"),
+                    PromotionRules()).evidence_hash
+            == promote(rebuilt.to_promotion_request("skill-1"),
+                       PromotionRules()).evidence_hash)
+
+
+def test_an_empty_detail_with_health_keeps_one_copy_of_each_note():
+    raw = _raw(14)
+    empty = replace(raw, eval_result=replace(raw.eval_result, detail=""))
+    built = replace(empty, artifact_changed=False, metadata={
+        "run_health": {"attempted": TASKS,
+                       "failed_tasks": _failed_ids(14)}})
+    rebuilt = replace(built, artifact_changed=False)
+
+    for evidence in (built, rebuilt):
+        detail = evidence.eval_result.detail
+        assert detail.count("artifact unchanged") == 1
+        assert detail.count("run health") == 1
+        assert not detail.startswith("; ")
+        assert evidence.eval_result.delta == 0.0
+        assert evidence.eval_result.passed is False
+    assert rebuilt.eval_result.detail == built.eval_result.detail
+
+
 def test_a_health_count_without_its_ids_is_a_caller_error():
     with pytest.raises(ValueError):
         replace(_raw(14), metadata={"run_health": {"attempted": TASKS,

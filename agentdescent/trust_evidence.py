@@ -168,10 +168,13 @@ def _run_health(value: Any) -> RunHealth:
         threshold=value.get("threshold", 0.2))
 
 
-_ARTIFACT_NOTE_TEXT = ("; artifact unchanged, so the eval delta is evaluation "
+_ARTIFACT_NOTE_TEXT = ("artifact unchanged, so the eval delta is evaluation "
                        "noise, not learning")
-_ARTIFACT_NOTE = re.compile(re.escape(_ARTIFACT_NOTE_TEXT))
-_HEALTH_NOTE = re.compile(r"; run health: .*?task\(s\)")
+#: The separator belongs to the composition, not to the sentence: a detail that
+#: starts with the note (an empty original) has none, and a pattern that
+#: required one would leave the second copy behind on the next rebuild.
+_ARTIFACT_NOTE = re.compile(r"(?:;\s*)?" + re.escape(_ARTIFACT_NOTE_TEXT))
+_HEALTH_NOTE = re.compile(r"(?:;\s*)?run health: .*?task\(s\)")
 
 
 def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
@@ -185,12 +188,15 @@ def _drop_failed_tasks(result: EvalResult, health: RunHealth) -> EvalResult:
     censored = health.censored or n == 0
     # ``replace`` on a bundle re-appends the note; strip the previous copy and
     # nothing else, so a note another field appended (the artifact one) stays.
-    detail = _HEALTH_NOTE.sub("", result.detail)
-    detail = (f"{detail}; run health: {health.failed} of "
-              f"{health.attempted} tasks failed at the provider or harness "
-              f"(rate {health.failure_rate:.2f} vs threshold "
-              f"{health.threshold:.2f}); gain is the mean over {n} answered "
-              f"task(s)")
+    # The separator is optional in the pattern because the note can lead the
+    # detail; ``strip`` drops the one the removal leaves behind.
+    detail = _HEALTH_NOTE.sub("", result.detail).strip("; ")
+    health_note = (f"run health: {health.failed} of "
+                   f"{health.attempted} tasks failed at the provider or harness "
+                   f"(rate {health.failure_rate:.2f} vs threshold "
+                   f"{health.threshold:.2f}); gain is the mean over {n} answered "
+                   f"task(s)")
+    detail = f"{detail}; {health_note}" if detail else health_note
     return replace(result, n=n, delta=delta, ci=(interval.lo, interval.hi),
                    per_task=answered,
                    passed=result.passed and not censored, detail=detail)
@@ -231,10 +237,12 @@ class TrustEvidence:
             # noise, so it can neither be reported as gain nor pass an eval
             # gate. Zeroing here covers every construction path, including a
             # caller that builds the bundle directly from its own EvalResult.
+            detail = _ARTIFACT_NOTE.sub(
+                "", self.eval_result.detail).strip("; ")
             object.__setattr__(self, "eval_result", replace(
                 self.eval_result, delta=0.0, passed=False,
-                detail=(_ARTIFACT_NOTE.sub("", self.eval_result.detail) +
-                        _ARTIFACT_NOTE_TEXT).lstrip("; ")))
+                detail=(f"{detail}; {_ARTIFACT_NOTE_TEXT}" if detail
+                        else _ARTIFACT_NOTE_TEXT)))
         if self.risk is not None:
             risk = _finite(self.risk, "risk")
             if not 0.0 <= risk <= 1.0:

@@ -186,7 +186,7 @@ class VerifierAgreement(_ForwardsInstall):
         self._n_accepted = 0
         self._n_rejected = 0
         self._accepted_confirmed: List[float] = []
-        self._rejected_missed: List[float] = []
+        self._rejected_good: List[float] = []
 
     def _mean(self, scorer: Scorer, artifact: Any) -> float:
         if not self.audit_tasks:
@@ -200,7 +200,7 @@ class VerifierAgreement(_ForwardsInstall):
             n_accepted=self._n_accepted, n_rejected=self._n_rejected,
             rejected_sample_rate=self.rejected_sample_rate, seed=self.seed,
             accepted_confirmed=self._accepted_confirmed,
-            rejected_missed=self._rejected_missed)
+            rejected_good=self._rejected_good)
 
     def accept(self, ctx: MergeContext) -> AcceptDecision:
         decision = (self.inner.accept(ctx) if hasattr(self.inner, "accept")
@@ -213,12 +213,16 @@ class VerifierAgreement(_ForwardsInstall):
                     and random.Random(key).random() <= self.rejected_sample_rate):
                 base_o = self._mean(self.oracle, ctx.artifact)
                 cand_o = self._mean(self.oracle, ctx.candidate)
-                self._rejected_missed.append(1.0 if cand_o > base_o else 0.0)
+                self._rejected_good.append(1.0 if cand_o > base_o else 0.0)
             return decision
+        # Counted before any audit override: the stratum is the verifier's own
+        # decision, and a commit it accepted stays in the accepted stratum even
+        # when the audit then refuses it -- otherwise the audit would launder the
+        # verifier's false positives out of its own precision.
+        self._n_accepted += 1
         diff = getattr(ctx, "diff", None)
         key = f"{self.seed}:{getattr(diff, 'diff_id', '')}"
         if random.Random(key).random() > self.sample_rate or not self.audit_tasks:
-            self._n_accepted += 1
             return decision
         base_v = self._mean(self.verifier, ctx.artifact)
         cand_v = self._mean(self.verifier, ctx.candidate)
@@ -227,18 +231,17 @@ class VerifierAgreement(_ForwardsInstall):
         verifier_gain = cand_v - base_v
         oracle_gain = cand_o - base_o
         if oracle_gain < 0.0:
-            self._n_rejected += 1              # refused by the audit, not admitted
+            self._accepted_confirmed.append(0.0)   # accepted, the oracle denies
             return AcceptDecision(
                 False, "oracle-regression",
                 f"oracle {base_o:.3f} -> {cand_o:.3f} on the audit set",
                 observed_delta=0.0)
         if verifier_gain > 0.0 and oracle_gain <= 0.0:
-            self._n_rejected += 1
+            self._accepted_confirmed.append(0.0)
             return AcceptDecision(
                 False, "oracle-disagrees",
                 f"verifier {base_v:.3f} -> {cand_v:.3f} but oracle "
                 f"{base_o:.3f} -> {cand_o:.3f}",
                 observed_delta=0.0)
-        self._n_accepted += 1
         self._accepted_confirmed.append(1.0 if oracle_gain > 0.0 else 0.0)
         return decision

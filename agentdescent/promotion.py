@@ -551,12 +551,12 @@ def promote(request: PromotionRequest,
         admission = getattr(report, "admission", None)
         if admission is None:                   # no report is no admission either
             missing.append("verifier admission")
-        elif admission.precision is None or admission.recall_bound is None:
-            deferred.append(f"verifier admission is incomplete: {admission.reason}")
         elif admission.recommendation == "reject":
             hard_fail = True
             reasons.append(f"verifier admission failed: {admission.reason}")
         elif admission.recommendation != "admit":
+            # One source for the bar: incomplete and insufficient-evidence
+            # reports both arrive here as "defer", never as a pass or a fail.
             deferred.append(f"verifier admission: {admission.reason}")
 
     report = request.calibration

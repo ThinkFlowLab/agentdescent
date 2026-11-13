@@ -49,9 +49,20 @@ verifier-only gain is `oracle-disagrees`. The audit draw is seeded from the diff
 id, so it does not depend on merge order.
 
 Auditing accepted commits measures precision and nothing else, so
-`rejected_sample_rate` audits the rejected stratum too and `admission_report()`
-adds a lower confidence bound on its recall; `require_verifier_admission=True`
-defers on a missing or incomplete report and fails closed on a `reject`.
+`rejected_sample_rate` audits the rejected stratum too. `admission_report()`
+labels the verifier's own decisions -- a commit it accepted stays in the accepted
+stratum even when the audit then refuses it -- and reports precision on that
+stratum with its bootstrap interval, plus `rejection_accuracy_lower` /
+`rejection_accuracy_upper`, the interval on the share of its rejections that were
+correct. `reject` needs a bound already under 0.5 on a stratum with at least three
+audited decisions, `admit` needs both pessimistic bounds at 0.8, and everything
+else defers: one or two audited rejections are not evidence that a verifier is
+anti-correlated.
+
+`require_verifier_admission=True` carries the report on `EnsembleReport.admission`
+and defers on a missing, incomplete or insufficient one, failing closed only on a
+`reject`. Nothing fills that field for you: a caller that wants the gate must pass
+`verifier_agreement.admission_report()` when it builds the report.
 
 Both pieces take `(artifact, task) -> float` callables, so they work with the
 shipped verifier, a model judge, or a deterministic fixture. They are deliberately

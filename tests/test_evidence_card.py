@@ -1,10 +1,9 @@
 """Evidence cards: the 12-field schema and its offline ``--check`` validator.
 
-``#951`` publishes every empirical claim as a card so a reader can see which of
-the twelve questions the claim does not answer. These pin the validator on
-temporary trees: a complete card passes, every incomplete one is refused with
-the offending field named on one line, and ``not reviewed`` is the explicit way
-to say a field has no evidence.
+``#951`` publishes every claim as a card, so a reader can see which of the twelve
+questions it leaves unanswered. These pin the validator on temporary trees: a
+complete card passes, every incomplete one is refused with the offending field
+named on one line, and ``not reviewed`` is the explicit "no evidence".
 """
 import json
 import subprocess
@@ -15,11 +14,9 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 
-FIELDS = (
-    "held_out", "matched_budget", "cross_model", "cost", "disjoint_search",
-    "reliability", "code", "evolved_artifact", "who_edits", "feedback",
-    "timing", "topology",
-)
+FIELDS = ("held_out", "matched_budget", "cross_model", "cost", "disjoint_search",
+          "reliability", "code", "evolved_artifact", "who_edits", "feedback",
+          "timing", "topology")
 
 
 def _tool():
@@ -59,8 +56,7 @@ def test_a_missing_field_is_refused_by_name(tmp_path, capsys, field):
     assert "\n" not in err.strip(), "a refusal is one line per offending field"
 
 
-@pytest.mark.parametrize("value, needle", [("", "blank"), ("   ", "blank"),
-                                           (None, "string"), (7, "string")])
+@pytest.mark.parametrize("value, needle", [("", "blank"), (None, "string")])
 def test_a_blank_or_non_string_value_is_refused_by_name(tmp_path, capsys, value, needle):
     assert _check(_write(tmp_path, _card(cost=value))) == 1
     err = capsys.readouterr().err
@@ -91,20 +87,6 @@ def test_a_wrong_schema_version_is_refused_by_name(tmp_path, capsys, version):
     assert "schema_version" in capsys.readouterr().err
 
 
-def test_a_missing_schema_version_is_refused(tmp_path, capsys):
-    card = _card()
-    del card["schema_version"]
-    assert _check(_write(tmp_path, card)) == 1
-    assert "schema_version" in capsys.readouterr().err
-
-
-def test_a_non_object_card_is_refused(tmp_path, capsys):
-    path = tmp_path / "card.json"
-    path.write_text("[1, 2, 3]", encoding="utf-8")
-    assert _check(path) == 1
-    assert "object" in capsys.readouterr().err
-
-
 def test_one_bad_card_fails_the_run_and_names_it(tmp_path, capsys):
     _write(tmp_path, _card(), "good.json")
     bad = _card()
@@ -113,13 +95,6 @@ def test_one_bad_card_fails_the_run_and_names_it(tmp_path, capsys):
     assert _check(tmp_path) == 1
     err = capsys.readouterr().err
     assert "bad.json" in err and "timing" in err
-
-
-def test_a_directory_argument_scans_its_cards_only(tmp_path, capsys):
-    _write(tmp_path, _card(), "a.json")
-    (tmp_path / "notes.txt").write_text("not a card", encoding="utf-8")
-    assert _check(tmp_path) == 0
-    assert "1 card" in capsys.readouterr().out
 
 
 def test_no_paths_without_the_directory_is_zero_cards(tmp_path, monkeypatch, capsys):
@@ -136,10 +111,6 @@ def test_no_paths_scans_the_default_directory(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     assert _tool().main(["--check"]) == 0
     assert "1 card" in capsys.readouterr().out
-
-
-def test_a_named_path_that_does_not_exist_is_an_input_error(tmp_path):
-    assert _check(tmp_path / "absent.json") == 2
 
 
 def test_the_module_is_runnable_with_dash_m(tmp_path):

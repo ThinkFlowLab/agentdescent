@@ -1,17 +1,17 @@
 """Evidence cards: the 12-field schema and its offline ``--check`` validator.
 
-Every empirical claim is published as a card that answers the same twelve
-questions, so a reader can see which ones the claim leaves unanswered instead of
-inferring it from prose. A field with no evidence is the explicit string
-``not reviewed``; there is no blank field and no omitted field. ``#951`` adds the
-cards and the rest of the wiring; this module is the schema and the check.
+``#951`` publishes every empirical claim as a card that answers the same twelve
+questions, so a reader can see what a claim leaves unanswered instead of
+inferring it. No evidence is the explicit string ``not reviewed``; there is no
+blank field and no omitted field. This module is the schema and the check; the
+cards are later slices.
 
     python -m tools.evidence_card --check [CARD ...]
 
 ``--check`` validates ``*.json`` cards in the paths given, or ``reports/evidence``
-when none is given (an absent directory is ``0 cards``, not an error). Exit codes
-are 0 for valid cards, 1 for a refusal -- one line per offending field -- and 2
-for an input error. Standard library only, no network, and it writes nothing.
+when none is given (absent is ``0 cards``, not an error). Exit 0 valid, 1 refused
+with one line per offending field, 2 input error. No network, no clock, and it
+writes nothing.
 """
 from __future__ import annotations
 
@@ -23,22 +23,11 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 
 #: The twelve questions a card answers, in the order ``#951`` lists them.
-FIELDS = (
-    "held_out",
-    "matched_budget",
-    "cross_model",
-    "cost",
-    "disjoint_search",
-    "reliability",
-    "code",
-    "evolved_artifact",
-    "who_edits",
-    "feedback",
-    "timing",
-    "topology",
-)
+FIELDS = ("held_out", "matched_budget", "cross_model", "cost", "disjoint_search",
+          "reliability", "code", "evolved_artifact", "who_edits", "feedback",
+          "timing", "topology")
 
-#: The only way to say a field has no evidence. Anything else non-empty is a value.
+#: The only way to say a field has no evidence; anything else non-empty is a value.
 NOT_REVIEWED = "not reviewed"
 
 DEFAULT_DIR = Path("reports") / "evidence"
@@ -57,50 +46,41 @@ def validate(card, source="card"):
     for name in FIELDS:
         if name not in card:
             errors.append(f"{source}: {name}: missing field")
-            continue
-        value = card[name]
-        if not isinstance(value, str):
+        elif not isinstance(card[name], str):
             errors.append(f"{source}: {name}: not a string (use '{NOT_REVIEWED}')")
-        elif not value.strip():
+        elif not card[name].strip():
             errors.append(f"{source}: {name}: blank (use '{NOT_REVIEWED}')")
-    for name in card:
-        # schema_version is metadata, not evidence: it is validated above and is
-        # not one of the twelve fields a card must carry.
-        if name != "schema_version" and name not in FIELDS:
-            errors.append(f"{source}: {name}: unknown field")
+    # schema_version is metadata, not evidence: checked above, never one of the twelve.
+    errors.extend(f"{source}: {name}: unknown field"
+                  for name in card if name != "schema_version" and name not in FIELDS)
     return errors
 
 
 def collect(paths):
-    """Return ``(cards, input_errors)`` for the ``--check`` arguments.
-
-    A directory contributes its top-level ``*.json`` files, sorted so a run is
-    deterministic. The default directory is optional; a path the caller named is
-    not.
-    """
+    """Return ``(cards, input_errors)``; only the implicit default directory is optional."""
     implicit = not paths
-    if implicit:
-        paths = [DEFAULT_DIR]
     cards, problems = [], []
-    for raw in paths:
+    for raw in [DEFAULT_DIR] if implicit else paths:
         path = Path(raw)
         if path.is_dir():
             cards.extend(sorted(p for p in path.glob("*.json") if p.is_file()))
         elif path.is_file():
             cards.append(path)
-        elif not path.exists() and implicit and path == DEFAULT_DIR:
-            continue
-        else:
+        elif not (implicit and path == DEFAULT_DIR):
             problems.append(f"{path}: no such card or directory")
     return cards, problems
 
 
+def _report(lines):
+    for line in lines:
+        print(f"error: {line}", file=sys.stderr)
+
+
 def check(paths):
-    """Validate the cards named by ``paths`` and return the exit code."""
+    """Validate the named cards and return the exit code."""
     cards, problems = collect(paths)
     if problems:
-        for line in problems:
-            print(f"error: {line}", file=sys.stderr)
+        _report(problems)
         return 2
     errors = []
     for path in cards:
@@ -111,8 +91,7 @@ def check(paths):
             continue
         errors.extend(validate(card, str(path)))
     if errors:
-        for line in errors:
-            print(f"error: {line}", file=sys.stderr)
+        _report(errors)
         return 1
     print(f"{len(cards)} card" if len(cards) == 1 else f"{len(cards)} cards")
     return 0
@@ -123,10 +102,8 @@ def main(argv=None):
         prog="python -m tools.evidence_card",
         description="Validate evidence cards against schema v1.",
     )
-    parser.add_argument(
-        "--check", nargs="*", metavar="PATH",
-        help=f"cards or directories to check (default: {DEFAULT_DIR})",
-    )
+    parser.add_argument("--check", nargs="*", metavar="PATH",
+                        help=f"cards or directories to check (default: {DEFAULT_DIR})")
     args = parser.parse_args(argv)
     if args.check is None:
         parser.print_usage(sys.stderr)

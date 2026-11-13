@@ -399,3 +399,8 @@ sizes are deliberately small so a run costs minutes; they
 are **not** the papers' full setups, and where a full setup needs heavy
 infrastructure (SWE-bench in Docker, gated data) the boundary is stated on the
 algorithm's page.
+
+Claims are published as 12-field evidence cards, and
+`python -m tools.evidence_card --check [CARD ...]` refuses a card that omits a
+field, names an unknown one, or leaves a value blank — `not reviewed` is the
+explicit way to say a field has no evidence.

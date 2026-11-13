@@ -29,7 +29,7 @@ agentdescent install dsh                 # or: claude-code, codex, opencode, gro
 | `claude-code` | a plugin directory at `~/.agentdescent/plugins/claude-code/` (`plugin.json`, skill, `/agentdescent:evolve`, `/agentdescent:algorithms`, `.mcp.json`, a `SessionStart` hook) | `claude --plugin-dir ~/.agentdescent/plugins/claude-code`, or `/plugin marketplace add ThinkFlowLab/agentdescent` then `/plugin install agentdescent@agentdescent` |
 | `codex` | `~/.codex/skills/agentdescent/SKILL.md`; `/prompts:evolve` and `/prompts:algorithms` as `~/.codex/prompts/{evolve,algorithms}.md` (same bodies as Claude `/agentdescent:evolve` / `/agentdescent:algorithms`); an `[mcp_servers.agentdescent]` block appended to `~/.codex/config.toml` | restart Codex; check with `codex mcp list`. **Or skip `install` entirely** and use the plugin — see below |
 | `opencode` | `~/.config/opencode/skill/agentdescent/SKILL.md`; `/agentdescent/evolve` and `/agentdescent/algorithms` under `~/.config/opencode/command/agentdescent/` (legacy singular `command/`, nested to mirror Claude's namespaced slash); an `mcp.agentdescent` entry merged into `~/.config/opencode/opencode.jsonc` (into `opencode.json` beside it when your `opencode.jsonc` has comments; OpenCode merges the two) | restart OpenCode; check with `opencode mcp list` |
-| `grok-bot` | scaffold under `~/.agentdescent/plugins/grok-bot/` (`SKILL.md`, `HOST.md`, `mcp.example.json`) — **not** a one-click wire-up: Grok Bot has no public plugin API for local skill+stdio MCP; `HOST.md` names `algorithms list`/`show`/`run` and MCP discovery | read `HOST.md`; ask Grok Bot to save the skill as a user skill; drive runs with the CLI (`algorithms run` = init+plan), or run `agentdescent mcp --transport streamable-http` behind an HTTPS tunnel and add the URL as a custom MCP server. `doctor` reports `mcp n/a` when the scaffold is current |
+| `grok-bot` | scaffold under `~/.agentdescent/plugins/grok-bot/` (`SKILL.md`, `HOST.md`, `mcp.example.json`) — **not** a one-click wire-up: Grok Bot has no public plugin API for local skill+stdio MCP; `HOST.md` names `algorithms list`/`show`/`run` and MCP discovery | read `HOST.md`; ask Grok Bot to save the skill as a user skill; drive runs with the CLI (`algorithms run` = init+plan), or run `agentdescent mcp --transport streamable-http --http-token-env AGENTDESCENT_MCP_TOKEN` behind an HTTPS tunnel and add the URL plus its `Authorization: Bearer` header as a custom MCP server. `doctor` reports `mcp n/a` when the scaffold is current |
 
 `agentdescent doctor` also reads what `install` left behind, without writing
 anything (`--home <dir>` uses the same probe directory as `install --home` /
@@ -62,13 +62,28 @@ interpreter. Grok Bot stays `mcp n/a`.
 
 **Grok Bot over HTTP.** The scaffold edits no host config, because Grok Bot has
 no public one-click plugin API for local skill directories or stdio MCP (custom
-connectors need public HTTPS). Run `agentdescent mcp --transport streamable-http`
-(loopback, port 8000, path `/mcp`) and expose it through an HTTPS tunnel; the
-server has no auth, and a non-loopback `--host` needs `--allow-remote`. If the
-port cannot be bound the command prints one line naming the port and exits 4
-before announcing any URL, so pick another `--port` (exit 3 stays reserved for a
-missing or too-old MCP SDK, 2 for a refused `--host`). A future one-click route
-is tracked on [#165](https://github.com/ThinkFlowLab/agentdescent/issues/165).
+connectors need public HTTPS). Generate a token, serve the tools over HTTP with
+it, and expose them through an HTTPS tunnel:
+
+```bash
+export AGENTDESCENT_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+agentdescent mcp --transport streamable-http --http-token-env AGENTDESCENT_MCP_TOKEN
+```
+
+That listens on loopback port 8000, path `/mcp`. Add the tunnel URL as a custom
+MCP server whose request header is `Authorization: Bearer <that token>`. Every
+request without the header is answered 401 before an MCP session is created, so
+a leaked tunnel URL on its own reaches no tool. The token is read from the named
+environment variable only — never from the command line, a spec or the URL — and
+it is never printed. Without `--http-token-env` a loopback server behaves as
+before; a non-loopback `--host` needs `--allow-remote` **and** a token. If your
+connector cannot send a custom header, drive runs with the CLI on the Bot's
+computer instead. If the port cannot be bound the command prints one line
+naming the port and exits 4 before announcing any URL, so pick another `--port`
+(exit 3 stays reserved for a missing or too-old MCP SDK, 2 for a refused
+`--host` or a named token variable that is missing or empty). A future one-click
+route is tracked on
+[#165](https://github.com/ThinkFlowLab/agentdescent/issues/165).
 
 ### Uninstall
 

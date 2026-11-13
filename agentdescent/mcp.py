@@ -32,6 +32,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import secrets
 from typing import Annotated, Any, Dict, Optional, Sequence, Tuple
 
 from . import __version__, runstore
@@ -44,8 +45,9 @@ from .evolvespec import (EvolveSpec, SpecError, budget_round_overshoot_warning,
 
 __all__ = ["ADVANCED_ENV", "DEFAULT_HTTP_HOST", "DEFAULT_HTTP_PORT", "PATH_A_TOOLS",
            "RESCAN_ALLOW_ENV", "STREAMABLE_HTTP_REQUIRES", "TRANSPORTS",
-           "Tools", "TOOL_DESCRIPTIONS", "advanced_from_env", "build_server",
-           "is_loopback_host", "rescan_allow_from_env", "serve"]
+           "HttpTokenMissing", "Tools", "TOOL_DESCRIPTIONS", "advanced_from_env",
+           "build_server", "http_token", "is_loopback_host",
+           "rescan_allow_from_env", "serve"]
 
 #: Comma-separated import prefixes `audit_rescan` may resolve beyond this
 #: package, read from the operator's environment.
@@ -1612,9 +1614,90 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+class HttpTokenMissing(RuntimeError):
+    """``--http-token-env`` named an environment variable that is unset or empty."""
+
+
+def http_token(env_name: Optional[str]) -> Optional[str]:
+    """The bearer token for streamable-http, read from ``env_name`` in the environment.
+
+    ``None`` means no gate was asked for. A named variable that is unset or
+    empty raises :class:`HttpTokenMissing` instead: an empty variable must fail
+    closed, not quietly start an unauthenticated server. The value is only ever
+    compared (:func:`secrets.compare_digest`) and handed to the ASGI gate -- it
+    is never printed, logged, or put in a URL.
+    """
+    name = (env_name or "").strip()
+    if not name:
+        return None
+    value = os.environ.get(name) or ""
+    if not value.strip():
+        raise HttpTokenMissing(
+            f"--http-token-env {name} is not set (or is empty); export the bearer "
+            "token in that variable -- it is never read from the command line")
+    return value
+
+
+def _bearer_guard(app: Any, token: str) -> Any:
+    """Wrap an ASGI app so only ``Authorization: Bearer <token>`` reaches it.
+
+    The gate is outside ``streamable_http_app()``, so a request without the
+    header is answered 401 before the MCP layer sees it at all: no session is
+    created, ``initialize`` never runs and ``tools/list`` cannot enumerate.
+    Lifespan scopes pass through untouched -- the SDK app starts its session
+    manager there.
+    """
+
+    expected = f"Bearer {token}".encode("utf-8")
+    denied = json.dumps({"error": "unauthorized"}).encode("utf-8")
+
+    async def guarded(scope, receive, send):
+        if scope.get("type") != "http":
+            await app(scope, receive, send)
+            return
+        sent = dict(scope.get("headers") or []).get(b"authorization", b"")
+        # Constant-time: a plain != on a secret leaks its prefix under timing,
+        # which is why host_sampling.SamplingBridge compares this way too.
+        if not secrets.compare_digest(sent, expected):
+            await send({"type": "http.response.start", "status": 401, "headers": [
+                (b"content-type", b"application/json"),
+                (b"www-authenticate", b'Bearer realm="agentdescent"'),
+                (b"content-length", str(len(denied)).encode("ascii")),
+            ]})
+            await send({"type": "http.response.body", "body": denied})
+            return
+        await app(scope, receive, send)
+
+    return guarded
+
+
+def _http_asgi_app(server: Any, host: str) -> Any:
+    """``streamable_http_app()``: the ASGI entry the SDK ``run`` helpers hide.
+
+    ``serve`` needs it when a token is configured, because ``run`` takes no
+    middleware. Both SDK majors expose it; only mcp 2.x takes ``host``, which is
+    where it decides DNS-rebinding protection.
+    """
+    factory = getattr(server, "streamable_http_app", None)
+    if factory is None:
+        raise RuntimeError(STREAMABLE_HTTP_REQUIRES)
+    if "host" in inspect.signature(factory).parameters:  # mcp >= 2
+        return factory(host=host)
+    return factory()
+
+
+def _serve_with_token(server: Any, *, host: str, port: int, token: str) -> None:
+    """Serve the gated ASGI app. ``uvicorn`` is a Requires-Dist of mcp 1.8 and 2.x."""
+    import uvicorn
+
+    uvicorn.run(_bearer_guard(_http_asgi_app(server, host), token),
+                host=host, port=port)
+
+
 def serve(store: Optional[str] = None, *, transport: str = "stdio",
           host: str = DEFAULT_HTTP_HOST, port: int = DEFAULT_HTTP_PORT,
-          advanced: Optional[bool] = None) -> None:
+          advanced: Optional[bool] = None,
+          http_token_env: Optional[str] = None) -> None:
     """Serve until the host closes the pipe (stdio) or the process is stopped.
 
     ``streamable-http`` listens on ``host:port`` at ``/mcp``. The host/port go
@@ -1622,6 +1705,11 @@ def serve(store: Optional[str] = None, *, transport: str = "stdio",
     ``run``; mcp 1.x's ``FastMCP`` reads them from ``server.settings``. Callers
     are responsible for the loopback check (the CLI refuses a non-loopback host
     without ``--allow-remote``): ``start`` and ``apply`` write to disk.
+
+    ``http_token_env`` names the environment variable holding a bearer token.
+    When it is set, every HTTP request must carry ``Authorization: Bearer
+    <token>``; see :func:`http_token` for why an empty variable refuses to
+    start. stdio has no headers, so the CLI rejects the pair instead.
     """
     if transport not in TRANSPORTS:
         raise ValueError(f"unknown transport {transport!r}; expected one of {TRANSPORTS}")
@@ -1635,9 +1723,8 @@ def serve(store: Optional[str] = None, *, transport: str = "stdio",
     if runner is None:
         raise RuntimeError(STREAMABLE_HTTP_REQUIRES)
     params = inspect.signature(runner).parameters
-    if "host" in params and "port" in params:  # mcp >= 2
-        server.run("streamable-http", host=host, port=port)
-    else:  # mcp 1.x FastMCP (>= 1.8)
+    modern = "host" in params and "port" in params  # mcp >= 2
+    if not modern:  # mcp 1.x FastMCP (>= 1.8)
         server.settings.host = host
         server.settings.port = port
         # mcp 1.x decides DNS-rebinding protection in the constructor, from the
@@ -1648,4 +1735,11 @@ def serve(store: Optional[str] = None, *, transport: str = "stdio",
         # non-loopback host and drop the loopback-only pin.
         if not is_loopback_host(host) and getattr(server.settings, "transport_security", None):
             server.settings.transport_security = None
+    token = http_token(http_token_env)
+    if token is not None:
+        _serve_with_token(server, host=host, port=port, token=token)
+        return
+    if modern:
+        server.run("streamable-http", host=host, port=port)
+    else:
         server.run("streamable-http")

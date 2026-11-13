@@ -5413,14 +5413,21 @@ def cmd_mcp(a: argparse.Namespace) -> int:
     transport = getattr(a, "transport", "stdio")
     host = getattr(a, "host", "127.0.0.1")
     port = getattr(a, "port", 8000)
+    token_env = getattr(a, "http_token_env", None) or None
     try:
         from .mcp import (DEFAULT_HTTP_HOST, STREAMABLE_HTTP_REQUIRES,
-                          is_loopback_host, serve)
+                          HttpTokenMissing, http_token, is_loopback_host, serve)
     except ImportError as e:
         print(f"agentdescent mcp: cannot start the MCP server -- {_mcp_import_failure(e)}",
               file=sys.stderr)
         return 3
-    if transport != "stdio":
+    if transport == "stdio":
+        if token_env:
+            print("agentdescent mcp: --http-token-env only applies to "
+                  "--transport streamable-http: stdio carries no HTTP headers.",
+                  file=sys.stderr)
+            return 2
+    else:
         if not is_loopback_host(host):
             if not getattr(a, "allow_remote", False):
                 print(f"agentdescent mcp: refusing to listen on non-loopback host {host!r}: "
@@ -5429,9 +5436,27 @@ def cmd_mcp(a: argparse.Namespace) -> int:
                       "--allow-remote if you really mean to serve the network.",
                       file=sys.stderr)
                 return 2
-            print(f"agentdescent mcp: WARNING: serving on {host}:{port} with no "
-                  "authentication; anyone who can reach it can start runs and write files.",
+            if not token_env:
+                # The tunnel recipes bind loopback, but a network bind with no
+                # token is the same open endpoint; the token is the only gate
+                # that survives either route (#912).
+                print(f"agentdescent mcp: refusing --allow-remote on {host!r} without "
+                      "--http-token-env: anyone who can reach it can start runs and write "
+                      "files. Pass --http-token-env NAME with the bearer token in $NAME.",
+                      file=sys.stderr)
+                return 2
+            print(f"agentdescent mcp: WARNING: serving on {host}:{port}; every request must "
+                  f"carry `Authorization: Bearer <token>` from ${token_env}.",
                   file=sys.stderr)
+        if token_env:
+            # Fail before the port probe and the URL line: a server that will
+            # answer 401 to everything must not be announced as ready.
+            try:
+                http_token(token_env)
+            except HttpTokenMissing as e:
+                print(f"agentdescent mcp: cannot start the MCP server -- {e}",
+                      file=sys.stderr)
+                return 2
         # A busy port otherwise fails deep inside uvicorn's logs *after* we
         # announced the URL, with the same exit code as a missing SDK, so a
         # backgrounded server looks up and the tunnel reaches someone else's
@@ -5445,7 +5470,8 @@ def cmd_mcp(a: argparse.Namespace) -> int:
                   f"another --port (e.g. --port {suggest}){tail}",
                   file=sys.stderr)
             return MCP_EXIT_PORT_UNAVAILABLE
-        print(f"agentdescent mcp: streamable-http on http://{host}:{port}/mcp",
+        print(f"agentdescent mcp: streamable-http on http://{host}:{port}/mcp"
+              + (" (bearer token required)" if token_env else ""),
               file=sys.stderr)
     try:
         advanced = True if getattr(a, "advanced", False) else None
@@ -5453,11 +5479,14 @@ def cmd_mcp(a: argparse.Namespace) -> int:
             serve(store=a.store, advanced=advanced)
         else:
             serve(store=a.store, transport=transport, host=host, port=port,
-                  advanced=advanced)
+                  advanced=advanced, http_token_env=token_env)
     except ImportError as e:
         print(f"agentdescent mcp: cannot start the MCP server -- {_mcp_import_failure(e)}",
               file=sys.stderr)
         return 3
+    except HttpTokenMissing as e:
+        print(f"agentdescent mcp: cannot start the MCP server -- {e}", file=sys.stderr)
+        return 2
     except RuntimeError as e:
         # mcp < 1.8: serve() raises STREAMABLE_HTTP_REQUIRES instead of the SDK's
         # opaque "Unknown transport" ValueError (#589).
@@ -6364,7 +6393,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="streamable-http port (default 8000); exits 4 if it cannot be "
                         "bound, e.g. already in use")
     s.add_argument("--allow-remote", action="store_true",
-                   help="allow a non-loopback --host (the tools can start runs and write files)")
+                   help="allow a non-loopback --host (the tools can start runs and write "
+                        "files); requires --http-token-env")
+    s.add_argument("--http-token-env", default=None, metavar="NAME",
+                   help="streamable-http: require `Authorization: Bearer <token>` on every "
+                        "request, with the token in the environment variable NAME (never on "
+                        "the command line); required with --allow-remote")
     s.add_argument("--advanced", action="store_true",
                    help="expose audit/meta/platform/experience/… MCP tools "
                         "(default: Path A only — doctor/plan/start/status/show/apply/…; "

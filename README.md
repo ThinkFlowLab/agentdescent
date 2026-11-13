@@ -190,7 +190,7 @@ mirrors them, so a run started from an agent can be inspected from a shell.
 | Codex | `codex plugin marketplace add ThinkFlowLab/agentdescent && codex plugin add agentdescent@agentdescent` | `codex mcp list` |
 | OpenCode | `agentdescent install opencode` | `opencode mcp list` |
 | DeepSeek Harness | `agentdescent install dsh` | `dsh --profile web --dump-config \| grep agentdescent` |
-| Grok Bot | `agentdescent install grok-bot` (a scaffold, not one-click) | read `HOST.md`; MCP via `agentdescent mcp --transport streamable-http` behind an HTTPS tunnel |
+| Grok Bot | `agentdescent install grok-bot` (a scaffold, not one-click) | read `HOST.md`; MCP via `agentdescent mcp --transport streamable-http --http-token-env AGENTDESCENT_MCP_TOKEN` behind an HTTPS tunnel, with that bearer token as the connector's header |
 
 From a checkout, `bash scripts/setup-hosts.sh` installs AgentDescent and wires
 every agent CLI it finds. Then say *"improve this prompt against these

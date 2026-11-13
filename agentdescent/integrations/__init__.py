@@ -1113,11 +1113,13 @@ launcher will not reach the Bot from Cursor's backend.
    `describe_algorithm` when the HTTP MCP below is wired. The skill
    falls back to those verbs when MCP tools are absent.
 3. **MCP (optional, not auto-wired).** Serve the tools over HTTP on loopback
-   and expose them through any HTTPS tunnel, then ask the Bot to add the
-   tunnel URL (ending in `/mcp`) as a custom MCP server:
+   with a bearer token and expose them through any HTTPS tunnel, then ask the
+   Bot to add the tunnel URL (ending in `/mcp`) as a custom MCP server whose
+   request header is `Authorization: Bearer <token>`:
 
    ```bash
-   agentdescent mcp --transport streamable-http --port 8000
+   export AGENTDESCENT_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+   agentdescent mcp --transport streamable-http --port 8000 --http-token-env AGENTDESCENT_MCP_TOKEN
    # in another shell -- the Host header must stay 127.0.0.1:8000, because the
    # server rejects unknown Host headers (DNS-rebinding protection):
    cloudflared tunnel --url http://127.0.0.1:8000 --http-host-header 127.0.0.1:8000
@@ -1127,10 +1129,13 @@ launcher will not reach the Bot from Cursor's backend.
    If port 8000 is taken, the server exits 4 with one line saying so before
    printing any URL; pick another `--port` and use it in the tunnel too.
 
-   The server has **no authentication**: anyone holding the tunnel URL can
-   start runs and `apply` files, so keep the URL private and stop the tunnel
-   when done. A non-loopback `--host` is refused unless you pass
-   `--allow-remote`. Do **not** expect `mcp.example.json` to be picked up
+   Every request without the header is answered 401 **before** an MCP session
+   is created, so anyone holding the tunnel URL alone can reach no tool. The
+   token is read from the named environment variable only: never pass its value
+   as a flag, put it in the URL, or expect it in a log. Without
+   `--http-token-env` a loopback server behaves as before; a non-loopback
+   `--host` is refused unless you pass `--allow-remote` **and** name a token
+   variable. Do **not** expect `mcp.example.json` to be picked up
    automatically — it is documentation.
 4. **Bot template.** To share a Bot that already knows the procedure, use
    Grok Bot's template export (skills + getting-started), not this installer.

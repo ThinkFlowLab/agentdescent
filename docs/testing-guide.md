@@ -247,8 +247,9 @@ There is no host config to check: Grok Bot has no public plugin API for a local
 skill directory or a stdio MCP server, so `install` only writes the scaffold
 under `~/.agentdescent/plugins/grok-bot/`. Save the skill in the Bot and drive
 runs with the CLI, or serve the tools with
-`agentdescent mcp --transport streamable-http` behind an HTTPS tunnel and add
-the tunnel URL (ending in `/mcp`) as a custom MCP server — see
+`agentdescent mcp --transport streamable-http --http-token-env AGENTDESCENT_MCP_TOKEN`
+behind an HTTPS tunnel and add the tunnel URL (ending in `/mcp`) as a custom MCP
+server with that token as its `Authorization: Bearer` header — see
 [the plugin quickstart](plugin-quickstart.md#grok-bot).
 
 ### Driving each host without a terminal session

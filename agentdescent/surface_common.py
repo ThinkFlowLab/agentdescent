@@ -141,6 +141,16 @@ def load_jsonl(value: Any, *, name: str) -> Iterator[Dict[str, Any]]:
 def atomic_write_text(path: str, text: str) -> str:
     """Write text atomically; returns the absolute path."""
     resolved = os.path.abspath(os.path.expanduser(path))
+    if os.path.islink(resolved):
+        # The operator's link is not this writer's to destroy: `os.replace` does
+        # not follow the final symlink, so the target keeps its bytes but the
+        # link is swapped for a regular file without a word -- while init,
+        # apply and demo refuse the same shape at exit 2 (#1008/#1020/#1021).
+        # Only the leaf is checked, so a symlinked directory above it still
+        # resolves as it does today (#1029).
+        raise SurfaceError(
+            f"cannot write {resolved}: {os.path.basename(resolved)!r} "
+            f"is a symlink")
     directory = os.path.dirname(resolved)
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(

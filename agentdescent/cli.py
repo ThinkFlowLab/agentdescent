@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import difflib
+import errno
 import json
 import os
 import re
@@ -1205,28 +1206,84 @@ def count_library_skills(path: str) -> int:
     return n
 
 
+def _preflight_write(path: str) -> None:
+    """Refuse now, before the seed writes, when ``path`` cannot be written (#1003).
+
+    A read-only directory, a regular file where a directory belongs, or a name
+    the filesystem cannot hold all refuse here -- before any starter
+    ``*/SKILL.md`` reaches the target, and without creating anything on the way.
+    """
+    dest = os.path.abspath(path)
+    parent = os.path.dirname(dest) or "."
+    probe_dir = parent
+    while not os.path.exists(probe_dir):
+        up = os.path.dirname(probe_dir)
+        if up == probe_dir:
+            break
+        probe_dir = up
+    try:
+        if not os.path.isdir(probe_dir):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR),
+                                     probe_dir)
+        if os.path.exists(dest):
+            os.close(os.open(dest, os.O_WRONLY))     # test the bit, no truncate
+        elif probe_dir == parent:
+            os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+            os.unlink(dest)
+        else:                       # the write creates the parent; probe the ancestor
+            fd, probe = tempfile.mkstemp(dir=probe_dir, prefix=".ad-probe-")
+            os.close(fd)
+            os.unlink(probe)
+    except OSError as e:
+        raise _cannot_write(path, e) from None
+
+
+def _skill_library_seed_plan(path: str) -> List[Tuple[str, str, str]]:
+    """``(skill_dir, dest, body)`` for the starters still needed; writes nothing (#1003)."""
+    root = os.path.expanduser(path)
+    if not os.path.isdir(root):
+        return []
+    have = count_library_skills(root)
+    existing = {name for name in os.listdir(root)
+                if os.path.isfile(os.path.join(root, name, "SKILL.md"))}
+    planned: List[Tuple[str, str, str]] = []
+    for name, body in _STARTER_LIBRARY_SKILLS:
+        if have >= 2:
+            break
+        if name in existing:
+            continue
+        dest = os.path.join(root, name, "SKILL.md")
+        if not os.path.exists(dest):
+            planned.append((os.path.join(root, name), dest, body))
+            have += 1
+    return planned
+
+
+def _write_skill_library_seed(planned: Sequence[Tuple[str, str, str]]) -> List[str]:
+    """Write a preflighted seed plan; every step refuses with ``cannot write``."""
+    written: List[str] = []
+    for skill_dir, dest, body in planned:
+        try:
+            os.makedirs(skill_dir, exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        written.append(dest)
+    return written
+
+
 def ensure_skill_library_tree(path: str) -> List[str]:
     """Seed ≥2 ``*/SKILL.md`` under ``path`` when fewer exist. Returns written paths."""
     root = os.path.expanduser(path)
-    os.makedirs(root, exist_ok=True)
-    written: List[str] = []
-    if count_library_skills(root) >= 2:
-        return written
-    existing = {name for name in os.listdir(root)
-                if os.path.isfile(os.path.join(root, name, "SKILL.md"))}
-    for name, body in _STARTER_LIBRARY_SKILLS:
-        if name in existing:
-            continue
-        skill_dir = os.path.join(root, name)
-        os.makedirs(skill_dir, exist_ok=True)
-        dest = os.path.join(skill_dir, "SKILL.md")
-        if not os.path.exists(dest):
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(body)
-            written.append(dest)
-        if count_library_skills(root) >= 2:
-            break
-    return written
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        raise _cannot_write(root, e) from None
+    planned = _skill_library_seed_plan(root)
+    for _skill_dir, dest, _body in planned:
+        _preflight_write(dest)
+    return _write_skill_library_seed(planned)
 
 
 def write_starter_spec(
@@ -1303,17 +1360,26 @@ def write_starter_spec(
             raise ValueError(
                 f"--agent {agent}: {why}; pick a matching ref "
                 "(see `agentdescent doctor`) or omit --agent for the default")
-    library_seeded: List[str] = []
-    if spec["kind"] == "skill_library":
-        library_seeded = ensure_skill_library_tree(path)
-    column_notes: List[str] = []
-    if spec["kind"] != "policy_slot" and isinstance(spec.get("data"), dict):
-        columns, column_notes = detect_data_columns(data)
-        spec["data"].update(columns)
     if out is None:
         out = os.path.join(
             ".agentdescent",
             f"{os.path.basename(path.rstrip('/')) or 'spec'}.evolve.json")
+    library_seeded: List[str] = []
+    if spec["kind"] == "skill_library":
+        # Preflight both destinations before anything is written (#1003): the
+        # seed ran before the wrapped `--out` writer, so a refused `--out` left
+        # the starters behind; the `.bak-N` copy is the other late write.
+        plan = _skill_library_seed_plan(path)
+        for _skill_dir, dest, _body in plan:
+            _preflight_write(dest)
+        _preflight_write(out)
+        if os.path.isfile(out):
+            _preflight_write(_backup_slot(out))
+        library_seeded = _write_skill_library_seed(plan)
+    column_notes: List[str] = []
+    if spec["kind"] != "policy_slot" and isinstance(spec.get("data"), dict):
+        columns, column_notes = detect_data_columns(data)
+        spec["data"].update(columns)
     try:
         os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     except OSError as e:

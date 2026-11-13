@@ -614,6 +614,12 @@ and `apply --to` (a text file or a tree) — use the same shape: one
 `error: cannot write <path>: <reason>` line, or `{"ok": false, "error": ...}`
 under `--json`, with exit code 2 (#990).
 
+A skill-library target is a write too: `init <target> --kind skill_library` and
+`algorithms run <name> --kind skill_library` seed `*/SKILL.md` under the target,
+so the target itself must be writable, not only `--out`. An unwritable target is
+refused the same way, and both destinations are checked before anything is
+written, so a refused `--out` leaves no seeded starter behind (#1003).
+
 A run outlives the tool call that started it, but it **inherits the environment
 of the process that launched it** — including provider keys and, in sandboxed
 or proxied setups, `HTTPS_PROXY`. That is what you want from an interactive

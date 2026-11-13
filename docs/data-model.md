@@ -108,13 +108,6 @@ value. Both exist to stop a runaway reflector; both are reported as `oversized`
 in [`result.outcomes()`](evolution.md#why-did-nothing-commit) rather than
 dropped in silence.
 
-The artifact store is a port too: `agentdescent.ports.ArtifactStore` (#924)
-names the five methods a backend implements — `read_tree`/`write_tree` in
-bytes, `list_revisions`, `diff` and `promote` — and `ports.FileArtifactStore`
-is the reference implementation over a directory tree. A backend implements that
-protocol instead of copying files around: `read_tree` output feeds `FileTree`
-directly, so the store and the strategy agree on what the artifact is.
-
 ## `EvidenceCard` — the gradient metadata
 
 ```python

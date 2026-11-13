@@ -5,11 +5,9 @@ store keeps every revision, and ``promote`` names the one an evaluation reads.
 #924 makes that a port instead of a convention, so a directory or object store
 can back it without the loop copying files around.
 
-Layout: ``<root>/<artifact_id>/<revision>/`` holds the bytes and
-``<revision>.json`` its parent and message. Revision names are content-addressed
-(``r-<16 hex>``): the same tree written twice against the same parent is one
-revision. A name or relative path that could leave ``root`` raises
-:class:`ValueError` before anything is written. Stdlib only; no network call.
+``FileArtifactStore`` keeps ``<root>/<artifact_id>/<revision>/`` plus
+``<revision>.json`` (parent, message); a name or path that could leave ``root``
+raises ``ValueError`` before a write. Stdlib only, no network.
 """
 
 from __future__ import annotations
@@ -23,8 +21,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Protocol, Sequence, Union, runtime_checkable
-
-__all__ = ["ArtifactStore", "Diff", "FileArtifactStore"]
 
 _SAFE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
@@ -40,20 +36,14 @@ class Diff:
 
 @runtime_checkable
 class ArtifactStore(Protocol):
-    """``read_tree``/``write_tree`` speak bytes (a weight or an image is not
-    UTF-8); ``list_revisions`` is sorted; ``diff`` is a :class:`Diff`;
-    ``promote`` copies a revision to a stable name and is idempotent."""
+    """``read_tree``/``write_tree`` speak bytes (a weight is not UTF-8);
+    ``list_revisions`` is sorted; ``promote`` copies a revision to a name and is
+    idempotent."""
 
     def read_tree(self, artifact_id: str, revision: str) -> Dict[str, bytes]: ...
 
-    def write_tree(
-        self,
-        artifact_id: str,
-        files: Mapping[str, bytes],
-        *,
-        parent: Optional[str] = None,
-        message: str = "",
-    ) -> str: ...
+    def write_tree(self, artifact_id: str, files: Mapping[str, bytes], *,
+                   parent: Optional[str] = None, message: str = "") -> str: ...
 
     def list_revisions(self, artifact_id: str) -> Sequence[str]: ...
 
@@ -69,12 +59,9 @@ def _name(value: str, what: str) -> str:
 
 
 def _relpath(path: str) -> str:
-    if not isinstance(path, str):
-        raise TypeError(f"file path must be str, got {type(path).__name__}")
-    escape = ("", ".", "..")
-    if not path or path.startswith("/") or "\x00" in path or any(
-        part in escape for part in path.split("/")
-    ):
+    if not path or not isinstance(path, str) or path.startswith("/") or "\x00" in path:
+        raise ValueError(f"unsafe file path {path!r}: expected a relative path")
+    if any(part in ("", ".", "..") for part in path.split("/")):
         raise ValueError(f"unsafe file path {path!r}: expected a relative path")
     return path
 
@@ -84,15 +71,13 @@ def _revision_name(parent: Optional[str], files: Mapping[str, bytes]) -> str:
     digest.update((parent or "").encode("utf-8") + b"\0")
     for path in sorted(files):
         data = files[path]
-        digest.update(path.encode("utf-8") + b"\0")
-        digest.update(str(len(data)).encode("ascii") + b"\0" + data)
+        digest.update(path.encode("utf-8") + b"\0" + str(len(data)).encode() + b"\0" + data)
     return "r-" + digest.hexdigest()[:16]
 
 
 class FileArtifactStore:
-    """The reference backend: one directory tree under ``root`` (created on
-    construction); a revision is staged and renamed, so a partial one is never
-    listed."""
+    """The reference backend: a directory tree under ``root``; every revision is
+    staged and renamed, so a partial one is never listed."""
 
     def __init__(self, root: Union[str, os.PathLike]) -> None:
         self.root = Path(root)
@@ -101,42 +86,17 @@ class FileArtifactStore:
     def read_tree(self, artifact_id: str, revision: str) -> Dict[str, bytes]:
         return self._read(self._dir(artifact_id, revision))
 
-    def write_tree(
-        self,
-        artifact_id: str,
-        files: Mapping[str, bytes],
-        *,
-        parent: Optional[str] = None,
-        message: str = "",
-    ) -> str:
+    def write_tree(self, artifact_id: str, files: Mapping[str, bytes], *,
+                   parent: Optional[str] = None, message: str = "") -> str:
         artifact = self._dir(artifact_id)
         if parent is not None:
             _name(parent, "parent revision")
-        payload: Dict[str, bytes] = {}
-        for path, data in dict(files).items():
+        for path in files:
             _relpath(path)
-            if not isinstance(data, (bytes, bytearray)):
-                raise TypeError(f"file {path!r} must be bytes, got {type(data).__name__}")
-            payload[path] = bytes(data)
+        payload = {path: bytes(data) for path, data in dict(files).items()}
         revision = _revision_name(parent, payload)
-        target = artifact / revision
-        if target.is_dir():
-            return revision
-        artifact.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(artifact)))
-        try:
-            for path, data in payload.items():
-                destination = staging / path
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(data)
-            os.replace(staging, target)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-        (artifact / (revision + ".json")).write_text(
-            json.dumps({"parent": parent, "message": message}, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        if not (artifact / revision).is_dir():
+            self._commit(artifact, revision, payload, parent, message)
         return revision
 
     def list_revisions(self, artifact_id: str) -> Sequence[str]:
@@ -151,32 +111,24 @@ class FileArtifactStore:
     def diff(self, artifact_id: str, base: str, target: str) -> Diff:
         before = self.read_tree(artifact_id, base)
         after = self.read_tree(artifact_id, target)
+        changed = [p for p in set(before) & set(after) if before[p] != after[p]]
         return Diff(
             added=tuple(sorted(set(after) - set(before))),
             removed=tuple(sorted(set(before) - set(after))),
-            changed=tuple(
-                sorted(p for p in set(before) & set(after) if before[p] != after[p])
-            ),
+            changed=tuple(sorted(changed)),
         )
 
     def promote(self, artifact_id: str, revision: str, *, to: str) -> None:
         artifact = self._dir(artifact_id)
-        source = self._dir(artifact_id, revision)
+        files = self._read(self._dir(artifact_id, revision))
         target = artifact / _name(to, "promotion target")
         if target.is_dir():
-            if self._read(target) == self._read(source):
+            if self._read(target) == files:
                 return
             shutil.rmtree(target)
-        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(artifact)))
-        try:
-            shutil.copytree(source, staging, dirs_exist_ok=True)
-            os.replace(staging, target)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+        self._commit(artifact, target.name, files, None, "")
 
     def _dir(self, artifact_id: str, revision: Optional[str] = None) -> Path:
-        """``<root>/<artifact_id>``, or its ``revision`` subdirectory, validated."""
         directory = self.root / _name(artifact_id, "artifact id")
         if revision is None:
             return directory
@@ -184,6 +136,24 @@ class FileArtifactStore:
         if not directory.is_dir():
             raise FileNotFoundError(f"no revision {revision!r} for artifact {artifact_id!r}")
         return directory
+
+    def _commit(self, artifact: Path, name: str, files: Mapping[str, bytes],
+                parent: Optional[str], message: str) -> None:
+        artifact.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(artifact)))
+        try:
+            for path, data in files.items():
+                destination = staging / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            os.replace(staging, artifact / name)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        (artifact / (name + ".json")).write_text(
+            json.dumps({"parent": parent, "message": message}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _read(directory: Path) -> Dict[str, bytes]:

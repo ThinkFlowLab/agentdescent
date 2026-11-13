@@ -17,7 +17,7 @@ installing, the offline demo and the Python 3.9 caveat; this section is the
 reference for what each host gets.
 
 ```bash
-pip install "agentdescent[mcp]>=0.9.0"   # the MCP server needs this extra (and Python >= 3.10)
+pip install "agentdescent[mcp]>=0.10.0"   # the MCP server needs this extra (and Python >= 3.10)
 agentdescent install dsh                 # or: claude-code, codex, opencode, grok-bot
 ```
 
@@ -41,7 +41,8 @@ for any installed host the line names `skill` and `mcp` too (for example
 section (the same data is `hosts` in the JSON report and the MCP `doctor` tool).
 `stale` means the `SKILL.md` a host holds differs from the one this package would
 write now -- what a `pip install -U` leaves behind -- and `partial` means the
-skill or the MCP entry is absent; both are problems (exit code 1) and the fix is
+skill or the MCP entry is absent, or the MCP launcher points at a deleted
+interpreter; both are problems (exit code 1) and the fix is
 to re-run `agentdescent install <host>`. A host CLI on `PATH` with nothing
 installed is a hint, not a problem, because `pip install` wires nothing and not
 every host on a machine should be touched. An OpenCode config with comments (`opencode.jsonc`, or an
@@ -53,8 +54,11 @@ anything is `missing`. Grok Bot's scaffold reports `mcp n/a` (no host-native
 MCP config to check); with a current skill that is still `ok`, not `partial`. An install made through a
 host's own marketplace (`codex plugin add`, Claude Code's `/plugin install`)
 leaves no files here, so it reads `missing` and the hint names that route too.
-Only presence is checked: a launcher pinned to an interpreter that has since
-been deleted still reads `ok`.
+A launcher whose first argument is an absolute path that is no longer an
+executable file reads `mcp broken` (the host is `partial`, exit 1) and the
+host line names the dead path; a relative or bare command such as `python3`
+is not flagged. Re-run `agentdescent install <host>` to pin the current
+interpreter. Grok Bot stays `mcp n/a`.
 
 **Grok Bot over HTTP.** The scaffold edits no host config, because Grok Bot has
 no public one-click plugin API for local skill directories or stdio MCP (custom
@@ -605,6 +609,25 @@ writable `$HOME`, a mistyped `--store`, or a path that is a file), the CLI
 exits 2 with one `error: cannot create run store <path>: <reason>` line, or
 `{"ok": false, "error": ...}` under `--json`, instead of a traceback (#907).
 
+The artifacts written outside the store — `init --out`, `algorithms run --out`,
+and `apply --to` (a text file or a tree) — use the same shape: one
+`error: cannot write <path>: <reason>` line, or `{"ok": false, "error": ...}`
+under `--json`, with exit code 2 (#990).
+
+A skill-library target is a write too: `init <target> --kind skill_library` and
+`algorithms run <name> --kind skill_library` seed `*/SKILL.md` under the target,
+so the target itself must be writable, not only `--out`. An unwritable target is
+refused the same way, and both destinations are checked before anything is
+written, so a refused `--out` leaves no seeded starter behind (#1003).
+
+A destination that is a **symlink** is refused before any backup or write, for
+every kind: the starter directories a skill library is seeded into, the `--out`
+leaf (existing or dangling), and the `<stem>.opencode-providers.json` file next
+to it. The check is `filetree.dest_problem`, the same rule `apply --to` uses, so
+the link is never dereferenced and no `.bak-N` copy holds the bytes of a file
+outside the tree (#1008). A link *above* the destination — a symlinked home, a
+linked project directory — stays allowed.
+
 A run outlives the tool call that started it, but it **inherits the environment
 of the process that launched it** — including provider keys and, in sandboxed
 or proxied setups, `HTTPS_PROXY`. That is what you want from an interactive
@@ -626,7 +649,10 @@ One failure is not resumed by default: a run that ended on `QuotaExhausted` (the
 account's quota for that model is spent) is refused with the reset time the
 provider named, because a relaunch only re-burns a call into the same 429. Pass
 `resume <run_id> --force` -- `force=true` on the MCP tool -- to retry anyway once
-the reset has passed or the key/model has been changed (#926).
+the reset has passed or the key/model has been changed (#926). The same gate
+covers `SubscriptionInactive`, an expired or unprovisioned plan refused on the
+first call, because there is no reset to wait for: renew the subscription or
+point the run at another key/model, then `--force` (#1006).
 
 ### A run that learned nothing: `propose_errors`
 

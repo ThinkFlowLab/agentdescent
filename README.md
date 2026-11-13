@@ -21,7 +21,7 @@
 ## Install
 
 ```bash
-pip install "agentdescent[mcp]>=0.9.0"
+pip install "agentdescent[mcp]>=0.10.0"
 agentdescent demo                         # a complete evolution, offline, no API key, ~10 s
 agentdescent doctor                       # which agent CLIs and provider keys this machine has
 ```

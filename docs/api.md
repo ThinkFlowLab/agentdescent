@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-615 public names across 122 modules.
+617 public names across 122 modules.
 
 ---
 
@@ -858,6 +858,10 @@ The provider refused the request for a reason no retry can change (#635).
 ### `QuotaExhausted`
 
 The account's quota or billing limit is used up until a human acts (#653).
+
+### `SubscriptionInactive`
+
+The account has no active subscription or credit for this endpoint (#1006).
 
 ### `Usage(...)`
 
@@ -3602,6 +3606,10 @@ OptionReport(
 
 Build the evaluation, canary, statistical, Goodhart, metamorphic, verifier and calibration reports from one paired run. &nbsp;·&nbsp; `agentdescent.trust_evidence` &nbsp;·&nbsp; [guide](trust-evidence.md)
 
+### `RunHealth(attempted: int, failed_tasks: Tuple[str, ...] = (), threshold: float = 0.2) -> None`
+
+How much of a run produced a real answer (#993).
+
 ### `TrustEvidence(...)`
 
 The reports one paired evaluation produced, ready for `promote()`.
@@ -3619,6 +3627,8 @@ TrustEvidence(
     contaminated: Optional[bool] = None,
     risk: Optional[float] = None,
     approved: Optional[bool] = None,
+    artifact_changed: Optional[bool] = None,
+    run_health: Optional[RunHealth] = None,
     metadata: Mapping[str, Any] = <factory>
 ) -> None
 ```
@@ -3652,6 +3662,7 @@ build_trust_evidence(
     contaminated: Optional[bool] = None,
     risk: Optional[float] = None,
     approved: Optional[bool] = None,
+    artifact_changed: Optional[bool] = None,
     alpha: float = 0.05,
     seed: int = 0,
     min_effect: float = 0.0

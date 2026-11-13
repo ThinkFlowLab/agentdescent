@@ -387,7 +387,7 @@ from .promotion import (
     ReviewCost,
     promote,
 )
-from .trust_evidence import TrustEvidence, build_trust_evidence
+from .trust_evidence import RunHealth, TrustEvidence, build_trust_evidence
 from .compute_policy import (
     ComputeAction,
     ComputeOption,
@@ -469,6 +469,7 @@ from .agents import (
     AgentError,
     ProviderConfigError,
     QuotaExhausted,
+    SubscriptionInactive,
     Completion,
     Usage,
     claude,
@@ -528,7 +529,7 @@ from .parallel import (
     shard_round_robin,
 )
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 __all__ = [
     "Contract",
@@ -714,6 +715,7 @@ __all__ = [
     "AgentError",
     "ProviderConfigError",
     "QuotaExhausted",
+    "SubscriptionInactive",
     "Usage",
     "metered",
     "claude",
@@ -929,6 +931,7 @@ __all__ = [
     "promote",
     "PromotionLedger",
     "ReleaseRecord",
+    "RunHealth",
     "TrustEvidence",
     "build_trust_evidence",
     "ComputeAction",

@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import difflib
+import errno
 import json
 import os
 import re
@@ -92,6 +93,18 @@ def _out(payload: Any, *, as_json: bool) -> None:
         print(payload)
     else:
         print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
+def _cannot_write(path: str, e: OSError) -> "runstore.RunStoreError":
+    """One `error: cannot write <path>: <reason>` line instead of a traceback.
+
+    `#907` gave the run store that contract inside `runstore.create`. The
+    artifact writers outside the store (``init``/``algorithms run --out``,
+    ``apply --to``) are wrapped at the writer, not with a blanket ``except
+    OSError`` in ``main()``: refusals (``refusing to write ...``) and unrelated
+    bugs still raise (#990).
+    """
+    return runstore.RunStoreError(f"cannot write {path}: {e.strerror or e}")
 
 
 def _spec_error(a: argparse.Namespace, e: Exception) -> int:
@@ -570,6 +583,10 @@ def doctor_report(*, home: Optional[str] = None) -> Dict[str, Any]:
                 f"({info.get('user_skill_path')}); run `agentdescent install {name}`, "
                 f"then in a Grok Bot chat ask it to rewrite its `agentdescent` skill "
                 f"from {info['path']}")
+        elif info.get("mcp") == "broken":
+            problems.append(
+                f"{name}: the MCP launcher points at a deleted interpreter; "
+                f"run `agentdescent install {name}`")
         elif info["state"] in ("stale", "partial"):
             msg = (
                 f"{name}: the installed integration is {info['state']} "
@@ -1150,7 +1167,10 @@ def _backup_existing_spec(out: str, spec: Any) -> Optional[str]:
         except ValueError:
             pass
     backup = _backup_slot(out)
-    shutil.copyfile(out, backup)
+    try:
+        shutil.copyfile(out, backup)
+    except OSError as e:
+        raise _cannot_write(backup, e) from None
     return backup
 
 
@@ -1186,28 +1206,104 @@ def count_library_skills(path: str) -> int:
     return n
 
 
+def _preflight_write(path: str) -> None:
+    """Refuse now, before the seed writes, when ``path`` cannot be written (#1003).
+
+    A read-only directory, a regular file where a directory belongs, or a name
+    the filesystem cannot hold all refuse here -- before any starter
+    ``*/SKILL.md`` reaches the target, and without creating anything on the way.
+    """
+    dest = os.path.abspath(path)
+    parent = os.path.dirname(dest) or "."
+    probe_dir = parent
+    while not os.path.exists(probe_dir):
+        up = os.path.dirname(probe_dir)
+        if up == probe_dir:
+            break
+        probe_dir = up
+    try:
+        if not os.path.isdir(probe_dir):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR),
+                                     probe_dir)
+        if os.path.exists(dest):
+            os.close(os.open(dest, os.O_WRONLY))     # test the bit, no truncate
+        elif probe_dir == parent:
+            os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+            os.unlink(dest)
+        else:                       # the write creates the parent; probe the ancestor
+            fd, probe = tempfile.mkstemp(dir=probe_dir, prefix=".ad-probe-")
+            os.close(fd)
+            os.unlink(probe)
+    except OSError as e:
+        raise _cannot_write(path, e) from None
+
+
+def _refuse_linked_dest(root: str, path: str) -> None:
+    """Refuse a link planted at the destination, before any backup or write (#1008).
+
+    ``_preflight_write`` tests writability only and every test it makes follows a
+    link, so a symlink named exactly like the writer's destination was
+    dereferenced: the spec landed outside the tree and the ``.bak-N`` copy kept
+    the linked file's bytes. The rule is ``filetree.dest_problem`` -- what
+    ``apply --to`` and the tree writer already use (#977) -- with ``root`` set to
+    the directory the writer was given, so a link *above* it stays allowed
+    (dotfiles and homedir layouts) and only the destination itself is refused.
+    """
+    from .filetree import dest_problem
+
+    problem = dest_problem(root, path)
+    if problem is not None:
+        raise runstore.RunStoreError(
+            f"cannot write {os.path.abspath(path)}: {problem}")
+
+
+def _skill_library_seed_plan(path: str) -> List[Tuple[str, str, str]]:
+    """``(skill_dir, dest, body)`` for the starters still needed; writes nothing (#1003)."""
+    root = os.path.expanduser(path)
+    if not os.path.isdir(root):
+        return []
+    have = count_library_skills(root)
+    existing = {name for name in os.listdir(root)
+                if os.path.isfile(os.path.join(root, name, "SKILL.md"))}
+    planned: List[Tuple[str, str, str]] = []
+    for name, body in _STARTER_LIBRARY_SKILLS:
+        if have >= 2:
+            break
+        if name in existing:
+            continue
+        dest = os.path.join(root, name, "SKILL.md")
+        if not os.path.exists(dest):
+            planned.append((os.path.join(root, name), dest, body))
+            have += 1
+    return planned
+
+
+def _write_skill_library_seed(planned: Sequence[Tuple[str, str, str]]) -> List[str]:
+    """Write a preflighted seed plan; every step refuses with ``cannot write``."""
+    written: List[str] = []
+    for skill_dir, dest, body in planned:
+        try:
+            os.makedirs(skill_dir, exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        written.append(dest)
+    return written
+
+
 def ensure_skill_library_tree(path: str) -> List[str]:
     """Seed ≥2 ``*/SKILL.md`` under ``path`` when fewer exist. Returns written paths."""
     root = os.path.expanduser(path)
-    os.makedirs(root, exist_ok=True)
-    written: List[str] = []
-    if count_library_skills(root) >= 2:
-        return written
-    existing = {name for name in os.listdir(root)
-                if os.path.isfile(os.path.join(root, name, "SKILL.md"))}
-    for name, body in _STARTER_LIBRARY_SKILLS:
-        if name in existing:
-            continue
-        skill_dir = os.path.join(root, name)
-        os.makedirs(skill_dir, exist_ok=True)
-        dest = os.path.join(skill_dir, "SKILL.md")
-        if not os.path.exists(dest):
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(body)
-            written.append(dest)
-        if count_library_skills(root) >= 2:
-            break
-    return written
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        raise _cannot_write(root, e) from None
+    planned = _skill_library_seed_plan(root)
+    for _skill_dir, dest, _body in planned:
+        _refuse_linked_dest(root, dest)
+        _preflight_write(dest)
+    return _write_skill_library_seed(planned)
 
 
 def write_starter_spec(
@@ -1284,19 +1380,48 @@ def write_starter_spec(
             raise ValueError(
                 f"--agent {agent}: {why}; pick a matching ref "
                 "(see `agentdescent doctor`) or omit --agent for the default")
-    library_seeded: List[str] = []
-    if spec["kind"] == "skill_library":
-        library_seeded = ensure_skill_library_tree(path)
-    column_notes: List[str] = []
-    if spec["kind"] != "policy_slot" and isinstance(spec.get("data"), dict):
-        columns, column_notes = detect_data_columns(data)
-        spec["data"].update(columns)
     if out is None:
         out = os.path.join(
             ".agentdescent",
             f"{os.path.basename(path.rstrip('/')) or 'spec'}.evolve.json")
-    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    # Every destination is link-checked before any backup or seed write (#1008):
+    # a link at the `--out` leaf, at the providers file, or at a starter
+    # directory was dereferenced, so the spec landed outside the tree and the
+    # `.bak-N` copy kept the linked file's bytes. A link *above* these paths is
+    # still allowed, so a symlinked homedir keeps working.
+    out_dir = os.path.dirname(os.path.abspath(out)) or os.sep
+    _refuse_linked_dest(out_dir, out)
+    if os.path.isfile(out):
+        _refuse_linked_dest(out_dir, _backup_slot(out))
     providers_out = None
+    if spec.get("agent") == {"ref": "opencode"} and model and base_url:
+        stem = os.path.splitext(os.path.basename(out))[0]
+        providers_out = os.path.join(out_dir, f"{stem}.opencode-providers.json")
+        _refuse_linked_dest(out_dir, providers_out)
+        if os.path.isfile(providers_out):
+            _refuse_linked_dest(out_dir, _backup_slot(providers_out))
+    library_seeded: List[str] = []
+    if spec["kind"] == "skill_library":
+        # Preflight both destinations before anything is written (#1003): the
+        # seed ran before the wrapped `--out` writer, so a refused `--out` left
+        # the starters behind; the `.bak-N` copy is the other late write.
+        root = os.path.expanduser(path)
+        plan = _skill_library_seed_plan(path)
+        for _skill_dir, dest, _body in plan:
+            _refuse_linked_dest(root, dest)
+            _preflight_write(dest)
+        _preflight_write(out)
+        if os.path.isfile(out):
+            _preflight_write(_backup_slot(out))
+        library_seeded = _write_skill_library_seed(plan)
+    column_notes: List[str] = []
+    if spec["kind"] != "policy_slot" and isinstance(spec.get("data"), dict):
+        columns, column_notes = detect_data_columns(data)
+        spec["data"].update(columns)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    except OSError as e:
+        raise _cannot_write(out, e) from None
     providers_key_env = None
     providers_backup = None
     if spec.get("agent") == {"ref": "opencode"} and model and base_url:
@@ -1307,19 +1432,22 @@ def write_starter_spec(
         llm = next((b for b in (spec.get("reflect"), spec.get("agent"))
                     if isinstance(b, dict) and b.get("ref") == "openai_compatible"), {})
         providers_key_env = llm.get("api_key_env") or key_env or "OPENAI_API_KEY"
-        stem = os.path.splitext(os.path.basename(out))[0]
-        providers_out = os.path.join(os.path.dirname(os.path.abspath(out)),
-                                     f"{stem}.opencode-providers.json")
         agent_block, providers = opencode_coding_recipe(
             model=model, base_url=base_url, key_env=providers_key_env,
             config_path=providers_out)
         spec["agent"] = agent_block
         providers_backup = _backup_existing_spec(providers_out, providers)
-        with open(providers_out, "w", encoding="utf-8") as fh:
-            json.dump(providers, fh, indent=2)
+        try:
+            with open(providers_out, "w", encoding="utf-8") as fh:
+                json.dump(providers, fh, indent=2)
+        except OSError as e:
+            raise _cannot_write(providers_out, e) from None
     backup = _backup_existing_spec(out, spec)
-    with open(out, "w", encoding="utf-8") as fh:
-        json.dump(spec, fh, indent=2)
+    try:
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(spec, fh, indent=2)
+    except OSError as e:
+        raise _cannot_write(out, e) from None
     report: List[Tuple[str, str]] = [("wrote", f"wrote {out}")]
     for seeded in library_seeded:
         report.append(("wrote", f"seeded {seeded}"))
@@ -1389,10 +1517,11 @@ def write_starter_spec(
                     report.append(("next", "(`agentdescent demo` runs a complete example, "
                                    "offline, to copy from)"))
         if spec["kind"] == "skill_library":
-            # Always tip which wheel cards apply (evoskill needs a real model).
+            # Always tip which wheel cards apply.
             report.append(("note",
                            "skill_library cards: archive_selection "
-                           "(selection rule) or evoskill (needs a real model); "
+                           "(selection rule) or evoskill (proposer/generator); "
+                           "`agentdescent demo --algorithm evoskill` runs evoskill offline; "
                            "`agentdescent algorithms list --kind skill_library`"))
         report.append(("then", f"agentdescent plan {out}"))
     return out, spec, report, providers_out
@@ -1766,11 +1895,23 @@ def require_resume_not_quota_exhausted(run_id: str, *,
     failure keeps resuming, and so does a run whose stored error is not a quota
     refusal -- the gate reads why *this* attempt ended, not whether a quota error
     ever appeared in the run's history.
+
+    An expired subscription is gated the same way (#1006): Ark answers it with
+    a 400 ``InvalidSubscription``, so the next ``resume`` would relaunch into
+    the same refusal. It is not a reset to wait for -- the fix is renewing the
+    plan or pointing the run at another key/model -- so the message names that
+    instead of a reset time.
     """
     st = runstore.get(run_id, store=store).status()
     if st.state != "failed" or not st.error:
         return
     err = st.error.lstrip()
+    if err.startswith("SubscriptionInactive"):
+        raise SpecError(
+            f"cannot resume {run_id}: it failed on SubscriptionInactive -- the "
+            f"account has no active subscription for that endpoint; renew it at "
+            f"the provider, or point the run's model / api_key_env at another "
+            f"plan, or pass --force to retry now")
     if not err.startswith("QuotaExhausted"):
         return
     model = _QUOTA_MODEL_RE.search(err)
@@ -3035,6 +3176,32 @@ def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
             notes, f"run {run_id}")
 
 
+def _refuse_dest_link(top: str, path: str) -> None:
+    """Refuse a link planted in the destination, before any backup or write (#977).
+
+    ``apply`` link-checked the source only and then handed ``--to`` to
+    ``shutil.copy2`` / ``open``, both of which follow a link: probe
+    ``skills/SKILL.md -> id_rsa`` overwrote the target and left
+    ``skills/SKILL.md.bak-0`` holding the target's bytes inside a directory host
+    scanners read. The rule is ``filetree.dest_problem`` -- the tree writer's
+    boundary -- not a second copy of it.
+    """
+    from .filetree import dest_problem
+
+    top = os.path.abspath(top)
+    if top == os.path.abspath(path) and os.path.islink(top):
+        raise runstore.RunStoreError(
+            f"--to {top} is a symlink; refuse to apply (a destination link is "
+            "never dereferenced)")
+    problem = dest_problem(top, path)
+    if problem is not None:
+        raise runstore.RunStoreError(
+            f"refuse to apply to {os.path.abspath(path)!r}: {problem} under "
+            f"--to {top}; a destination link is never dereferenced, and no "
+            ".bak-N may hold what it points at. Remove the link or pick "
+            "another --to")
+
+
 def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str] = None,
                   dry_run: bool = False, backup: bool = True,
                   check_write: Optional[Callable[[str, str], Any]] = None) -> Dict[str, Any]:
@@ -3060,6 +3227,7 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
                 f"{run_id} evolved a single text artifact and {dest!r} is a "
                 "directory; pass --to FILE to write it to a file, or read it "
                 "with `show`")
+        _refuse_dest_link(os.path.dirname(os.path.abspath(dest)) or os.sep, dest)
         plan = _text_plan(dest, result.rendered)
         slot = (_backup_slot(dest)
                 if backup and not plan["noop"] and os.path.exists(dest) else None)
@@ -3076,13 +3244,26 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
             # slot on every apply. Apply, hand-edit, apply again and the second
             # backup was the hand-edit -- the original the first apply had saved
             # was gone, from the same command that promises to keep one.
-            shutil.copy2(dest, slot)
+            try:
+                shutil.copy2(dest, slot)
+            except OSError as e:
+                raise _cannot_write(slot, e) from None
             saved = [slot]
-        with open(dest, "w", encoding="utf-8", newline="") as fh:
-            fh.write(result.rendered)
+        try:
+            with open(dest, "w", encoding="utf-8", newline="") as fh:
+                fh.write(result.rendered)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
         return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
                 "dest": dest}
-    plan = result._write_to(dest, backup=backup, dry_run=dry_run, check_write=check_write)
+    _refuse_dest_link(dest, dest)
+    try:
+        plan = result._write_to(dest, backup=backup, dry_run=dry_run,
+                                check_write=check_write)
+    except OSError as e:
+        # `filetree.materialize` writes the tree, so a refused write there is an
+        # artifact write too (#990).
+        raise _cannot_write(dest, e) from None
     plan["dest"] = dest
     if spec.kind == "skill_library":
         # write_to default prune=False: host skills outside the evolved keys
@@ -3101,7 +3282,9 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
 
 def _backup_slot(dest: str) -> str:
     n = 0
-    while os.path.exists(f"{dest}.bak-{n}"):
+    # `lexists`, not `exists`: a dangling link at `.bak-0` is still a link, and
+    # copying onto it would write through it, outside the destination (#977).
+    while os.path.lexists(f"{dest}.bak-{n}"):
         n += 1
     return f"{dest}.bak-{n}"
 
@@ -3142,6 +3325,7 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                 rendered = fh.read()
         except (OSError, UnicodeDecodeError) as e:
             raise runstore.RunStoreError(f"cannot read {src}: {e}") from None
+        _refuse_dest_link(os.path.dirname(dest) or os.sep, dest)
         plan = _text_plan(dest, rendered)
         slot = (_backup_slot(dest)
                 if backup and not plan["noop"] and os.path.exists(dest) else None)
@@ -3153,13 +3337,22 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                     "source": src, "dest": dest}
         saved = []
         if slot is not None:
-            shutil.copy2(dest, slot)
+            try:
+                shutil.copy2(dest, slot)
+            except OSError as e:
+                raise _cannot_write(slot, e) from None
             saved = [slot]
         parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(dest, "w", encoding="utf-8", newline="") as fh:
-            fh.write(rendered)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        try:
+            with open(dest, "w", encoding="utf-8", newline="") as fh:
+                fh.write(rendered)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
         return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
                 "source": src, "dest": dest}
     if not os.path.isdir(src):
@@ -3167,6 +3360,7 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     if os.path.isfile(dest):
         raise runstore.RunStoreError(
             f"{src} is a directory but --to {dest} is a file")
+    _refuse_dest_link(dest, dest)
 
     def _files(root: str, *, refuse_symlinks: bool = False) -> List[str]:
         """Real files only. With ``refuse_symlinks``, raise if any link is under root.
@@ -3226,6 +3420,11 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     plan: Dict[str, Any] = {"written": changed, "unchanged": unchanged, "extra": extra,
                             "deleted": [], "backup": [], "noop": not changed,
                             "source": src, "dest": dest}
+    # Every leaf, before the backup is taken: a link planted in --to must not
+    # redirect the `.bak-N` copy either, or the backup holds the target's
+    # bytes inside a directory host scanners read (#977).
+    for rel in changed:
+        _refuse_dest_link(dest, os.path.join(dest, rel.replace("/", os.sep)))
     slot = (_file_tree_backup_path(dest)
             if backup and not plan["noop"] and os.path.isdir(dest) else None)
     _check_apply_paths(dest, [os.path.join(dest, rel.replace("/", os.sep))
@@ -3233,11 +3432,17 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     if dry_run or plan["noop"]:
         return plan
     if slot is not None:
-        shutil.copytree(dest, slot, symlinks=True)
+        try:
+            shutil.copytree(dest, slot, symlinks=True)
+        except OSError as e:
+            raise _cannot_write(slot, e) from None
         plan["backup"] = [slot]
     for rel in changed:
         out = os.path.join(dest, rel.replace("/", os.sep))
-        os.makedirs(os.path.dirname(out), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(out, e) from None
         # Source entries are guaranteed non-links by `_files`; still refuse to
         # follow if the tree changed under us.
         src_path = os.path.join(src, rel.replace("/", os.sep))
@@ -3245,7 +3450,10 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
             raise runstore.RunStoreError(
                 f"--from {src} contains symlink(s) ({rel}); refuse to apply "
                 "(would dereference into real files)")
-        shutil.copy2(src_path, out)
+        try:
+            shutil.copy2(src_path, out)
+        except OSError as e:
+            raise _cannot_write(out, e) from None
     return plan
 
 
@@ -3306,6 +3514,13 @@ def cmd_resume(a: argparse.Namespace) -> int:
     return 0
 
 
+def _mcp_bit(info: Dict[str, Any]) -> str:
+    """The ``mcp …`` fragment on a doctor host line, including a dead path."""
+    if info.get("mcp") == "broken" and info.get("mcp_launcher"):
+        return f"mcp broken: {info['mcp_launcher']} not found"
+    return f"mcp {info['mcp']}"
+
+
 def cmd_doctor(a: argparse.Namespace) -> int:
     home = getattr(a, "home", None)
     try:
@@ -3341,12 +3556,12 @@ def cmd_doctor(a: argparse.Namespace) -> int:
                     # No desktop CLI to report; the saved user skill is what the
                     # Bot loads (#675).
                     print(f"host {name}: {info['state']} "
-                          f"(skill {info['skill']}, mcp {info['mcp']}; "
+                          f"(skill {info['skill']}, {_mcp_bit(info)}; "
                           f"user skill {info.get('user_skill', 'unknown')})")
                     continue
                 cli_bit = (f"cli {info['cli']}" if info["cli"] else "cli not on PATH")
                 print(f"host {name}: {info['state']} "
-                      f"(skill {info['skill']}, mcp {info['mcp']}; {cli_bit})")
+                      f"(skill {info['skill']}, {_mcp_bit(info)}; {cli_bit})")
         for h in rep["hints"]:
             print(f"- {h}")
         for p in rep["problems"]:
@@ -5056,6 +5271,28 @@ def _bind_failure(e: BaseException) -> str:
 
 
 def cmd_serve(a: argparse.Namespace) -> int:
+    # The panel is read-only but unauthenticated: it lists every run in the
+    # store, including specs and artifacts. `mcp` already refuses a
+    # non-loopback bind without an opt-in (#911); `serve` publishing the store
+    # to the network from one flag was the gap.
+    from .mcp import is_loopback_host
+
+    if not is_loopback_host(getattr(a, "host", None)) and not getattr(
+            a, "allow_remote", False):
+        message = (f"refusing to listen on non-loopback host {a.host!r}: the run "
+                   "panel has no authentication and shows every run in the store. "
+                   f"Keep --host {runstore.DEFAULT_HTTP_HOST} and expose it with a "
+                   "tunnel, or pass --allow-remote if you really mean to publish "
+                   "the store to the network.")
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": message}, as_json=True)
+        else:
+            print(f"agentdescent serve: {message}", file=sys.stderr)
+        return 2
+    if not is_loopback_host(getattr(a, "host", None)):
+        print(f"agentdescent serve: WARNING: serving on {a.host}:{a.port} with no "
+              "authentication; anyone who can reach it can read every run in the "
+              "store.", file=sys.stderr)
     # Bind before announcing the URL: a busy or invalid --port used to print
     # the banner and then die with a traceback (exit 1), so a backgrounded
     # panel looked up. Same contract as `mcp --transport streamable-http`
@@ -5349,9 +5586,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "--algorithm is a text-only card)")
     s.add_argument("--algorithm", metavar="NAME",
                    help="run the demo with this named algorithm offline "
-                        "(skill_dir / skill_library: archive_selection; text: "
-                        "gepa, dgm, ace, skillopt, rrsi; evoskill is refused — "
-                        "needs a real model). "
+                        "(skill_library: evoskill; skill_dir / skill_library: "
+                        "archive_selection; text: gepa, dgm, ace, skillopt, rrsi). "
                         "Currently: " + ", ".join(_demo_offline_algorithms()))
     s.set_defaults(fn=cmd_demo)
 
@@ -6111,6 +6347,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("serve", help="serve a read-only run panel on loopback, for a host UI")
     s.add_argument("--host", default=runstore.DEFAULT_HTTP_HOST)
     s.add_argument("--port", type=int, default=runstore.DEFAULT_HTTP_PORT)
+    s.add_argument("--allow-remote", action="store_true",
+                   help="allow a non-loopback --host (the panel has no "
+                        "authentication and lists every run in the store)")
     s.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("mcp", help="serve the tools over MCP (stdio by default; needs agentdescent[mcp])")

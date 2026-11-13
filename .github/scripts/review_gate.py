@@ -41,28 +41,36 @@ POLICY = os.path.join(HERE, "..", "agent", "review-policy.json")
 
 def parse_report(body: Optional[str]) -> Dict[str, Any]:
     """The LAST report in one body: a comment may quote an earlier review, and
-    only the last Verdict the reviewer stands behind is read. The tip may be
-    written above that verdict (``Tip SHA:`` first, #774) or inside it
-    (``Verdict: PASS (tip b0a30224)``, #776/#782); both name the same commit, so
-    neither shape is treated as "no report"."""
+    only the last Verdict the reviewer stands behind is read. The tip belongs to
+    that verdict's own block, never to a line appended below it: a bare
+    ``Tip SHA:`` under an older PASS used to re-point the PASS at a commit it
+    never judged (#930). The tip may be written above the verdict (``Tip SHA:``
+    first, #774) or inside it (``Verdict: PASS (tip b0a30224)``, #776/#782); the
+    inline shape wins when both are present. A tip line after the block's
+    evidence (``Ran:`` / ``Not run:``) is prose, not the report's tip, so such a
+    body names no commit and the gate refuses it."""
     lines = re.sub(r"[*`]", "", str(body or "")).split("\n")
     out: Dict[str, Any] = {"tip": None, "verdict": None, "ran": [], "hasNotRun": False}
+    verdicts: List[Any] = []  # (line index, inline tip or None)
+    tips: List[Any] = []  # (line index, hex or None)
+    evidence: List[int] = []  # indices of Ran:/Not run: lines
     for i, raw in enumerate(lines):
         line = raw.strip()
         m = re.match(r"^Tip(?: SHA)?\s*:\s*(.+)$", line, re.I)
         if m:
             hexes = re.search(r"[0-9a-f]{7,40}", m.group(1), re.I)
-            out["tip"] = hexes.group(0).lower() if hexes else None
+            tips.append((i, hexes.group(0).lower() if hexes else None))
         m = re.match(r"^Verdict\s*:\s*(PASS|FAIL|INC)\b(.*)$", line, re.I)
         if m:
             out["verdict"] = m.group(1).upper()
             inline = re.search(r"(?:tip|at)\s*:?\s*([0-9a-f]{7,40})", m.group(2) or "", re.I) \
                 or re.search(r"\b([0-9a-f]{7,40})\b", m.group(2) or "", re.I)
-            if inline:
-                out["tip"] = inline.group(1).lower()
+            verdicts.append((i, inline.group(1).lower() if inline else None))
         m = re.match(r"^(?:(?:What\s+)?I\s+)?Ran\b\s*(?:\([^)]*\))?\s*:\s*(.*)$", line, re.I)
         if m:
+            evidence.append(i)
             out["ran"] = []
+            out["hasNotRun"] = False
             first = m.group(1).strip()
             if first and first != "-":
                 out["ran"].append(first)
@@ -74,7 +82,19 @@ def parse_report(body: Optional[str]) -> Dict[str, Any]:
                 elif nxt != "":
                     break
         if re.match(r"^Not run\s*:", line, re.I):
+            evidence.append(i)
             out["hasNotRun"] = True
+    if verdicts:
+        _, inline_tip = verdicts[-1]
+        if inline_tip:
+            out["tip"] = inline_tip
+        else:
+            start = verdicts[-2][0] + 1 if len(verdicts) > 1 else 0
+            end = next((j for j in evidence if j >= start), len(lines))
+            own = [sha for j, sha in tips if start <= j < end]
+            out["tip"] = own[-1] if own else None
+    else:
+        out["tip"] = tips[-1][1] if tips else None
     return out
 
 

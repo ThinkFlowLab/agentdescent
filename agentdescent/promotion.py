@@ -423,7 +423,10 @@ def promote(request: PromotionRequest,
                 f"eval has {result.n} task(s), needs {policy.min_tasks}")
         if not result.passed:
             hard_fail = True
-            reasons.append("eval gate did not pass")
+            # The detail is what says *why* the gate failed -- a censored run
+            # carries its failure count and rate there (#993), and a bare
+            # "did not pass" would hide it.
+            reasons.append(f"eval gate did not pass: {result.detail}")
         if result.delta < policy.min_effect:
             hard_fail = True
             reasons.append(

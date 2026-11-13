@@ -137,6 +137,14 @@ class MergeContext:
     #: branches on it would be reading the version of itself, which no shipped
     #: policy does.
     policy_digest: str = ""
+    #: Task-level probe measurements, when the installed acceptance policy asked
+    #: for them (#938). Additive and optional: ``None`` is what every run has
+    #: today, and no existing field changes meaning. The aggregator fills it only
+    #: for a policy that declares ``needs_probes``, and it carries both the
+    #: partitions **and** the evaluator, so a policy cannot score its own
+    #: candidate. Typed as ``Any`` to keep this module free of a cycle through
+    #: :mod:`agentdescent.acceptance`, which imports this one for the types.
+    probes: Optional[Any] = None
 
     @staticmethod
     def rate(counts: Tuple[float, float]) -> float:
@@ -233,6 +241,18 @@ class AcceptDecision:
     #: Measured change in the full held-out rate. The aggregator folds this back
     #: into the artifact's running prior when a candidate is refused.
     observed_delta: float = 0.0
+    #: The gate could not measure what it needs, so the candidate is neither
+    #: committed nor rejected (#938). The aggregator reports the category and
+    #: leaves the artifact's prior alone: a missing measurement is not evidence
+    #: against the lesson, and silently falling back to a weaker gate would hide
+    #: that the strong one never ran.
+    defer: bool = False
+    #: Review evidence to store beside the ledger once the commit lands
+    #: (``rule_id -> {precondition, behavior_change, expected_effect, verifier,
+    #: trace_ids, evidence_card_hash}``, #938). ``None`` for a gate that keeps no
+    #: provenance; the aggregator writes it only after ``Ledger.commit`` returned,
+    #: so it cannot bypass CAS.
+    provenance: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)

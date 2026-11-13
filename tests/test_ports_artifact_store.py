@@ -1,8 +1,8 @@
 """`ports.ArtifactStore` and the `FileArtifactStore` reference backend (#1026).
 
-Pins the conformance check, a byte-identical round trip including a non-UTF-8
-file, the #924 acceptance line, sorted `Diff`/`list_revisions`, idempotent
-`promote`, and the traversal refusal that keeps a hostile name inside `root`.
+Pins the conformance check, a byte-identical round trip (a non-UTF-8 file
+included), the #924 acceptance line, sorted output, idempotent `promote`, and the
+traversal refusal that keeps a hostile name inside `root`.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import pytest
 from agentdescent.filetree import load_tree
 from agentdescent.ports import ArtifactStore, Diff, FileArtifactStore
 from agentdescent.treestrategy import FileTree
+
 
 def tree() -> dict[str, bytes]:
     return {

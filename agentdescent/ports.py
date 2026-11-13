@@ -2,8 +2,8 @@
 
 An artifact is a tree of files with revisions: a worker proposes bytes, the
 store keeps every revision, and ``promote`` names the one an evaluation reads.
-#924 makes that a port instead of a convention, so a directory, an object store
-or a database can back it without the loop copying files around.
+#924 makes that a port instead of a convention, so a directory or object store
+can back it without the loop copying files around.
 
 Layout: ``<root>/<artifact_id>/<revision>/`` holds the bytes and
 ``<revision>.json`` its parent and message. Revision names are content-addressed
@@ -26,7 +26,6 @@ from typing import Dict, Mapping, Optional, Protocol, Sequence, Union, runtime_c
 
 __all__ = ["ArtifactStore", "Diff", "FileArtifactStore"]
 
-#: Alphanumeric start, so ``.``, ``..`` and dot-directories are out.
 _SAFE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 

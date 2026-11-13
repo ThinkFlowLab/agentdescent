@@ -473,3 +473,76 @@ def test_demo_algorithm_next_steps_keep_the_algorithm(tmp_path, monkeypatch, nam
     assert f"agentdescent evolve agentdescent.{name}.spec.json" in payload["next"]
     target = "<your-skill-dir>" if payload["kind"] != "text" else "<your-prompt.txt>"
     assert any(target in s for s in payload["next"])
+
+
+# -- `--dir` refuses a link planted at a leaf it would write (#1017) ----------
+
+
+def test_a_symlinked_fixture_leaf_is_refused_before_any_write(tmp_path, capsys):
+    """``--dir`` wrote with a plain ``open()``, so the link was followed and the
+    file it pointed at was replaced, outside the directory the user named."""
+    work = tmp_path / "d1"
+    work.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("keep me\n")
+    (work / "prompt.txt").symlink_to(keep)
+
+    code = cli.main(["--store", str(tmp_path / "runs"), "demo",
+                     "--dir", str(work), "--kind", "text"])
+    err = capsys.readouterr().err
+    assert code == 2, err
+    assert "cannot write" in err and "'prompt.txt' is a symlink" in err
+    assert keep.read_text() == "keep me\n", "the linked file must be untouched"
+    assert (work / "prompt.txt").is_symlink()
+    assert sorted(p.name for p in work.iterdir()) == ["prompt.txt"], (
+        "the refusal must land before the first write, not halfway through")
+
+
+def test_a_symlinked_spec_is_refused_the_same_way(tmp_path, capsys):
+    work = tmp_path / "d2"
+    work.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.json"
+    keep.write_text("{}\n")
+    (work / "spec.json").symlink_to(keep)
+
+    code = cli.main(["--store", str(tmp_path / "runs"), "demo", "--dir", str(work)])
+    err = capsys.readouterr().err
+    assert code == 2, err
+    assert "'spec.json' is a symlink" in err
+    assert keep.read_text() == "{}\n"
+    assert sorted(p.name for p in work.iterdir()) == ["spec.json"]
+
+
+def test_a_symlinked_leaf_is_one_json_error(tmp_path):
+    work = tmp_path / "d3"
+    work.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("keep me\n")
+    (work / "prompt.txt").symlink_to(keep)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = cli.main(["--store", str(tmp_path / "runs"), "--json", "demo",
+                         "--dir", str(work), "--kind", "text"])
+    payload = json.loads(buf.getvalue())
+    assert code == 2
+    assert payload["ok"] is False
+    assert "cannot write" in payload["error"] and "'prompt.txt' is a symlink" in payload["error"]
+    assert keep.read_text() == "keep me\n"
+
+
+def test_a_plain_dir_still_gets_every_fixture_and_the_spec(tmp_path):
+    """Control: the preflight refuses a link, not an ordinary write."""
+    work = tmp_path / "plain"
+    code = cli.main(["--store", str(tmp_path / "runs"), "demo",
+                     "--dir", str(work), "--kind", "text"])
+    assert code == 0
+    assert (work / "prompt.txt").is_file()
+    assert (work / "cases.jsonl").is_file()
+    assert (work / "spec.json").is_file()

@@ -252,8 +252,35 @@ else:
 """
 
 
+def _refuse_linked_dests(root: str, leaves: List[str]) -> None:
+    """Refuse a link planted at any leaf the caller is about to write (#1017).
+
+    ``demo --dir`` wrote every fixture and the spec with a plain
+    ``open(..., "w")``, so a link at the destination was followed: the file it
+    pointed at was replaced and the link stayed a link. The rule is
+    ``filetree.dest_problem`` -- what ``init --out`` and ``apply`` already use
+    (#977, #1008) -- checked over the whole plan **before the first write**, so
+    the first refusal leaves the directory byte-for-byte unchanged instead of
+    half-written.
+    """
+    from .filetree import dest_problem
+
+    for leaf in leaves:
+        problem = dest_problem(root, leaf)
+        if problem is not None:
+            raise ValueError(f"cannot write {os.path.abspath(leaf)}: {problem}")
+
+
+def _library_leaves(root: str) -> List[str]:
+    """Every file ``write_library`` writes, in write order."""
+    return [leaf for name in ("csv-total", "date-parse")
+            for leaf in (os.path.join(root, name, "SKILL.md"),
+                         os.path.join(root, name, "references", "rules.md"))]
+
+
 def write_library(root: str) -> None:
     """Write the two-skill fixture (wrong COLUMN / FIELD on purpose) under ``root``."""
+    _refuse_linked_dests(root, _library_leaves(root))
     for name, skill, rules in (
         ("csv-total", _CSV_LIBRARY_SKILL, _LIBRARY_SEED_RULES["csv-total"]),
         ("date-parse", _DATE_LIBRARY_SKILL, _LIBRARY_SEED_RULES["date-parse"]),
@@ -540,6 +567,16 @@ def build(root: str, algorithm: Optional[str] = None,
           kind: Optional[str] = None) -> Dict[str, Any]:
     """Write the demo's skill/library/prompt, dataset and spec under ``root``."""
     resolved = resolve_demo_kind(algorithm, kind)
+    leaves = [os.path.join(root, "spec.json"), os.path.join(root, "cases.jsonl")]
+    if resolved == "text":
+        leaves.append(os.path.join(root, "prompt.txt"))
+    elif resolved == "skill_library":
+        leaves.extend(_library_leaves(root))
+    else:
+        skill = os.path.join(root, DEMO_SKILL)
+        leaves.extend([os.path.join(skill, "SKILL.md"),
+                       os.path.join(skill, "references", "rules.md")])
+    _refuse_linked_dests(root, leaves)
     if resolved == "text":
         with open(os.path.join(root, "prompt.txt"), "w", encoding="utf-8") as fh:
             fh.write(_TEXT_SEED)

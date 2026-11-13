@@ -913,3 +913,77 @@ thing the parallelism claims were measured with. Same aggregator, staleness and
 governance underneath. See [async](async.md#asyncagentdescent-the-reference-runtime),
 [the reference orchestrator and domain](orchestrator.md), and the measured
 trade-offs in [efficiency experiments](efficiency.md).
+
+### Efficient Artifact search
+
+`ArtifactSearch` composes proposal routing, candidate screening and measured-gain
+feedback through the existing policy interfaces. It works with `evolve()` and
+`async_evolve()`, including population selection. The task runner and evaluator
+stay fixed; only the model generating proposed changes is routed.
+
+```python
+from agentdescent.artifact_search import ArtifactSearch
+from agentdescent.model_router import ModelSpec
+
+# fast_propose and strong_propose are ordinary four-argument reflectors:
+# (rendered_artifact, task, output, reward) -> str | None.
+search = ArtifactSearch(
+    [ModelSpec("fast", cost=1), ModelSpec("strong", cost=4)],
+    {"fast": fast_propose, "strong": strong_propose},
+    seed=7,
+)
+result = evolve(
+    tasks, reward, run=run, strategy=strategy,
+    policies=search.policies(), self_verify=False,
+)
+print(search.report())
+```
+
+Each proposal request calls one reflector once. After one initial attempt per
+model, the existing Thompson router chooses using measured gains and configured
+costs. The wrapper locks routing/bookkeeping but releases the lock for the model
+call. There are no internal retries or hidden extra proposal calls.
+
+The screen applies the actual diff to the current artifact, then compares the
+complete rendered candidate. Exact duplicate detection is the default. Screening
+is confined to one merge batch, artifact, branch and proposal base version; a
+stale card cannot suppress a fresh one, and a later batch can retry an interrupted
+or rejected candidate. Existing evaluation caching still handles repeated work
+across batches. `similarity_threshold=0.95` optionally enables SimHash screening
+of near-copies. This is a text heuristic: similar programs can behave differently,
+so leave it disabled when such distinctions matter.
+
+Screening precedes conflict/fusion and held-out evaluation. The worker's initial
+rollout and generation have already happened. `self_verify=False` also avoids the
+optional worker-side candidate rerun before the screen. No existing acceptance,
+audit or promotion gate is bypassed. To keep a custom acceptance policy, pass it
+as `ArtifactSearch(..., acceptance=policy)`; the default is `DefaultAcceptance`.
+Other slots can be set on the returned `Policies`, for example `selection`.
+Custom aggregators must honor proposal identity, batch screening and the supplied
+acceptance policy; an aggregator that drops merge policies is not supported.
+
+Each structured `Proposal(text, proposal_id)` becomes an evidence card carrying
+that ID. Ordinary string proposers keep working. Feedback uses
+`max(0, candidate_heldout_rate - base_heldout_rate)` only when the measured diff
+matches one identified proposal. It is a measured-gain signal, **not** a commit
+reward: subsequent audit/CAS can still refuse the change. Fused or otherwise
+unattributable measurements do not update individual models. Neither duplicate
+nor stale cards receive fabricated zero-quality observations.
+
+`report()` separates generated/duplicate/feedback counts, pending identities,
+actual generation seconds and **configured cost units**. Costs are estimates
+from `ModelSpec`, not inferred token or dollar usage; model routing does not learn
+new prices from these estimates. A fresh search object is required per run.
+Pending identities are bounded by `max_pending` (default 4096); eviction prevents
+memory growth and means late feedback for that proposal is not attributed.
+Router and pending state are not restored by checkpoint/resume in this recipe.
+
+Run the offline example from a source checkout:
+
+```sh
+python -m examples.efficient_search
+```
+
+Its deterministic reflectors demonstrate the integration. This recipe is not a
+faithful ShinkaEvolve port, and no real-model quality or cost improvement is
+claimed by the fixture.

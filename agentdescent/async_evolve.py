@@ -40,14 +40,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .advantage import GroupAdvantage
 from .agents import Usage
 from .budget import BudgetGovernor, CallBudget
-from .policies import Policies
+from .policies import Policies, Proposal
 from .evolution import (
     _score_seed_held_out,
     _publish_stable, _safe_log,
     Agent, EvolutionResult, Propose, Reward, RoundInfo, Run, Strategy, Task,
     _ASYNC_WIRED_POLICIES, _cost_fields, _fusion_trials, _replay_stats,
     _resolve_policies,
-    SOLVED, _build_engine, _checked_proposal, _checked_reward,
+    SOLVED, _build_engine, _checked_proposal, _checked_reward, _proposal_text,
     _head_for_worker, _step,
 )
 from .aggregator import Aggregator, AggregatorConfig, check_reports
@@ -960,7 +960,7 @@ def async_evolve(
                             for p_i, proposal in enumerate(proposals):
                                 author = (f"w{wid}" if len(proposals) == 1
                                           else f"w{wid}/p{p_i}")
-                                diff = strat.to_diff(art.state, proposal,
+                                diff = strat.to_diff(art.state, _proposal_text(proposal),
                                                      author, art_v, aid)
                                 if diff is None:
                                     continue
@@ -1000,6 +1000,8 @@ def async_evolve(
                                     touched=[aid], before_after_delta=delta,
                                     trajectory_refs=[task],
                                     branch=worker_branch,
+                                    proposal_id=(proposal.proposal_id
+                                                 if isinstance(proposal, Proposal) else ""),
                                     trace_ids=tuple(
                                         t for t in (trace, self_trace)
                                         if t is not None),

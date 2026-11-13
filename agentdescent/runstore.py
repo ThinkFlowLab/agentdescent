@@ -214,7 +214,18 @@ def _write_json(path: str, payload: Any) -> None:
     bytes to a unique sibling and ``os.replace``; always remove the sibling
     in ``finally`` so a dump/replace error (or a raised ``default=str``)
     cannot leave an orphan for a host that globs the run directory.
+
+    A link planted at ``path`` is refused before anything is created (#1030):
+    ``os.replace`` does not follow the final symlink, so the write would land
+    in a fresh regular file and destroy the operator's link while the outside
+    target kept its bytes. ``filetree.leaf_problem`` tests the leaf alone, so a
+    symlinked run directory above it stays legal.
     """
+    from .filetree import leaf_problem
+
+    problem = leaf_problem(path)
+    if problem is not None:
+        raise RunStoreError(f"cannot write {os.path.abspath(path)}: {problem}")
     # Encode before touching the filesystem — same contract as checkpoint /
     # FileCache / Ledger writes. ``default=str`` keeps Path/UUID notes
     # round-trippable; ``OSError`` from the write still propagates.

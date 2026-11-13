@@ -59,6 +59,13 @@ while its record stays available for audit.
   the active/quarantined/retired lifecycle.
 - The store is a single-writer JSON snapshot written atomically, like the
   workspace registry; concurrent writers need their own lock or a real database.
+- The store leaf is a regular file. An existing path that is a directory, a
+  device or a FIFO is refused (`cannot read skill bank …: not a regular
+  file`) instead of reading as an empty bank, and every write refuses a
+  symlink store (`… is a symlink`) before it creates anything. A link *to*
+  a file still reads -- `report` and plain `audit` keep working -- but
+  `--apply` never writes through it: a rename would replace the link and
+  leave two files claiming to be the bank.
 - `retire` / `activate` are library calls; v1 has no CLI verb for them (the
   audit's `--apply` is the only lifecycle write).
 - `baseline` counts every skill's outcomes, including quarantined and retired

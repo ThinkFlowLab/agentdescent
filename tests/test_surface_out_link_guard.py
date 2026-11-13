@@ -36,8 +36,10 @@ def test_governed_harness_init_refuses_a_symlinked_out(tmp_path, capsys):
 
     captured = capsys.readouterr()
     assert code == 2
+    # #1032/#1033 ship one ``error: <message>`` line for a SurfaceError, the
+    # same envelope the ``cannot write`` writers use; the type prefix is gone.
     assert captured.err.strip() == (
-        f"error: SurfaceError: cannot write {link}: 'out_link.json' is a symlink")
+        f"error: cannot write {link}: 'out_link.json' is a symlink")
     assert link.is_symlink()
     assert target.read_text(encoding="utf-8") == "keep-me\n"
     assert not list(work.glob(".agentdescent-surface-*"))
@@ -53,7 +55,7 @@ def test_governed_harness_init_refusal_is_ok_false_under_json(tmp_path, capsys):
     payload = json.loads(captured.out)
     assert payload["ok"] is False
     assert payload["error"] == (
-        f"SurfaceError: cannot write {link}: 'out_link.json' is a symlink")
+        f"cannot write {link}: 'out_link.json' is a symlink")
     assert link.is_symlink()
     assert target.read_text(encoding="utf-8") == "keep-me\n"
 

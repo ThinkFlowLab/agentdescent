@@ -816,6 +816,29 @@ def test_plan_says_when_workers_buy_selection_rather_than_merging(tmp_path, monk
     assert warns, "no model to merge with, so four workers really are selection"
 
 
+def test_plan_selection_warning_quiet_for_an_aggregator_factory(tmp_path):
+    """gepa's Pareto pool admits every surviving proposal (#1039): the
+    best-of-N "collapse to one candidate" warning and its `reflect` advice
+    do not apply on the aggregator_factory path."""
+    from agentdescent.cli import plan_payload
+    from agentdescent.evolvespec import EvolveSpec
+
+    cases = tmp_path / "cases.jsonl"
+    cases.write_text(
+        "\n".join(f'{{"prompt": "q{i}", "gold": "a{i}"}}' for i in range(8)) + "\n",
+        encoding="utf-8")
+    target = tmp_path / "prompt.txt"
+    target.write_text("hi\n", encoding="utf-8")
+    spec = EvolveSpec.from_dict({
+        "kind": "text", "target": str(target),
+        "data": {"path": str(cases), "prompt": "prompt", "gold": "gold"},
+        "score": "contains", "agent": {"ref": "openai_compatible", "model": "m"},
+        "algorithm": "gepa", "evolve": {"n_workers": 4}})
+    payload = plan_payload(spec)
+    assert payload["evolve_kwargs"].get("aggregator_factory") is not None
+    assert not [w for w in payload["warnings"] if "best-of-N" in w]
+
+
 def test_doctor_reports_the_base_url_not_just_that_one_is_set():
     """Given only "OPENAI_API_KEY: true", an agent wrote `"model": "gpt-4o-mini"`
     against an endpoint that serves nothing of the sort. The URL is not a

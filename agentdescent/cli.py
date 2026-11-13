@@ -1861,11 +1861,23 @@ def require_resume_not_quota_exhausted(run_id: str, *,
     failure keeps resuming, and so does a run whose stored error is not a quota
     refusal -- the gate reads why *this* attempt ended, not whether a quota error
     ever appeared in the run's history.
+
+    An expired subscription is gated the same way (#1006): Ark answers it with
+    a 400 ``InvalidSubscription``, so the next ``resume`` would relaunch into
+    the same refusal. It is not a reset to wait for -- the fix is renewing the
+    plan or pointing the run at another key/model -- so the message names that
+    instead of a reset time.
     """
     st = runstore.get(run_id, store=store).status()
     if st.state != "failed" or not st.error:
         return
     err = st.error.lstrip()
+    if err.startswith("SubscriptionInactive"):
+        raise SpecError(
+            f"cannot resume {run_id}: it failed on SubscriptionInactive -- the "
+            f"account has no active subscription for that endpoint; renew it at "
+            f"the provider, or point the run's model / api_key_env at another "
+            f"plan, or pass --force to retry now")
     if not err.startswith("QuotaExhausted"):
         return
     model = _QUOTA_MODEL_RE.search(err)

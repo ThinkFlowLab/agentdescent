@@ -180,6 +180,8 @@ def offline_text_reflector(prompt: str) -> str:
 
 
 LIBRARY_SKILL_NAMES = ("csv-total", "date-parse")
+#: The (deliberately wrong) rules.md each seeded library skill starts with.
+_LIBRARY_SEED_RULES = {"csv-total": "COLUMN: id\n", "date-parse": "FIELD: month\n"}
 
 _CSV_LIBRARY_SKILL = """\
 ---
@@ -253,8 +255,8 @@ else:
 def write_library(root: str) -> None:
     """Write the two-skill fixture (wrong COLUMN / FIELD on purpose) under ``root``."""
     for name, skill, rules in (
-        ("csv-total", _CSV_LIBRARY_SKILL, "COLUMN: id\n"),
-        ("date-parse", _DATE_LIBRARY_SKILL, "FIELD: month\n"),
+        ("csv-total", _CSV_LIBRARY_SKILL, _LIBRARY_SEED_RULES["csv-total"]),
+        ("date-parse", _DATE_LIBRARY_SKILL, _LIBRARY_SEED_RULES["date-parse"]),
     ):
         path = os.path.join(root, name, "references")
         os.makedirs(path, exist_ok=True)
@@ -597,6 +599,25 @@ def _rules_line(state: Dict[str, Any]) -> str:
     return f"rules -> {line!r}"
 
 
+def _skill_bullets(body: Any) -> str:
+    """The ``- `` bullets of an induced SKILL.md, capped, as one quoted string (#1011)."""
+    text = body if isinstance(body, str) else ""
+    bullets = [ln.strip()[2:].strip() for ln in text.splitlines()
+               if ln.strip().startswith("- ") and ln.strip()[2:].strip()]
+    if not bullets:
+        lines = [ln.strip() for ln in text.splitlines()
+                 if ln.strip() and not ln.strip().startswith(("#", "---"))
+                 and ":" not in ln.split(" ", 1)[0]]
+        bullets = lines[:1]
+    if not bullets:
+        return "(empty)"
+    shown = bullets[:_RULES_SHOWN]
+    line = " | ".join(shown)
+    if len(bullets) > len(shown):
+        line = f"{line} (+{len(bullets) - len(shown)} more)"
+    return repr(line)
+
+
 def learned_summary(state: Dict[str, Any], *, kind: str) -> str:
     """One-line description of what the offline demo committed, for ``cmd_demo``."""
     if kind == "text":
@@ -617,12 +638,17 @@ def learned_summary(state: Dict[str, Any], *, kind: str) -> str:
         parts = []
         # #934: evoskill induces a new <slug>/SKILL.md; name that first so
         # "what it learned" is the skill file (with frontmatter), not a hash.
+        # #1011: summarise it by its rule bullets, not the whole file repr.
         for path in sorted(p for p in state if p.endswith("/SKILL.md")):
             slug = path.split("/", 1)[0]
             if slug not in LIBRARY_SKILL_NAMES:
-                parts.append(f"{path} -> {state[path].strip()!r}")
-        for name in LIBRARY_SKILL_NAMES:
-            rules = state.get(f"{name}/references/rules.md", "").strip()
+                parts.append(f"{path} (new) -> {_skill_bullets(state[path])}")
+        seeds = [(name, state.get(f"{name}/references/rules.md", "").strip())
+                 for name in LIBRARY_SKILL_NAMES]
+        changed = [(n, r) for n, r in seeds if r != _LIBRARY_SEED_RULES[n].strip()]
+        # #1011: a seed the run left alone is not something it learned; name
+        # every seed only when nothing changed, so the line is never empty.
+        for name, rules in (changed if parts or changed else seeds):
             parts.append(f"{name}/rules.md -> {rules!r}")
         return "; ".join(parts)
     return f"rules.md -> {state.get('references/rules.md', '').strip()!r}"

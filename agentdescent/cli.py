@@ -582,6 +582,10 @@ def doctor_report(*, home: Optional[str] = None) -> Dict[str, Any]:
                 f"({info.get('user_skill_path')}); run `agentdescent install {name}`, "
                 f"then in a Grok Bot chat ask it to rewrite its `agentdescent` skill "
                 f"from {info['path']}")
+        elif info.get("mcp") == "broken":
+            problems.append(
+                f"{name}: the MCP launcher points at a deleted interpreter; "
+                f"run `agentdescent install {name}`")
         elif info["state"] in ("stale", "partial"):
             msg = (
                 f"{name}: the installed integration is {info['state']} "
@@ -1162,7 +1166,10 @@ def _backup_existing_spec(out: str, spec: Any) -> Optional[str]:
         except ValueError:
             pass
     backup = _backup_slot(out)
-    shutil.copyfile(out, backup)
+    try:
+        shutil.copyfile(out, backup)
+    except OSError as e:
+        raise _cannot_write(backup, e) from None
     return backup
 
 
@@ -1410,10 +1417,11 @@ def write_starter_spec(
                     report.append(("next", "(`agentdescent demo` runs a complete example, "
                                    "offline, to copy from)"))
         if spec["kind"] == "skill_library":
-            # Always tip which wheel cards apply (evoskill needs a real model).
+            # Always tip which wheel cards apply.
             report.append(("note",
                            "skill_library cards: archive_selection "
-                           "(selection rule) or evoskill (needs a real model); "
+                           "(selection rule) or evoskill (proposer/generator); "
+                           "`agentdescent demo --algorithm evoskill` runs evoskill offline; "
                            "`agentdescent algorithms list --kind skill_library`"))
         report.append(("then", f"agentdescent plan {out}"))
     return out, spec, report, providers_out
@@ -3217,13 +3225,22 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                     "source": src, "dest": dest}
         saved = []
         if slot is not None:
-            shutil.copy2(dest, slot)
+            try:
+                shutil.copy2(dest, slot)
+            except OSError as e:
+                raise _cannot_write(slot, e) from None
             saved = [slot]
         parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(dest, "w", encoding="utf-8", newline="") as fh:
-            fh.write(rendered)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        try:
+            with open(dest, "w", encoding="utf-8", newline="") as fh:
+                fh.write(rendered)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
         return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
                 "source": src, "dest": dest}
     if not os.path.isdir(src):
@@ -3303,11 +3320,17 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
     if dry_run or plan["noop"]:
         return plan
     if slot is not None:
-        shutil.copytree(dest, slot, symlinks=True)
+        try:
+            shutil.copytree(dest, slot, symlinks=True)
+        except OSError as e:
+            raise _cannot_write(slot, e) from None
         plan["backup"] = [slot]
     for rel in changed:
         out = os.path.join(dest, rel.replace("/", os.sep))
-        os.makedirs(os.path.dirname(out), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(out, e) from None
         # Source entries are guaranteed non-links by `_files`; still refuse to
         # follow if the tree changed under us.
         src_path = os.path.join(src, rel.replace("/", os.sep))
@@ -3315,7 +3338,10 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
             raise runstore.RunStoreError(
                 f"--from {src} contains symlink(s) ({rel}); refuse to apply "
                 "(would dereference into real files)")
-        shutil.copy2(src_path, out)
+        try:
+            shutil.copy2(src_path, out)
+        except OSError as e:
+            raise _cannot_write(out, e) from None
     return plan
 
 
@@ -3376,6 +3402,13 @@ def cmd_resume(a: argparse.Namespace) -> int:
     return 0
 
 
+def _mcp_bit(info: Dict[str, Any]) -> str:
+    """The ``mcp …`` fragment on a doctor host line, including a dead path."""
+    if info.get("mcp") == "broken" and info.get("mcp_launcher"):
+        return f"mcp broken: {info['mcp_launcher']} not found"
+    return f"mcp {info['mcp']}"
+
+
 def cmd_doctor(a: argparse.Namespace) -> int:
     home = getattr(a, "home", None)
     try:
@@ -3411,12 +3444,12 @@ def cmd_doctor(a: argparse.Namespace) -> int:
                     # No desktop CLI to report; the saved user skill is what the
                     # Bot loads (#675).
                     print(f"host {name}: {info['state']} "
-                          f"(skill {info['skill']}, mcp {info['mcp']}; "
+                          f"(skill {info['skill']}, {_mcp_bit(info)}; "
                           f"user skill {info.get('user_skill', 'unknown')})")
                     continue
                 cli_bit = (f"cli {info['cli']}" if info["cli"] else "cli not on PATH")
                 print(f"host {name}: {info['state']} "
-                      f"(skill {info['skill']}, mcp {info['mcp']}; {cli_bit})")
+                      f"(skill {info['skill']}, {_mcp_bit(info)}; {cli_bit})")
         for h in rep["hints"]:
             print(f"- {h}")
         for p in rep["problems"]:
@@ -5126,6 +5159,28 @@ def _bind_failure(e: BaseException) -> str:
 
 
 def cmd_serve(a: argparse.Namespace) -> int:
+    # The panel is read-only but unauthenticated: it lists every run in the
+    # store, including specs and artifacts. `mcp` already refuses a
+    # non-loopback bind without an opt-in (#911); `serve` publishing the store
+    # to the network from one flag was the gap.
+    from .mcp import is_loopback_host
+
+    if not is_loopback_host(getattr(a, "host", None)) and not getattr(
+            a, "allow_remote", False):
+        message = (f"refusing to listen on non-loopback host {a.host!r}: the run "
+                   "panel has no authentication and shows every run in the store. "
+                   f"Keep --host {runstore.DEFAULT_HTTP_HOST} and expose it with a "
+                   "tunnel, or pass --allow-remote if you really mean to publish "
+                   "the store to the network.")
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": message}, as_json=True)
+        else:
+            print(f"agentdescent serve: {message}", file=sys.stderr)
+        return 2
+    if not is_loopback_host(getattr(a, "host", None)):
+        print(f"agentdescent serve: WARNING: serving on {a.host}:{a.port} with no "
+              "authentication; anyone who can reach it can read every run in the "
+              "store.", file=sys.stderr)
     # Bind before announcing the URL: a busy or invalid --port used to print
     # the banner and then die with a traceback (exit 1), so a backgrounded
     # panel looked up. Same contract as `mcp --transport streamable-http`
@@ -5419,9 +5474,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "--algorithm is a text-only card)")
     s.add_argument("--algorithm", metavar="NAME",
                    help="run the demo with this named algorithm offline "
-                        "(skill_dir / skill_library: archive_selection; text: "
-                        "gepa, dgm, ace, skillopt, rrsi; evoskill is refused — "
-                        "needs a real model). "
+                        "(skill_library: evoskill; skill_dir / skill_library: "
+                        "archive_selection; text: gepa, dgm, ace, skillopt, rrsi). "
                         "Currently: " + ", ".join(_demo_offline_algorithms()))
     s.set_defaults(fn=cmd_demo)
 
@@ -6181,6 +6235,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("serve", help="serve a read-only run panel on loopback, for a host UI")
     s.add_argument("--host", default=runstore.DEFAULT_HTTP_HOST)
     s.add_argument("--port", type=int, default=runstore.DEFAULT_HTTP_PORT)
+    s.add_argument("--allow-remote", action="store_true",
+                   help="allow a non-loopback --host (the panel has no "
+                        "authentication and lists every run in the store)")
     s.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("mcp", help="serve the tools over MCP (stdio by default; needs agentdescent[mcp])")

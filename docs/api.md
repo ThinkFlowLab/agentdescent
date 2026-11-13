@@ -3619,6 +3619,7 @@ TrustEvidence(
     contaminated: Optional[bool] = None,
     risk: Optional[float] = None,
     approved: Optional[bool] = None,
+    artifact_changed: Optional[bool] = None,
     run_health: Optional[RunHealth] = None,
     metadata: Mapping[str, Any] = <factory>
 ) -> None
@@ -3653,6 +3654,7 @@ build_trust_evidence(
     contaminated: Optional[bool] = None,
     risk: Optional[float] = None,
     approved: Optional[bool] = None,
+    artifact_changed: Optional[bool] = None,
     alpha: float = 0.05,
     seed: int = 0,
     min_effect: float = 0.0

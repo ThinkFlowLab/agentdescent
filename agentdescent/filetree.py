@@ -41,6 +41,7 @@ __all__ = [
     "TreeError",
     "canonical",
     "dest_problem",
+    "leaf_problem",
     "parse_tree",
     "load_tree",
     "materialize",
@@ -361,6 +362,21 @@ def dest_problem(root: str, full: str) -> Optional[str]:
     if real != real_root and not real.startswith(real_root + os.sep):
         return f"{rel!r} resolves outside {root!r}"
     return None
+
+
+def leaf_problem(path: str) -> Optional[str]:
+    """Why a link planted at ``path`` itself must be refused, or ``None`` (#1030).
+
+    The same rule as :func:`dest_problem`, with the immediate parent as root, so
+    the component loop tests the leaf alone: a symlinked *directory* above the
+    file -- a store or archive kept on another disk -- stays legal, and only a
+    link *at* the destination is refused. The four atomic writers that were
+    still renaming over a user-named leaf (``workspace_store``,
+    ``consolidation``, ``runstore``) wrap the result as
+    ``cannot write <path>: <problem>``.
+    """
+    full = os.path.abspath(os.path.expanduser(path))
+    return dest_problem(os.path.dirname(full) or ".", full)
 
 
 def materialize(state: Mapping[str, str], dest: str, *, prefix: str = "",

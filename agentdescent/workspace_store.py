@@ -60,8 +60,21 @@ class PersistentWorkspaceRegistry(WorkspaceRegistry):
         return self.to_dict()
 
     def save(self) -> None:
-        """Persist the current snapshot atomically."""
+        """Persist the current snapshot atomically.
+
+        A link planted at the registry file is refused before the temporary is
+        created: ``os.replace`` would not follow it, so the write would land in
+        a fresh regular file and silently destroy the operator's link (#1030).
+        The rule is ``filetree.dest_problem`` with the parent as root, so a
+        symlinked *directory* above the file stays legal and only the leaf is
+        tested.
+        """
         with self._lock:
+            from .filetree import leaf_problem
+
+            problem = leaf_problem(self.path)
+            if problem is not None:
+                raise ValueError(f"cannot write {self.path}: {problem}")
             payload = self.to_dict()
             directory = os.path.dirname(self.path) or "."
             os.makedirs(directory, exist_ok=True)

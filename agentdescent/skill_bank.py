@@ -125,6 +125,13 @@ class SkillRecord:
 
 
 def _atomic(path: str, payload: Mapping[str, Any]) -> None:
+    if os.path.islink(path):
+        # A rename replaces the link, not the file it names, so writing over a
+        # symlink store leaves the link and its target disagreeing about which
+        # file is the bank (#1015). Refuse before mkstemp: no temp file, no
+        # half-written store. The read side keeps following the link.
+        raise SkillBankError(
+            f"cannot write skill bank {path!r}: {path!r} is a symlink")
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
@@ -156,6 +163,12 @@ class SkillBank:
         self._records: Dict[str, SkillRecord] = {}
         if os.path.isfile(self.path):
             self._load()
+        elif os.path.exists(self.path):
+            # A directory, a device or a FIFO is not "no bank yet": reading it
+            # as an empty bank reports `skills: 0`, and `--apply` then claims a
+            # lifecycle write to nothing (#1015).
+            raise SkillBankError(
+                f"cannot read skill bank {self.path!r}: not a regular file")
 
     def _load(self) -> None:
         try:
@@ -259,6 +272,7 @@ class SkillBank:
             raise SkillBankError("min_lift must be finite")
         baseline = self.baseline()
         actions = []
+        changed = False
         for record in self.records:
             lift = record.lift(baseline)
             if record.uses < min_uses:
@@ -278,6 +292,7 @@ class SkillBank:
             if apply and action == "quarantine" and record.status == "active":
                 self.set_status(record.skill_id, "quarantined")
                 row["status"] = "quarantined"
+                changed = True
             actions.append(row)
         return {
             "schema_version": SKILL_BANK_SCHEMA_VERSION,
@@ -286,7 +301,7 @@ class SkillBank:
             "baseline": baseline,
             "min_uses": min_uses,
             "min_lift": float(min_lift),
-            "applied": bool(apply),
+            "applied": changed,
             "actions": actions,
             "counts": {
                 "skills": len(actions),

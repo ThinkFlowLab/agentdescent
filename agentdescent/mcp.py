@@ -552,6 +552,16 @@ class Tools:
                                f"agentdescent.{registered}.spec.json")
         else:
             out = os.path.abspath(os.path.expanduser(out))
+        # Every other tool that writes a file routes its destination through
+        # _check_write; this one passed `out` straight to the CLI helper, so a
+        # host could name any path on the server's filesystem -- including one
+        # outside AGENTDESCENT_SURFACE_WRITE_DIRS (#1018).
+        from .surface_common import SurfaceError
+
+        try:
+            self._check_write(out, "out")
+        except SurfaceError as e:
+            return {"ok": False, "error": str(e)}
         try:
             obj = algorithms_run_payload(
                 name, abs_path, kind=kind, cases=abs_cases, agent=agent,

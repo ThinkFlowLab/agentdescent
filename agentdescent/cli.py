@@ -1238,25 +1238,6 @@ def _preflight_write(path: str) -> None:
         raise _cannot_write(path, e) from None
 
 
-def _refuse_linked_dest(root: str, path: str) -> None:
-    """Refuse a link planted at the destination, before any backup or write (#1008).
-
-    ``_preflight_write`` tests writability only and every test it makes follows a
-    link, so a symlink named exactly like the writer's destination was
-    dereferenced: the spec landed outside the tree and the ``.bak-N`` copy kept
-    the linked file's bytes. The rule is ``filetree.dest_problem`` -- what
-    ``apply --to`` and the tree writer already use (#977) -- with ``root`` set to
-    the directory the writer was given, so a link *above* it stays allowed
-    (dotfiles and homedir layouts) and only the destination itself is refused.
-    """
-    from .filetree import dest_problem
-
-    problem = dest_problem(root, path)
-    if problem is not None:
-        raise runstore.RunStoreError(
-            f"cannot write {os.path.abspath(path)}: {problem}")
-
-
 def _skill_library_seed_plan(path: str) -> List[Tuple[str, str, str]]:
     """``(skill_dir, dest, body)`` for the starters still needed; writes nothing (#1003)."""
     root = os.path.expanduser(path)
@@ -1301,7 +1282,6 @@ def ensure_skill_library_tree(path: str) -> List[str]:
         raise _cannot_write(root, e) from None
     planned = _skill_library_seed_plan(root)
     for _skill_dir, dest, _body in planned:
-        _refuse_linked_dest(root, dest)
         _preflight_write(dest)
     return _write_skill_library_seed(planned)
 
@@ -1384,31 +1364,13 @@ def write_starter_spec(
         out = os.path.join(
             ".agentdescent",
             f"{os.path.basename(path.rstrip('/')) or 'spec'}.evolve.json")
-    # Every destination is link-checked before any backup or seed write (#1008):
-    # a link at the `--out` leaf, at the providers file, or at a starter
-    # directory was dereferenced, so the spec landed outside the tree and the
-    # `.bak-N` copy kept the linked file's bytes. A link *above* these paths is
-    # still allowed, so a symlinked homedir keeps working.
-    out_dir = os.path.dirname(os.path.abspath(out)) or os.sep
-    _refuse_linked_dest(out_dir, out)
-    if os.path.isfile(out):
-        _refuse_linked_dest(out_dir, _backup_slot(out))
-    providers_out = None
-    if spec.get("agent") == {"ref": "opencode"} and model and base_url:
-        stem = os.path.splitext(os.path.basename(out))[0]
-        providers_out = os.path.join(out_dir, f"{stem}.opencode-providers.json")
-        _refuse_linked_dest(out_dir, providers_out)
-        if os.path.isfile(providers_out):
-            _refuse_linked_dest(out_dir, _backup_slot(providers_out))
     library_seeded: List[str] = []
     if spec["kind"] == "skill_library":
         # Preflight both destinations before anything is written (#1003): the
         # seed ran before the wrapped `--out` writer, so a refused `--out` left
         # the starters behind; the `.bak-N` copy is the other late write.
-        root = os.path.expanduser(path)
         plan = _skill_library_seed_plan(path)
         for _skill_dir, dest, _body in plan:
-            _refuse_linked_dest(root, dest)
             _preflight_write(dest)
         _preflight_write(out)
         if os.path.isfile(out):
@@ -1422,6 +1384,7 @@ def write_starter_spec(
         os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     except OSError as e:
         raise _cannot_write(out, e) from None
+    providers_out = None
     providers_key_env = None
     providers_backup = None
     if spec.get("agent") == {"ref": "opencode"} and model and base_url:
@@ -1432,6 +1395,9 @@ def write_starter_spec(
         llm = next((b for b in (spec.get("reflect"), spec.get("agent"))
                     if isinstance(b, dict) and b.get("ref") == "openai_compatible"), {})
         providers_key_env = llm.get("api_key_env") or key_env or "OPENAI_API_KEY"
+        stem = os.path.splitext(os.path.basename(out))[0]
+        providers_out = os.path.join(os.path.dirname(os.path.abspath(out)),
+                                     f"{stem}.opencode-providers.json")
         agent_block, providers = opencode_coding_recipe(
             model=model, base_url=base_url, key_env=providers_key_env,
             config_path=providers_out)
@@ -5413,14 +5379,21 @@ def cmd_mcp(a: argparse.Namespace) -> int:
     transport = getattr(a, "transport", "stdio")
     host = getattr(a, "host", "127.0.0.1")
     port = getattr(a, "port", 8000)
+    token_env = getattr(a, "http_token_env", None) or None
     try:
         from .mcp import (DEFAULT_HTTP_HOST, STREAMABLE_HTTP_REQUIRES,
-                          is_loopback_host, serve)
+                          HttpTokenMissing, http_token, is_loopback_host, serve)
     except ImportError as e:
         print(f"agentdescent mcp: cannot start the MCP server -- {_mcp_import_failure(e)}",
               file=sys.stderr)
         return 3
-    if transport != "stdio":
+    if transport == "stdio":
+        if token_env:
+            print("agentdescent mcp: --http-token-env only applies to "
+                  "--transport streamable-http: stdio carries no HTTP headers.",
+                  file=sys.stderr)
+            return 2
+    else:
         if not is_loopback_host(host):
             if not getattr(a, "allow_remote", False):
                 print(f"agentdescent mcp: refusing to listen on non-loopback host {host!r}: "
@@ -5429,9 +5402,27 @@ def cmd_mcp(a: argparse.Namespace) -> int:
                       "--allow-remote if you really mean to serve the network.",
                       file=sys.stderr)
                 return 2
-            print(f"agentdescent mcp: WARNING: serving on {host}:{port} with no "
-                  "authentication; anyone who can reach it can start runs and write files.",
+            if not token_env:
+                # The tunnel recipes bind loopback, but a network bind with no
+                # token is the same open endpoint; the token is the only gate
+                # that survives either route (#912).
+                print(f"agentdescent mcp: refusing --allow-remote on {host!r} without "
+                      "--http-token-env: anyone who can reach it can start runs and write "
+                      "files. Pass --http-token-env NAME with the bearer token in $NAME.",
+                      file=sys.stderr)
+                return 2
+            print(f"agentdescent mcp: WARNING: serving on {host}:{port}; every request must "
+                  f"carry `Authorization: Bearer <token>` from ${token_env}.",
                   file=sys.stderr)
+        if token_env:
+            # Fail before the port probe and the URL line: a server that will
+            # answer 401 to everything must not be announced as ready.
+            try:
+                http_token(token_env)
+            except HttpTokenMissing as e:
+                print(f"agentdescent mcp: cannot start the MCP server -- {e}",
+                      file=sys.stderr)
+                return 2
         # A busy port otherwise fails deep inside uvicorn's logs *after* we
         # announced the URL, with the same exit code as a missing SDK, so a
         # backgrounded server looks up and the tunnel reaches someone else's
@@ -5445,7 +5436,8 @@ def cmd_mcp(a: argparse.Namespace) -> int:
                   f"another --port (e.g. --port {suggest}){tail}",
                   file=sys.stderr)
             return MCP_EXIT_PORT_UNAVAILABLE
-        print(f"agentdescent mcp: streamable-http on http://{host}:{port}/mcp",
+        print(f"agentdescent mcp: streamable-http on http://{host}:{port}/mcp"
+              + (" (bearer token required)" if token_env else ""),
               file=sys.stderr)
     try:
         advanced = True if getattr(a, "advanced", False) else None
@@ -5453,11 +5445,14 @@ def cmd_mcp(a: argparse.Namespace) -> int:
             serve(store=a.store, advanced=advanced)
         else:
             serve(store=a.store, transport=transport, host=host, port=port,
-                  advanced=advanced)
+                  advanced=advanced, http_token_env=token_env)
     except ImportError as e:
         print(f"agentdescent mcp: cannot start the MCP server -- {_mcp_import_failure(e)}",
               file=sys.stderr)
         return 3
+    except HttpTokenMissing as e:
+        print(f"agentdescent mcp: cannot start the MCP server -- {e}", file=sys.stderr)
+        return 2
     except RuntimeError as e:
         # mcp < 1.8: serve() raises STREAMABLE_HTTP_REQUIRES instead of the SDK's
         # opaque "Unknown transport" ValueError (#589).
@@ -6364,7 +6359,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="streamable-http port (default 8000); exits 4 if it cannot be "
                         "bound, e.g. already in use")
     s.add_argument("--allow-remote", action="store_true",
-                   help="allow a non-loopback --host (the tools can start runs and write files)")
+                   help="allow a non-loopback --host (the tools can start runs and write "
+                        "files); requires --http-token-env")
+    s.add_argument("--http-token-env", default=None, metavar="NAME",
+                   help="streamable-http: require `Authorization: Bearer <token>` on every "
+                        "request, with the token in the environment variable NAME (never on "
+                        "the command line); required with --allow-remote")
     s.add_argument("--advanced", action="store_true",
                    help="expose audit/meta/platform/experience/… MCP tools "
                         "(default: Path A only — doctor/plan/start/status/show/apply/…; "

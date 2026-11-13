@@ -128,15 +128,21 @@ with its state and the command to run. Common aliases work too: `claude`,
 `~/.agentdescent/plugins/grok-bot/` (skill + `HOST.md` + example MCP JSON).
 There is no one-click host wire-up yet — read `HOST.md` for the current
 best path (save the skill in the Bot; drive runs with the CLI). To give the
-Bot the MCP tools, serve them over HTTP and expose them with a tunnel, then add
-the tunnel URL (ending in `/mcp`) as a custom MCP server:
+Bot the MCP tools, serve them over HTTP with a bearer token and expose them with
+a tunnel, then add the tunnel URL (ending in `/mcp`) as a custom MCP server
+whose request header is `Authorization: Bearer <token>`:
 
 ```bash
-agentdescent mcp --transport streamable-http --port 8000
+export AGENTDESCENT_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+agentdescent mcp --transport streamable-http --port 8000 --http-token-env AGENTDESCENT_MCP_TOKEN
 cloudflared tunnel --url http://127.0.0.1:8000 --http-host-header 127.0.0.1:8000
 ```
 
-The HTTP server has no authentication, so keep the URL private. See
+Every request without the header is answered 401 before an MCP session exists,
+so the tunnel URL on its own reaches no tool. The token lives in the named
+environment variable only — it is not a flag value, not in the URL, and never
+printed. If your connector cannot send a custom `Authorization` header, drive
+runs with the CLI on the Bot's computer instead. See
 [Use it from your agent](plugins.md).
 
 Then load it, and check it is actually there:

@@ -125,7 +125,12 @@ def _surface_error(a: argparse.Namespace, error: Exception) -> int:
     """A product-surface error: JSON under --json, one stderr line otherwise."""
     if os.environ.get("AGENTDESCENT_DEBUG"):
         raise error
-    message = f"{type(error).__name__}: {error}"
+    from .surface_common import SurfaceError
+
+    # A surface's own refusal reads like every other writer's line (`error:
+    # cannot write ...`, #1029); anything unexpected keeps its type for the log.
+    message = (str(error) if isinstance(error, SurfaceError)
+               else f"{type(error).__name__}: {error}")
     if getattr(a, "json", False):
         _out({"ok": False, "error": message}, as_json=True)
     else:

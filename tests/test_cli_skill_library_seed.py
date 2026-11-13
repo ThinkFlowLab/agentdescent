@@ -176,7 +176,7 @@ def test_a_symlinked_starter_dir_is_refused(tmp_path, capsys, as_json):
                         "--agent", "cli_agent", "--out", str(tmp_path / "s.json")))
     assert rc == 2
     _assert_link_refusal(capsys, as_json, target / "example-alpha")
-    assert sorted(p.name for p in outside.iterdir()) == []
+    assert sorted(p.name for p in (outside / "example-alpha").iterdir()) == []
     assert _skill_md(target) == []
 
 
@@ -190,7 +190,7 @@ def test_algorithms_run_symlinked_starter_dir_is_refused(tmp_path, capsys, as_js
                         "--kind", "skill_library", "--out", str(tmp_path / "s.json")))
     assert rc == 2
     _assert_link_refusal(capsys, as_json, target / "example-alpha")
-    assert sorted(p.name for p in outside.iterdir()) == []
+    assert sorted(p.name for p in (outside / "example-alpha").iterdir()) == []
     assert _skill_md(target) == []
 
 

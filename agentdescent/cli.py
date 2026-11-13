@@ -122,10 +122,19 @@ def _spec_error(a: argparse.Namespace, e: Exception) -> int:
 
 
 def _surface_error(a: argparse.Namespace, error: Exception) -> int:
-    """A product-surface error: JSON under --json, one stderr line otherwise."""
+    """A product-surface error: JSON under --json, one stderr line otherwise.
+
+    A ``SurfaceError`` is a refusal the caller is meant to read, so it keeps the
+    ``error: <message>`` envelope the ``cannot write`` writers already use
+    (#1008, #1017, #1015): one line, no class name in front of it (#1032). Any
+    other exception keeps its class, which is diagnostic rather than noise.
+    """
     if os.environ.get("AGENTDESCENT_DEBUG"):
         raise error
-    message = f"{type(error).__name__}: {error}"
+    from .surface_common import SurfaceError
+
+    message = (str(error) if isinstance(error, SurfaceError)
+               else f"{type(error).__name__}: {error}")
     if getattr(a, "json", False):
         _out({"ok": False, "error": message}, as_json=True)
     else:

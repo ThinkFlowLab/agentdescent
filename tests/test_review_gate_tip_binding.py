@@ -47,9 +47,10 @@ def c(body, login="Birfy", at="2026-11-11T10:00:00Z", kind="comment"):
 def test_an_appended_tip_line_does_not_repoint_an_older_pass():
     # The live shape from #930: PASS at HEAD, then a re-tip note under it.
     body = report(tip=HEAD) + "\n\n" + f"Tip SHA: `{OTHER}` (re-tipped, please re-review)"
-    # The gate must not hand the older PASS to the tip the note appended.
+    # The gate must not hand the older PASS to the tip the note appended: the
+    # report names HEAD, so judging OTHER fails with "names HEAD, not the tip".
     moved = rg.decide(OTHER, "HugoXK", [c(body)], POLICY)
-    assert not moved["ok"] and "no Tip SHA" in moved["reason"]
+    assert not moved["ok"] and "not the tip" in moved["reason"]
     assert rg.parse_report(body)["tip"] == HEAD
     r = rg.decide(HEAD, "HugoXK", [c(body)], POLICY)
     assert r["ok"] and r["by"] == "Birfy" and r["tip"] == HEAD

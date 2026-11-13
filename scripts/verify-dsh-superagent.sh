@@ -60,6 +60,8 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 (
+  # A subshell: its `exit 1` becomes the script's exit under `set -e`, and the
+  # EXIT trap still removes $work when it does.
   cd "$work"
   # An isolated HOME, so the pilot cannot touch the real ~/.agentdescent.
   export HOME="$work/home"

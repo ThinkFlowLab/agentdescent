@@ -46,12 +46,11 @@ pip install "agentdescent[mcp]"
 dsh plugin --profile superagent add link:/path/to/dsh-agentdescent
 ```
 
-`dsh plugin --profile superagent add <package>` is the command dsh itself names
-when the profile is missing (`dsh --profile superagent --dump-config`:
-`profile "superagent" does not exist; create it with 'dsh plugin --profile
-superagent add <package>'`), so the profile is created by the install, not
-before it. *Unverified on this page:* that the `superagent` profile then behaves
-exactly as `web` does. If `dsh plugin --profile superagent` reports no plugin
+*Unverified on this page:* that the `superagent` profile behaves exactly as
+`web` does. What dsh itself does say: `dsh --profile superagent --dump-config`
+fails with `profile "superagent" does not exist; create it with 'dsh plugin
+--profile superagent add <package>'`, so the profile is created by the install
+rather than before it. If `dsh plugin --profile superagent` reports no plugin
 surface, use the file-based install instead — it needs no profile support beyond
 the skill directory dsh already reads:
 
@@ -97,8 +96,12 @@ your tree, under the operator's write allowlist).
   default is the server's cwd plus `$AGENTDESCENT_HOME`
   (`agentdescent/surface_common.py:178-190`); an empty value refuses every MCP
   write path, which is the safest setting for a worker that should only plan.
-  Since `#1018` the `algorithm_spec` tool obeys the same allowlist, so a worker
-  cannot drop a spec outside its Ticket by naming an `out`.
+  `algorithm_spec` obeys this allowlist from the release that carries
+  [`#1018`](https://github.com/ThinkFlowLab/agentdescent/issues/1018) (fix in
+  [`#1022`](https://github.com/ThinkFlowLab/agentdescent/pull/1022)). On an older
+  version it can drop a spec outside its Ticket by naming an `out`: set the
+  allowlist empty for a plan-only worker, or do not expose `algorithm_spec`
+  at all.
 - Keep `--store` inside the run directory, so a Ticket's runs are removable with
   the Ticket.
 - `plan` is the budget line: it estimates cost without executing. Read it before

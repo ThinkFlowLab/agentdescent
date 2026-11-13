@@ -252,8 +252,39 @@ else:
 """
 
 
+_LIBRARY_FIXTURES = ("csv-total", "date-parse")
+_LIBRARY_FILES = ("SKILL.md", os.path.join("references", "rules.md"))
+
+
+def _refuse_linked_dest(root: str, *paths: str) -> None:
+    """Refuse a link planted at a fixture leaf, before the first write (#1017).
+
+    ``#1008`` settled this for ``init`` and ``#977`` for the tree writer, but the
+    demo wrote every fixture and its spec with a plain ``open(..., "w")``: a link
+    named exactly like a leaf was dereferenced, so the demo's bytes landed
+    outside ``--dir`` and the linked file's bytes were destroyed. The rule is
+    ``filetree.dest_problem`` with ``root`` set to the directory the writer was
+    given, so a link *above* it stays allowed and only the destination itself is
+    refused. Every leaf is checked here, before the first byte, because a
+    partial fixture is worse than no fixture.
+    """
+    from .filetree import dest_problem
+
+    for path in paths:
+        problem = dest_problem(root, path)
+        if problem is not None:
+            raise ValueError(
+                f"cannot write {os.path.abspath(path)}: {problem}")
+
+
+def _library_leaves(root: str) -> List[str]:
+    return [os.path.join(root, name, name_file)
+            for name in _LIBRARY_FIXTURES for name_file in _LIBRARY_FILES]
+
+
 def write_library(root: str) -> None:
     """Write the two-skill fixture (wrong COLUMN / FIELD on purpose) under ``root``."""
+    _refuse_linked_dest(root, *_library_leaves(root))
     for name, skill, rules in (
         ("csv-total", _CSV_LIBRARY_SKILL, _LIBRARY_SEED_RULES["csv-total"]),
         ("date-parse", _DATE_LIBRARY_SKILL, _LIBRARY_SEED_RULES["date-parse"]),
@@ -540,6 +571,19 @@ def build(root: str, algorithm: Optional[str] = None,
           kind: Optional[str] = None) -> Dict[str, Any]:
     """Write the demo's skill/library/prompt, dataset and spec under ``root``."""
     resolved = resolve_demo_kind(algorithm, kind)
+    # Every leaf this kind is about to write, preflighted as a set: a link at
+    # the spec must stop the fixtures too (#1017).
+    if resolved == "text":
+        leaves = [os.path.join(root, "prompt.txt")]
+    elif resolved == "skill_library":
+        leaves = _library_leaves(root)
+    else:
+        skill = os.path.join(root, DEMO_SKILL)
+        leaves = [os.path.join(skill, "SKILL.md"),
+                  os.path.join(skill, "references", "rules.md")]
+    leaves = leaves + [os.path.join(root, "cases.jsonl"),
+                       os.path.join(root, "spec.json")]
+    _refuse_linked_dest(root, *leaves)
     if resolved == "text":
         with open(os.path.join(root, "prompt.txt"), "w", encoding="utf-8") as fh:
             fh.write(_TEXT_SEED)

@@ -109,6 +109,9 @@ def test_an_unchanged_artifact_reports_no_gain_even_with_health():
     assert evidence.eval_result.detail.count("run health") == 1
     assert evidence.eval_result.detail.count("artifact unchanged") == 1
 
+    rebuilt = replace(evidence)
+    assert rebuilt.eval_result.detail.count("artifact unchanged") == 1
+
 
 def test_a_health_count_without_its_ids_is_a_caller_error():
     with pytest.raises(ValueError):

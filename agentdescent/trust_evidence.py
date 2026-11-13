@@ -168,6 +168,9 @@ def _run_health(value: Any) -> RunHealth:
         threshold=value.get("threshold", 0.2))
 
 
+_ARTIFACT_NOTE_TEXT = ("; artifact unchanged, so the eval delta is evaluation "
+                       "noise, not learning")
+_ARTIFACT_NOTE = re.compile(re.escape(_ARTIFACT_NOTE_TEXT))
 _HEALTH_NOTE = re.compile(r"; run health: .*?task\(s\)")
 
 
@@ -230,9 +233,8 @@ class TrustEvidence:
             # caller that builds the bundle directly from its own EvalResult.
             object.__setattr__(self, "eval_result", replace(
                 self.eval_result, delta=0.0, passed=False,
-                detail=(self.eval_result.detail +
-                        "; artifact unchanged, so the eval delta is evaluation "
-                        "noise, not learning").lstrip("; ")))
+                detail=(_ARTIFACT_NOTE.sub("", self.eval_result.detail) +
+                        _ARTIFACT_NOTE_TEXT).lstrip("; ")))
         if self.risk is not None:
             risk = _finite(self.risk, "risk")
             if not 0.0 <= risk <= 1.0:

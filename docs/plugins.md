@@ -17,7 +17,7 @@ installing, the offline demo and the Python 3.9 caveat; this section is the
 reference for what each host gets.
 
 ```bash
-pip install "agentdescent[mcp]>=0.9.0"   # the MCP server needs this extra (and Python >= 3.10)
+pip install "agentdescent[mcp]>=0.10.0"   # the MCP server needs this extra (and Python >= 3.10)
 agentdescent install dsh                 # or: claude-code, codex, opencode, grok-bot
 ```
 

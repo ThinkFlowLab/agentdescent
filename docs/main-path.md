@@ -74,6 +74,31 @@ when you need a single session with acceptance/decision logging; use
 campaign's run database without the compute, foundry or experience callbacks;
 it only inspects the durable run store.
 
+## The embedding facade
+
+The package exports the research surface too, and that surface changes. An
+integrator that embeds the engine should pin `agentdescent.facade` instead:
+
+```python
+from agentdescent.facade import API_VERSION, EvolutionResult, evolve
+
+result = evolve(tasks, reward, agent, SingleSlot(initial_value=""))
+```
+
+`facade` re-exports one curated list covering Path A and the durable
+`LoopKernel` path: the artifact strategies, the policies, the verifier, the
+ledger, the run store, `evolve`/`async_evolve` and the loop kernel. The promise,
+tied to `API_VERSION`:
+
+- a new symbol is **additive** and does not change the version;
+- a name is not removed or renamed without a version bump;
+- everything outside `facade.__all__` -- including everything
+  `agentdescent/__init__.py` exports -- is not covered by this promise.
+
+`tests/test_facade.py` pins the list and the version, so widening or narrowing
+the surface is a deliberate test edit. Extending the package still means
+importing from the canonical module; `facade` defines nothing of its own.
+
 ## Advanced layers (supported, narrower)
 
 | layer | canonical modules | surface |

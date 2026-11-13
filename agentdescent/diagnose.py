@@ -156,6 +156,12 @@ def _run_failed_next(run_id: str, error: str, store: Optional[str]) -> Tuple[str
     first = ("read log.txt / status.json for the first failure"
              if _has_log(run_id, store) else
              "read status.json (`agentdescent show <run_id>`) for the first failure")
+    if "SubscriptionInactive" in error or "no active subscription" in error:
+        # #1006: an expired plan is not a quota that resets, and `doctor` only
+        # checks that the key is set, so it was the same dead end as #635.
+        return ("the account has no active subscription for this endpoint; renew "
+                "it at the provider, or point api_key_env / model at another plan",
+                first.replace("<run_id>", run_id))
     if "QuotaExhausted" in error or "quota for this model is used up" in error:
         return ("the account's quota for this model is used up; wait for the "
                 "reset the provider names, or point api_key_env / model at "

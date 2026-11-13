@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-616 public names across 122 modules.
+617 public names across 122 modules.
 
 ---
 
@@ -858,6 +858,10 @@ The provider refused the request for a reason no retry can change (#635).
 ### `QuotaExhausted`
 
 The account's quota or billing limit is used up until a human acts (#653).
+
+### `SubscriptionInactive`
+
+The account has no active subscription or credit for this endpoint (#1006).
 
 ### `Usage(...)`
 

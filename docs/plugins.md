@@ -635,7 +635,10 @@ One failure is not resumed by default: a run that ended on `QuotaExhausted` (the
 account's quota for that model is spent) is refused with the reset time the
 provider named, because a relaunch only re-burns a call into the same 429. Pass
 `resume <run_id> --force` -- `force=true` on the MCP tool -- to retry anyway once
-the reset has passed or the key/model has been changed (#926).
+the reset has passed or the key/model has been changed (#926). The same gate
+covers `SubscriptionInactive`, an expired or unprovisioned plan refused on the
+first call, because there is no reset to wait for: renew the subscription or
+point the run at another key/model, then `--force` (#1006).
 
 ### A run that learned nothing: `propose_errors`
 

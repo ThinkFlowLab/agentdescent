@@ -635,6 +635,14 @@ so the target itself must be writable, not only `--out`. An unwritable target is
 refused the same way, and both destinations are checked before anything is
 written, so a refused `--out` leaves no seeded starter behind (#1003).
 
+A destination that is a **symlink** is refused before any backup or write, for
+every kind: the starter directories a skill library is seeded into, the `--out`
+leaf (existing or dangling), and the `<stem>.opencode-providers.json` file next
+to it. The check is `filetree.dest_problem`, the same rule `apply --to` uses, so
+the link is never dereferenced and no `.bak-N` copy holds the bytes of a file
+outside the tree (#1008). A link *above* the destination — a symlinked home, a
+linked project directory — stays allowed.
+
 A run outlives the tool call that started it, but it **inherits the environment
 of the process that launched it** — including provider keys and, in sandboxed
 or proxied setups, `HTTPS_PROXY`. That is what you want from an interactive

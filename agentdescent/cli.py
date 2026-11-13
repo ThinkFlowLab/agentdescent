@@ -1238,6 +1238,25 @@ def _preflight_write(path: str) -> None:
         raise _cannot_write(path, e) from None
 
 
+def _refuse_linked_dest(root: str, path: str) -> None:
+    """Refuse a link planted at the destination, before any backup or write (#1008).
+
+    ``_preflight_write`` tests writability only and every test it makes follows a
+    link, so a symlink named exactly like the writer's destination was
+    dereferenced: the spec landed outside the tree and the ``.bak-N`` copy kept
+    the linked file's bytes. The rule is ``filetree.dest_problem`` -- what
+    ``apply --to`` and the tree writer already use (#977) -- with ``root`` set to
+    the directory the writer was given, so a link *above* it stays allowed
+    (dotfiles and homedir layouts) and only the destination itself is refused.
+    """
+    from .filetree import dest_problem
+
+    problem = dest_problem(root, path)
+    if problem is not None:
+        raise runstore.RunStoreError(
+            f"cannot write {os.path.abspath(path)}: {problem}")
+
+
 def _skill_library_seed_plan(path: str) -> List[Tuple[str, str, str]]:
     """``(skill_dir, dest, body)`` for the starters still needed; writes nothing (#1003)."""
     root = os.path.expanduser(path)
@@ -1282,6 +1301,7 @@ def ensure_skill_library_tree(path: str) -> List[str]:
         raise _cannot_write(root, e) from None
     planned = _skill_library_seed_plan(root)
     for _skill_dir, dest, _body in planned:
+        _refuse_linked_dest(root, dest)
         _preflight_write(dest)
     return _write_skill_library_seed(planned)
 
@@ -1364,13 +1384,31 @@ def write_starter_spec(
         out = os.path.join(
             ".agentdescent",
             f"{os.path.basename(path.rstrip('/')) or 'spec'}.evolve.json")
+    # Every destination is link-checked before any backup or seed write (#1008):
+    # a link at the `--out` leaf, at the providers file, or at a starter
+    # directory was dereferenced, so the spec landed outside the tree and the
+    # `.bak-N` copy kept the linked file's bytes. A link *above* these paths is
+    # still allowed, so a symlinked homedir keeps working.
+    out_dir = os.path.dirname(os.path.abspath(out)) or os.sep
+    _refuse_linked_dest(out_dir, out)
+    if os.path.isfile(out):
+        _refuse_linked_dest(out_dir, _backup_slot(out))
+    providers_out = None
+    if spec.get("agent") == {"ref": "opencode"} and model and base_url:
+        stem = os.path.splitext(os.path.basename(out))[0]
+        providers_out = os.path.join(out_dir, f"{stem}.opencode-providers.json")
+        _refuse_linked_dest(out_dir, providers_out)
+        if os.path.isfile(providers_out):
+            _refuse_linked_dest(out_dir, _backup_slot(providers_out))
     library_seeded: List[str] = []
     if spec["kind"] == "skill_library":
         # Preflight both destinations before anything is written (#1003): the
         # seed ran before the wrapped `--out` writer, so a refused `--out` left
         # the starters behind; the `.bak-N` copy is the other late write.
+        root = os.path.expanduser(path)
         plan = _skill_library_seed_plan(path)
         for _skill_dir, dest, _body in plan:
+            _refuse_linked_dest(root, dest)
             _preflight_write(dest)
         _preflight_write(out)
         if os.path.isfile(out):
@@ -1384,7 +1422,6 @@ def write_starter_spec(
         os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     except OSError as e:
         raise _cannot_write(out, e) from None
-    providers_out = None
     providers_key_env = None
     providers_backup = None
     if spec.get("agent") == {"ref": "opencode"} and model and base_url:
@@ -1395,9 +1432,6 @@ def write_starter_spec(
         llm = next((b for b in (spec.get("reflect"), spec.get("agent"))
                     if isinstance(b, dict) and b.get("ref") == "openai_compatible"), {})
         providers_key_env = llm.get("api_key_env") or key_env or "OPENAI_API_KEY"
-        stem = os.path.splitext(os.path.basename(out))[0]
-        providers_out = os.path.join(os.path.dirname(os.path.abspath(out)),
-                                     f"{stem}.opencode-providers.json")
         agent_block, providers = opencode_coding_recipe(
             model=model, base_url=base_url, key_env=providers_key_env,
             config_path=providers_out)

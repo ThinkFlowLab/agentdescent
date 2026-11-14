@@ -89,3 +89,12 @@ if exporter is not None:
   guarantee belongs to `export_run`, while an `ExportedSpan` handed straight to
   `export_span` has its `attributes` copied verbatim, so a caller building one
   by hand owns what goes in it.
+- The wire path is exercised in CI, not only faked: the `otel-wire` job installs
+  the `[otel]` extra and runs `scripts/otel_wire_smoke.py`, which exports one
+  span and one metric to a closed port on `127.0.0.1` and asserts the refusal is
+  reported and contained — `export_run` still returns its count, `force_flush()`
+  and `shutdown()` still return, and nothing escapes.
+- `export_span` copies `ExportedSpan.attributes` **verbatim**: it neither drops
+  nor invents a key, so a caller that builds a span by hand owns its contents,
+  and the fixed attribute set above is `export_run`'s guarantee alone
+  (`tests/test_otel_wire.py`, `tests/test_otel_export.py`).

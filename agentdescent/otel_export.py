@@ -386,7 +386,7 @@ class OtlpExporter:
             if provider is not None:
                 provider.shutdown()
 
-    def export_span(self, span: ExportedSpan) -> None:   # pragma: no cover - extra
+    def export_span(self, span: ExportedSpan) -> None:
         status, status_code = self._otel["Status"], self._otel["StatusCode"]
         current = self._tracer.start_span(
             span.name, start_time=int(float(span.start) * 1_000_000_000),
@@ -395,7 +395,7 @@ class OtlpExporter:
             current.set_status(status(status_code.ERROR, span.status))
         current.end(end_time=int(float(span.end) * 1_000_000_000))
 
-    def export_metric(self, metric: ExportedMetric) -> None:   # pragma: no cover
+    def export_metric(self, metric: ExportedMetric) -> None:
         instrument = self._instruments.get(metric.name)
         if instrument is None:
             # ``create_gauge`` exists at the pinned floor: present in the SDK
@@ -410,5 +410,10 @@ class OtlpExporter:
         value, attributes = float(metric.value), dict(metric.attributes)
         if metric.kind == "gauge":
             instrument.set(value, attributes)
+        elif metric.kind == "histogram":
+            # ``record`` is the SDK's histogram method; ``add`` belongs to
+            # counters. The fake SDK used to give its histogram an ``add``, so
+            # the first real export raised AttributeError mid-run (#1083).
+            instrument.record(value, attributes)
         else:
             instrument.add(value, attributes)

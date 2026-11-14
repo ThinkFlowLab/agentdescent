@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -49,6 +50,34 @@ __all__ = [
     "ExperienceStore",
     "ExperienceEngine",
 ]
+
+
+def _refuse_unappendable_leaf(path: str) -> None:
+    """Refuse a leaf this append cannot write through (#1064).
+
+    ``open(path, "a")`` follows a link at the leaf: a symlink grows the file
+    outside ``root``, a hardlink grows the shared inode, and a dangling symlink
+    creates the file at the link's target. The rule is ``filetree.leaf_problem``,
+    wrapped as the sibling writers wrap it, so a symlinked *directory* above the
+    store stays legal. A leaf that is not a regular file, or a regular file with
+    more than one link, is refused too: an append has no staged rename to fall
+    back on, so any of those would leave the store's bytes somewhere else.
+    """
+    from .filetree import leaf_problem
+
+    problem = leaf_problem(path)
+    if problem is None:
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(info.st_mode):
+            problem = "not a regular file"
+        elif info.st_nlink > 1:
+            problem = (f"the file has {info.st_nlink} links, so an append would "
+                       "write outside the store")
+    if problem is not None:
+        raise ValueError(f"cannot write {path}: {problem}")
 
 
 def _finite(value: Any, name: str) -> float:
@@ -230,6 +259,9 @@ class ExperienceStore:
             raise TypeError("add() expects ExperienceRecord")
         with self._lock:
             if self.path is not None:
+                # Before makedirs and before the first byte: a link here would
+                # grow bytes outside the store (#1064).
+                _refuse_unappendable_leaf(self.path)
                 directory = os.path.dirname(self.path)
                 if directory:
                     os.makedirs(directory, exist_ok=True)

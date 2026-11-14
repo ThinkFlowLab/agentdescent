@@ -27,6 +27,7 @@ pipeline, synthesis, admission and archive stay in their tested modules.
 from __future__ import annotations
 
 import os
+import tempfile
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from .artifact_graph import ArtifactGraph
@@ -206,16 +207,25 @@ def _refuse_linked_leaves(directory: str, *paths: str) -> None:
                 f"cannot write {os.path.abspath(path)}: {problem}")
 
 
-def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
-    """Write the spec, and with ``--demo`` its traces, after refusing a linked leaf."""
-    target = os.path.abspath(os.path.expanduser(require_text(out, "out")))
-    directory = os.path.dirname(target)
-    traces_path = os.path.join(directory, "capability-traces.jsonl")
-    _refuse_linked_leaves(directory,
-                          *((target, traces_path) if demo else (target,)))
-    os.makedirs(directory, exist_ok=True)
-    if demo:
-        with open(traces_path, "w", encoding="utf-8") as handle:
+def _refuse_non_file(path: str) -> None:
+    """Refuse a directory where a fixture leaf is expected, before the first byte."""
+    if os.path.exists(path) and not os.path.isfile(path):
+        raise SurfaceError(
+            f"cannot write {os.path.abspath(path)}: not a file")
+
+
+def _write_traces(traces_path: str, directory: str) -> None:
+    """Stage the demo traces, then rename them in.
+
+    ``open(..., "w")`` follows a hardlink and truncates the inode it shares with
+    a file outside the fixture (#1043); a rename never writes through the
+    destination, and it also closes the window between the leaf guard and the
+    first byte.
+    """
+    descriptor, staged = tempfile.mkstemp(
+        prefix=".staging-", suffix=".jsonl", dir=directory, text=True)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             for index in range(4):
                 handle.write(json_line({
                     "trace_id": f"demo-trace-{index}",
@@ -223,6 +233,27 @@ def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
                     "output": "unknown",
                     "reward": 0.0,
                 }))
+        os.replace(staged, traces_path)
+    except Exception:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
+
+
+def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
+    """Write the spec, and with ``--demo`` its traces, after refusing a linked leaf."""
+    target = os.path.abspath(os.path.expanduser(require_text(out, "out")))
+    directory = os.path.dirname(target)
+    traces_path = os.path.join(directory, "capability-traces.jsonl")
+    _refuse_linked_leaves(directory,
+                          *((target, traces_path) if demo else (target,)))
+    if demo:
+        _refuse_non_file(traces_path)
+    os.makedirs(directory, exist_ok=True)
+    if demo:
+        _write_traces(traces_path, directory)
         spec = {
             "schema_version": SURFACE_SCHEMA_VERSION,
             "traces": traces_path,

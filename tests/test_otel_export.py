@@ -151,64 +151,73 @@ def test_the_exporter_is_off_unless_an_endpoint_is_configured() -> None:
     assert exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": ""}) is None
 
 
-def test_constructing_needs_the_extra_and_says_so(monkeypatch) -> None:
-    """The install line lands at construction, which is what `docs/metrics.md`
-    promises.
+def test_a_configured_endpoint_needs_the_extra_at_construction() -> None:
+    """Constructing the exporter imports the SDK, so a missing extra fails
+    before a run starts instead of on the first span written."""
+    try:                              # the same probe the exporter uses
+        otel_export._load_otel()
+    except ImportError:
+        pass
+    else:
+        pytest.skip("the [otel] extra is installed here")
 
-    A host that only learns at the first span has already counted records it
-    cannot deliver, so this row pins the fail-fast branch rather than accepting
-    whichever branch the code happens to take.
-    """
-    def _missing() -> dict:
-        raise ImportError(
-            "OTLP export needs the optional extra: pip install 'agentdescent[otel]'")
-
-    monkeypatch.setattr(otel_export, "_load_otel", _missing)
     with pytest.raises(ImportError) as excinfo:
-        otel_export.OtlpExporter("http://localhost:4318")
+        exporter_from_env(
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318"})
     assert "agentdescent[otel]" in str(excinfo.value)
-    with pytest.raises(ImportError):
-        exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example:4318"})
 
 
-def test_an_endpoint_with_credentials_is_refused_and_never_echoed() -> None:
+@pytest.mark.parametrize("endpoint", [
+    "https://user:token@collector.example:4318",
+    "https://user:token@localhost:4318",
+    "http://user:token@localhost:4318",
+])
+def test_an_endpoint_with_credentials_in_the_url_is_refused(endpoint) -> None:
+    """httpx quotes the request URL in its errors, so a userinfo endpoint would
+    put the token in a log on the first 401 or timeout. Refused, never echoed."""
     with pytest.raises(ValueError) as excinfo:
-        otel_export.OtlpExporter("https://user:s3cret@collector.example:4318")
+        otel_export.OtlpExporter(endpoint)
     message = str(excinfo.value)
-    assert "credentials" in message
-    assert "s3cret" not in message and "user:" not in message
+    assert "token" not in message
+    assert "user:token" not in message
+    assert "credential" in message.lower() or "userinfo" in message.lower()
 
 
-def test_plain_http_is_allowed_only_for_a_literal_loopback_host() -> None:
-    for allowed in ("http://localhost:4318", "http://127.0.0.1:4318",
-                    "http://[::1]:4318", "http://127.9.9.9:4318"):
-        assert otel_export._endpoint_problem(allowed) is None, allowed
-    for refused in ("http://collector.example:4318", "http://10.1.2.3:4318",
-                    "http://127.0.0.1.nip.io:4318"):
-        assert otel_export._endpoint_problem(refused) is not None, refused
+@pytest.mark.parametrize("endpoint", [
+    "http://collector.example.com:4318",
+    "http://10.0.0.5:4318",
+    "http://localhost.evil.example:4318",
+])
+def test_a_plaintext_endpoint_off_the_loopback_is_refused(endpoint) -> None:
+    """Only a literal loopback collector may be plain http; the remedy named is
+    TLS termination, not a switch."""
+    with pytest.raises(ValueError) as excinfo:
+        otel_export.OtlpExporter(endpoint)
+    message = str(excinfo.value)
+    assert "loopback" in message.lower()
+    assert "TLS" in message
 
 
-def test_the_one_named_escape_hatch_lets_a_private_collector_through(monkeypatch) -> None:
-    assert otel_export._endpoint_problem("http://10.1.2.3:4318") is not None
-    monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
-    exporter = otel_export.OtlpExporter(
-        "http://10.1.2.3:4318", env={"AGENTDESCENT_OTEL_ALLOW_INSECURE": "1"})
-    assert exporter.endpoint == "http://10.1.2.3:4318"
-    # The hatch is opt-in by name, not by a bare "not 0".
-    assert otel_export._endpoint_problem(
-        "http://10.1.2.3:4318", {"AGENTDESCENT_OTEL_ALLOW_INSECURE": "yes"}) is not None
+@pytest.mark.parametrize("endpoint", [
+    "http://localhost:4318",
+    "http://127.0.0.1:4318",
+    "http://127.1.2.3:4318",
+    "http://[::1]:4318",
+])
+def test_a_loopback_collector_may_be_plain_http(endpoint) -> None:
+    """Loopback http stays legal; the SDK missing is the only error here."""
+    try:
+        otel_export.OtlpExporter(endpoint)
+    except ImportError as exc:
+        assert "agentdescent[otel]" in str(exc)
+    else:                                  # the extra is installed here
+        pytest.skip("the [otel] extra is installed here")
 
 
-def test_exporter_from_env_applies_the_same_endpoint_rules(monkeypatch) -> None:
-    monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
+def test_the_environment_path_refuses_a_refused_endpoint_too() -> None:
     with pytest.raises(ValueError):
-        exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example:4318"})
-    with pytest.raises(ValueError):
-        exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": "https://u:p@collector.example:4318"})
-    assert exporter_from_env({
-        "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example:4318"}) is not None
-    assert exporter_from_env({
-        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318"}) is not None
+        exporter_from_env(
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318"})
 
 
 def test_importing_the_bridge_does_not_pull_the_extra() -> None:

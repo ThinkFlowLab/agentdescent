@@ -7,7 +7,8 @@ can back it without the loop copying files around.
 
 ``FileArtifactStore`` keeps ``<root>/<artifact_id>/<revision>/`` plus
 ``<revision>.json`` (parent, message); a name or path that could leave ``root``
-raises ``ValueError`` before a write. Stdlib only, no network.
+-- or a link planted at a leaf it writes -- raises ``ValueError`` before a
+write. Stdlib only, no network.
 """
 
 from __future__ import annotations
@@ -66,6 +67,22 @@ def _relpath(path: str) -> str:
     return path
 
 
+def _refuse_linked_leaf(path: Path) -> None:
+    """Refuse a link planted at ``path`` itself (#1041).
+
+    ``Path.write_text`` follows a link at the leaf, and ``shutil.rmtree``
+    refuses one with a raw ``OSError``: either way the documented ``ValueError``
+    was not what a caller got, and the sidecar write landed outside ``root``.
+    The rule is ``filetree.leaf_problem``: only the leaf is tested, so a
+    symlinked *directory* above the store stays legal.
+    """
+    from .filetree import leaf_problem
+
+    problem = leaf_problem(str(path))
+    if problem is not None:
+        raise ValueError(f"cannot write {path}: {problem}")
+
+
 def _revision_name(parent: Optional[str], files: Mapping[str, bytes]) -> str:
     digest = hashlib.sha256(b"agentdescent.ports.v1\0")
     digest.update((parent or "").encode("utf-8") + b"\0")
@@ -122,6 +139,9 @@ class FileArtifactStore:
         artifact = self._dir(artifact_id)
         files = self._read(self._dir(artifact_id, revision))
         target = artifact / _name(to, "promotion target")
+        # Before is_dir/read/rmtree: a link here would be followed into the
+        # outside tree and then refused by rmtree as a raw OSError (#1041).
+        _refuse_linked_leaf(target)
         if target.is_dir():
             if self._read(target) == files:
                 return
@@ -139,6 +159,10 @@ class FileArtifactStore:
 
     def _commit(self, artifact: Path, name: str, files: Mapping[str, bytes],
                 parent: Optional[str], message: str) -> None:
+        sidecar = artifact / (name + ".json")
+        # Before mkdir and staging: write_text would follow a link here and
+        # overwrite bytes outside the store (#1041).
+        _refuse_linked_leaf(sidecar)
         artifact.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(artifact)))
         try:
@@ -150,7 +174,7 @@ class FileArtifactStore:
         finally:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
-        (artifact / (name + ".json")).write_text(
+        sidecar.write_text(
             json.dumps({"parent": parent, "message": message}, sort_keys=True) + "\n",
             encoding="utf-8",
         )

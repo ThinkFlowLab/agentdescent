@@ -64,6 +64,15 @@ and defers on a missing, incomplete or insufficient one, failing closed only on 
 `reject`. Nothing fills that field for you: a caller that wants the gate must pass
 `verifier_agreement.admission_report()` when it builds the report.
 
+A mean gain hides an error that recurs: the report also carries `repeat_overlap`,
+the mean share of prompts on which an audited accepted error appears (the
+verifier claims a gain the oracle denies for the same commit), and
+`high_universality` once that share is at least half with three audited accepts.
+A high overlap blocks an admit — errors the same way under different prompts are
+one systemic failure, not the noise precision averages away — while
+`repeat_overlap is None` (one prompt, or fewer than three audited accepts) means
+unmeasured and never "no shared error".
+
 Both pieces take `(artifact, task) -> float` callables, so they work with the
 shipped verifier, a model judge, or a deterministic fixture. They are deliberately
 separate from `meta_audit`: that store records sampled truth for a *run*, while

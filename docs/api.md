@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-617 public names across 122 modules.
+628 public names across 125 modules.
 
 ---
 
@@ -3046,6 +3046,25 @@ Archive(
 
 Keep the `k` best-scoring candidates and spread the workers over them.
 
+### `Candidate(...)`
+
+One starting point the next batch could be launched from.
+
+```python
+Candidate(
+    artifact_id: str,
+    version: int,
+    state: Mapping[str, str] = <factory>,
+    score: Optional[float] = None,
+    per_task: Mapping[str, float] = <factory>,
+    selected: int = 0,
+    parent: Optional[int] = None,
+    branch: Optional[str] = None,
+    prior: Optional[float] = None,
+    cost: Optional[float] = None
+) -> None
+```
+
 ### `CladeThompson(...)`
 
 HGM's expansion policy: Thompson sampling on clade metaproductivity.
@@ -3436,6 +3455,7 @@ PromotionRequest(
     verifier: Optional[EnsembleReport] = None,
     calibration: Optional[CalibrationReport] = None,
     review_cost: Optional[ReviewCost] = None,
+    cost: Optional[Cost] = None,
     metadata: Mapping[str, Any] = <factory>
 ) -> None
 ```
@@ -3465,7 +3485,8 @@ PromotionRules(
     min_tasks: int = 2,
     max_risk: float = 1.0,
     max_review_cost: float = 0.0,
-    max_review_minutes: float = 0.0
+    max_review_minutes: float = 0.0,
+    require_cost: bool = False
 ) -> None
 ```
 
@@ -3494,6 +3515,108 @@ ReviewCost(
 ### `promote(request: PromotionRequest, policy: Optional[PromotionRules] = None) -> PromotionDecision`
 
 Assemble and judge one promotion; missing or failed evidence never passes.
+
+---
+
+## Cost per accepted diff
+
+What a diff cost, what it bought, and the acceptance option that prices it. &nbsp;·&nbsp; `agentdescent.cost` &nbsp;·&nbsp; [guide](cost.md)
+
+### `Cost(...)`
+
+What one diff cost, with `None` for every number not measured.
+
+```python
+Cost(
+    calls: Optional[int] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    tokens: Optional[int] = None,
+    wallclock: Optional[float] = None,
+    usd: Optional[float] = None
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `from_cards(cards: Iterable[Any]) -> 'Cost'` | The cost the contributing evidence cards recorded for this diff. |
+| `from_usage(usage: Any, *, usd: Optional[float] = None) -> 'Cost'` | The real counts a provider recorded (`agents.Usage`), plus an estimate. |
+
+### `CostPolicy(...)`
+
+Acceptance wrapper that prices the candidate before committing it.
+
+```python
+CostPolicy(
+    inner: Optional[Any] = None,
+    *,
+    reference_quality_per_cost: Optional[float] = None,
+    min_gain_per_1k_tokens: Optional[float] = None,
+    tolerance: float = 0.05,
+    require_cost: bool = False,
+    unit: str = '1k_tokens'
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `configure(config: Any) -> None` | Fill an unset inner gate from the run's config; forward when present. |
+
+### `CostReport(...)`
+
+Cost per accepted diff and per point of gain, from decision records.
+
+```python
+CostReport(
+    decisions: int = 0,
+    accepted: int = 0,
+    calls: Optional[int] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    tokens: Optional[int] = None,
+    wallclock: Optional[float] = None,
+    usd: Optional[float] = None,
+    calls_per_accepted: Optional[float] = None,
+    tokens_per_accepted: Optional[float] = None,
+    usd_per_accepted: Optional[float] = None,
+    tokens_per_point: Optional[float] = None,
+    usd_per_point: Optional[float] = None,
+    cost_status: str = 'unknown',
+    missing_cost: int = 0,
+    reference_tokens_per_point: Optional[float] = None
+) -> None
+```
+
+### `cost_efficiency(gain: float, cost: Cost, *, unit: str = '1k_tokens') -> Optional[float]`
+
+`quality_per_cost`: held-out delta per 1k tokens or per USD.
+
+### `cost_report(...)`
+
+Aggregate per-decision records into the report the issue asks for.
+
+```python
+cost_report(
+    records: Iterable[Any],
+    *,
+    reference_tokens_per_point: Optional[float] = None,
+    tolerance: float = 0.05
+) -> CostReport
+```
+
+### `cost_status(...)`
+
+Classify `value` against `reference`: improved/neutral/regressed/unknown.
+
+```python
+cost_status(
+    value: Optional[float],
+    reference: Optional[float],
+    *,
+    tolerance: float = 0.05,
+    lower_is_better: bool = False
+) -> str
+```
 
 ---
 
@@ -3886,7 +4009,8 @@ ExperienceEngine(
     store: ExperienceStore,
     *,
     require_anchors: bool = True,
-    anchor_tolerance: float = 0.0
+    anchor_tolerance: float = 0.0,
+    telemetry: Optional[RSITelemetry] = None
 ) -> None
 ```
 
@@ -3922,7 +4046,8 @@ ExperienceReport(
     rows: int,
     learner: ContinualReport,
     skipped: int = 0,
-    detail: str = ''
+    detail: str = '',
+    memory: Optional[MemoryAudit] = None
 ) -> None
 ```
 
@@ -4860,6 +4985,44 @@ run_fork_baseline(
 
 ---
 
+## The sparse audit package
+
+Pair a cheap verifier against ground truth, and correct for the gap. &nbsp;·&nbsp; `agentdescent.audit` &nbsp;·&nbsp; [guide](audit.md)
+
+### `CALIBRATION_CEILING`
+
+Where a calibration share sits when the improvement pool is still finding new error modes, and where it goes once the pool has stopped. Both are policy choices, not measurements: what a label is worth in each pool depends on whether you are trying to *fix* the verifier or to *correct for* it.
+
+### `CALIBRATION_FLOOR`
+
+Where a calibration share sits when the improvement pool is still finding new error modes, and where it goes once the pool has stopped. Both are policy choices, not measurements: what a label is worth in each pool depends on whether you are trying to *fix* the verifier or to *correct for* it.
+
+### `FLIP_ALARM`
+
+Flip rate above which a rescan is called out rather than reported. The plan's number. It is a policy choice and not a measurement -- there is no rate at which silently re-scoring a run's history becomes fine.
+
+### `MAX_COMBINATIONS`
+
+Combinations the search will build before it complains. Not a performance limit -- each one is a pass over the labelled set, which is a few hundred rows -- but a statistical one: every combination scored is another chance for one to look good by luck, and a search over a thousand of them on two hundred labels is fitting the noise.
+
+### `MIN_N_DOMINANT`
+
+Labels the heaviest stratum needs before the reported interval means what it says. Below it, measured coverage is about 0.92 against a nominal 0.95 -- see pitfall 3 in the module docstring, and `test_known_limitation_small_dominant_stratum`.
+
+### `MIN_UNSEEN`
+
+Below this estimated probability of a new mode, more improvement labels are buying the flat part of the rarefaction curve. Not a law -- the point at which a one-in-twenty chance of learning something stops being worth an oracle call is a budget question -- but it is where the Phase 0 curve had flattened.
+
+### `SCHEMA_VERSION`
+
+Bumped when the on-disk shape of a record changes incompatibly. A reader that meets a record it does not understand must say so rather than guess -- see `load`. Version 2 adds optional `scorer_version`; this build still migrates version-1 lines. Stamp the new marker whenever the persisted shape is one an older v1-only reader cannot decode, so that reader hits its explicit unsupported-version path instead of treating a valid line as corrupt and silently skipping pending work (#315).
+
+### `STALE_INFLATION`
+
+Variance multiplier the acceptance gate applies while a rectification is stale. Not a correction -- a stale rectifier has no number to correct *with* -- but a widening, so a gate that cannot be told how biased its verifier is commits less rather than the same amount with more confidence.
+
+---
+
 ## Document backends
 
 A tool-using agent over a document that is too big for a prompt. &nbsp;·&nbsp; `agentdescent.backends` &nbsp;·&nbsp; [guide](backends.md)
@@ -4926,6 +5089,10 @@ The reward functions everyone writes, with the details right. &nbsp;·&nbsp; `ag
 ### `GraderError`
 
 A `command_scorer` command failed or printed something that is not a score.
+
+### `SCORERS`
+
+Named scorers accepted by `scorer`. Pass a callable for anything else.
 
 ### `command_scorer(...)`
 
@@ -5138,6 +5305,10 @@ EnvironmentFingerprint(
 | `capture(...)` | Fingerprint this process (or the explicit values a caller supplies). |
 | `diff(other: 'EnvironmentFingerprint') -> Tuple[str, ...]` | Names of the environment inputs that differ (empty when identical). |
 
+### `REPLAY_ENV_ALLOWLIST`
+
+Environment variable names whose **presence** may affect a run, and which are therefore recorded as names. Chosen for determinism, not convenience: the hash seed changes dict/set iteration, `PYTHONPATH` decides which code is imported at all, the locale changes sorting and number formatting, `TZ` changes timestamps a prompt may contain, and the thread counts change floating-point reduction order in numeric workloads. Names only, never values -- not even hashed (Security review, #952). A four-entry dictionary recovered a `TZ` value offline from the old sha256 digests, and any candidate value confirms by `sha256()`, so a digest of a value is value material. `capture` also intersects the caller's list with this tuple, so no caller can widen it, and still drops credential-shaped names.
+
 ### `ReplayCheck(...)`
 
 The result of comparing a captured run with its replay.
@@ -5259,14 +5430,6 @@ A paired bootstrap of per-task gains.
 ### `BudgetGovernor`
 
 Tracks token spend against a cap and decides what to degrade.
-
-### `CALIBRATION_CEILING`
-
-Where a calibration share sits when the improvement pool is still finding new error modes, and where it goes once the pool has stopped. Both are policy choices, not measurements: what a label is worth in each pool depends on whether you are trying to *fix* the verifier or to *correct for* it.
-
-### `CALIBRATION_FLOOR`
-
-Where a calibration share sits when the improvement pool is still finding new error modes, and where it goes once the pool has stopped. Both are policy choices, not measurements: what a label is worth in each pool depends on whether you are trying to *fix* the verifier or to *correct for* it.
 
 ### `CacheProtocol`
 
@@ -5400,10 +5563,6 @@ Runs rollouts somewhere. Threads here, processes and hosts later.
 
 The L2/L1 blast-radius boundary (`0.30`).
 
-### `FLIP_ALARM`
-
-Flip rate above which a rescan is called out rather than reported. The plan's number. It is a policy choice and not a measurement -- there is no rate at which silently re-scoring a run's history becomes fine.
-
 ### `FROZEN_IDS`
 
 Artifact ids the loop may read but never mutate (L0).
@@ -5515,18 +5674,6 @@ Eight methods: four the aggregator calls, four more the engine calls.
 ### `LocalWorkspaceSandbox`
 
 A throwaway directory on this machine -- what a rollout has always got.
-
-### `MAX_COMBINATIONS`
-
-Combinations the search will build before it complains. Not a performance limit -- each one is a pass over the labelled set, which is a few hundred rows -- but a statistical one: every combination scored is another chance for one to look good by luck, and a search over a thousand of them on two hundred labels is fitting the noise.
-
-### `MIN_N_DOMINANT`
-
-Labels the heaviest stratum needs before the reported interval means what it says. Below it, measured coverage is about 0.92 against a nominal 0.95 -- see pitfall 3 in the module docstring, and `test_known_limitation_small_dominant_stratum`.
-
-### `MIN_UNSEEN`
-
-Below this estimated probability of a new mode, more improvement labels are buying the flat part of the rarefaction curve. Not a law -- the point at which a one-in-twenty chance of learning something stops being worth an oracle call is a budget question -- but it is where the Phase 0 curve had flattened.
 
 ### `MarginalGainStop`
 
@@ -5696,10 +5843,6 @@ One rollout, described completely enough to run somewhere else.
 
 The hashed inputs of one run and the resulting stable id.
 
-### `SCHEMA_VERSION`
-
-Bumped when the on-disk shape of a record changes incompatibly. A reader that meets a record it does not understand must say so rather than guess -- see `load`. Version 2 adds optional `scorer_version`; this build still migrates version-1 lines. Stamp the new marker whenever the persisted shape is one an older v1-only reader cannot decode, so that reader hits its explicit unsupported-version path instead of treating a valid line as corrupt and silently skipping pending work (#315).
-
 ### `SCORERS`
 
 Named scorers accepted by `scorer`. Pass a callable for anything else.
@@ -5715,10 +5858,6 @@ The contract each slot's value must satisfy -- the engine's own Protocols, all `
 ### `SOLVED`
 
 Reward at or above which a task counts as solved (`0.999`). Lower it for a graded scorer, or every rollout asks the reflector to fix an answer that was already good.
-
-### `STALE_INFLATION`
-
-Variance multiplier the acceptance gate applies while a rectification is stale. Not a correction -- a stale rectifier has no number to correct *with* -- but a widening, so a gate that cannot be told how biased its verifier is commits less rather than the same amount with more confidence.
 
 ### `SafetyCheck`
 
@@ -5743,6 +5882,10 @@ Where sandboxes come from and go back to.
 ### `SandboxSpec`
 
 What environment one rollout needs. Must survive JSON: it crosses processes.
+
+### `SearchReport`
+
+What a `search_evolve` found: the best state, the budget spent, and the value estimates the search used (best seen vs the tree's choice).
 
 ### `SearchTree`
 
@@ -5887,6 +6030,10 @@ Agentic backends -- a base agent that *navigates documents with tools*, not just
 ### `baselines`
 
 The control every efficiency number in this repository is missing.
+
+### `bootstrap_ci`
+
+Bootstrap the mean paired gain, `after - before`.
 
 ### `budgeted_completion`
 

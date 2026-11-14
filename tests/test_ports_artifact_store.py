@@ -7,6 +7,8 @@ traversal refusal.
 
 from __future__ import annotations
 
+import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -78,3 +80,59 @@ def test_a_hostile_name_is_refused_and_writes_nothing_outside_root(
     #: Not just "it raised": nothing new appeared anywhere outside `root`.
     assert list(outside.iterdir()) == []
     assert sorted(p.name for p in tmp_path.iterdir()) == ["outside", "store"]
+
+
+class TestANonDirectoryLeafIsRefused:
+    """#1045: a file where a tree belongs, a directory where a sidecar belongs."""
+
+    def test_promote_refuses_a_regular_file_at_the_target(self, tmp_path: Path) -> None:
+        store = FileArtifactStore(tmp_path / "store")
+        revision = store.write_tree("img", tree(), parent=None)
+        artifact = tmp_path / "store" / "img"
+        leaf = artifact / "prod"
+        leaf.write_bytes(b"KEEP\n")
+
+        with pytest.raises(ValueError, match=r"cannot write .*prod: not a directory"):
+            store.promote("img", revision, to="prod")
+
+        assert leaf.read_bytes() == b"KEEP\n"
+        assert list(artifact.glob(".staging-*")) == []
+        assert "prod" not in store.list_revisions("img")
+
+    def test_write_tree_refuses_a_regular_file_at_the_derived_revision(
+        self, tmp_path: Path
+    ) -> None:
+        store = FileArtifactStore(tmp_path / "store")
+        files = tree()
+        revision = store.write_tree("img", files, parent=None)
+        artifact = tmp_path / "store" / "img"
+        leaf = artifact / revision
+        shutil.rmtree(leaf)
+        leaf.write_bytes(b"KEEP\n")
+
+        with pytest.raises(
+            ValueError, match=r"cannot write .*" + re.escape(revision) + ": not a directory"
+        ):
+            store.write_tree("img", files, parent=None)
+
+        assert leaf.read_bytes() == b"KEEP\n"
+        assert list(artifact.glob(".staging-*")) == []
+
+    def test_promote_refuses_a_directory_at_the_sidecar_before_the_tree_lands(
+        self, tmp_path: Path
+    ) -> None:
+        store = FileArtifactStore(tmp_path / "store")
+        revision = store.write_tree("img", tree(), parent=None)
+        artifact = tmp_path / "store" / "img"
+        sidecar = artifact / "prod.json"
+        sidecar.mkdir()
+
+        with pytest.raises(
+            ValueError, match=r"cannot write .*prod\.json: not a file"
+        ):
+            store.promote("img", revision, to="prod")
+
+        assert sidecar.is_dir()
+        assert not (artifact / "prod").exists()
+        assert list(artifact.glob(".staging-*")) == []
+        assert "prod" not in store.list_revisions("img")

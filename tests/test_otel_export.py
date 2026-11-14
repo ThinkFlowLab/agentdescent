@@ -264,16 +264,35 @@ class _FakeTracer:
         return span
 
 
-class _FakeInstrument:
+class _FakeCounter:
+    """The SDK gives a counter ``add``, a gauge ``set``, a histogram ``record``.
+
+    One fake with all three methods would let a wrong call pass, which is how
+    ``Histogram.add`` survived to the first real export (#1083); each kind here
+    carries only its own method, so a wrong call is an AttributeError.
+    """
+
     def __init__(self) -> None:
         self.added = []
-        self.set_values = []
 
     def add(self, value, attributes) -> None:
         self.added.append((value, dict(attributes)))
 
+
+class _FakeGauge:
+    def __init__(self) -> None:
+        self.set_values = []
+
     def set(self, value, attributes) -> None:
         self.set_values.append((value, dict(attributes)))
+
+
+class _FakeHistogram:
+    def __init__(self) -> None:
+        self.recorded = []
+
+    def record(self, value, attributes) -> None:
+        self.recorded.append((value, dict(attributes)))
 
 
 class _FakeMeter:
@@ -281,17 +300,17 @@ class _FakeMeter:
         self.provider = provider
         self.instruments = {}
 
-    def _instrument(self, name):
-        return self.instruments.setdefault(name, _FakeInstrument())
+    def _instrument(self, name, factory):
+        return self.instruments.setdefault(name, factory())
 
     def create_counter(self, name, unit=None):
-        return self._instrument(name)
+        return self._instrument(name, _FakeCounter)
 
     def create_gauge(self, name, unit=None):
-        return self._instrument(name)
+        return self._instrument(name, _FakeGauge)
 
     def create_histogram(self, name, unit=None):
-        return self._instrument(name)
+        return self._instrument(name, _FakeHistogram)
 
 
 class _FakeSignalExporter:
@@ -434,3 +453,25 @@ def test_force_flush_and_shutdown_close_only_this_exporter(monkeypatch) -> None:
     assert first._meter_provider.stopped is True
     assert second._tracer_provider.stopped is False
     assert second._meter_provider.stopped is False
+
+
+def test_the_instrument_methods_match_the_sdk(monkeypatch) -> None:
+    """Counter ``add``, gauge ``set``, histogram ``record`` -- the SDK's names.
+
+    Each fake instrument carries only its own kind's method, so a wrong call is
+    an AttributeError here instead of on the first real export; that is how
+    ``Histogram.add`` was found after the fakes had hidden it (#1083).
+    """
+    monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
+    exporter = otel_export.OtlpExporter("https://a.example:4318")
+
+    export_run(exporter, run_id="run-1", metrics=_metrics(),
+               rounds=(RoundSample(1, reward=0.25, start=1.0, end=2.0),),
+               decisions=(DecisionSample("skill", True, calls=1,
+                                         start=2.0, end=2.1),))
+
+    instruments = exporter._meter.instruments
+    assert instruments["agentdescent_rsi_round_reward"].recorded == [(0.25, {
+        "run.id": "run-1"})]
+    assert instruments["agentdescent_rsi_decisions_total"].added == [(2.0, {})]
+    assert instruments["agentdescent_rsi_acceptance_rate"].set_values

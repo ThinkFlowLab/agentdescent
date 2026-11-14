@@ -13,6 +13,7 @@ follows (#1017/#1021): refuse the link, keep its bytes, write no fixture.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 from agentdescent import cli
@@ -105,3 +106,38 @@ class TestCapabilityInitLeafGuard:
         assert code == 0
         assert (real / "spec.json").is_file()
         assert (real / "capability-traces.jsonl").is_file()
+
+    def test_a_hardlink_at_the_traces_leaf_keeps_the_outside_bytes(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        keep = outside / "keep.json"
+        keep.write_text(ORIGINAL, encoding="utf-8")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        leaf = out_dir / "capability-traces.jsonl"
+        os.link(keep, leaf)
+
+        code = cli.main(["capability", "init", "--demo",
+                         "--out", str(out_dir / "spec.json")])
+
+        assert code == 0
+        assert keep.read_text(encoding="utf-8") == ORIGINAL
+        assert leaf.is_file() and not leaf.is_symlink()
+        assert leaf.stat().st_nlink == 1
+        assert len(leaf.read_text(encoding="utf-8").splitlines()) == 4
+
+    def test_a_directory_at_the_traces_leaf_is_refused_before_any_byte(self, tmp_path, capsys):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        leaf = out_dir / "capability-traces.jsonl"
+        leaf.mkdir()
+
+        code = cli.main(["capability", "init", "--demo",
+                         "--out", str(out_dir / "spec.json")])
+
+        captured = capsys.readouterr()
+        assert code == 2
+        assert captured.err.strip() == f"error: cannot write {leaf}: not a file"
+        assert leaf.is_dir()
+        assert not (out_dir / "spec.json").exists()
+        assert [p.name for p in out_dir.iterdir()] == ["capability-traces.jsonl"]

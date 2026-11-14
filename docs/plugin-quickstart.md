@@ -102,9 +102,18 @@ distinguishable from "the reflector proposed nothing useful". Both are
 diagnostics on disk; `record_rollouts: false` keeps neither.
 
 A bare `agentdescent demo` writes to a temporary directory and removes it at
-exit, whether the run succeeded or failed. Pass `--dir ./somewhere` to keep the
-demo's files around and poke at them; `--json` also keeps the directory it
-reports in `dir`, so a host can read it after the command returns.
+exit, whether the run succeeded or failed -- so its footer cannot offer `show`
+or `apply` for that run: the artifacts are gone, `show` would render every file
+as new, and `apply` would rebuild the directory that was just deleted. The
+footer says so and names the command that keeps them:
+
+```bash
+agentdescent demo --dir ./demo           # keeps the files and prints show/apply
+```
+
+Pass `--dir ./somewhere` to keep the demo's files around and poke at them;
+`--json` also keeps the directory it reports in `dir`, so a host can read it
+after the command returns.
 
 Pass `--algorithm archive_selection` to watch a named algorithm (from
 `agentdescent algorithms list`) run the same offline example end to end. Only

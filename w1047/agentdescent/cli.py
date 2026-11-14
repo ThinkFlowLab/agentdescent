@@ -1,0 +1,6529 @@
+"""``agentdescent`` on the command line: the verbs the MCP server also exposes.
+
+One surface, two transports. Everything a host agent can do through the MCP
+server a person can do by hand here, in the same words, so a run started from
+Claude Code or DeepSeek Harness can be inspected from a shell and a run started
+from a shell can be picked up by an agent. The skill file falls back to these
+commands on a host with no MCP.
+
+**Path A** (the default host loop — start here)::
+
+    agentdescent doctor                                             what is installed
+    agentdescent init    <path> [--kind ...] [--data cases.jsonl]   write a starter spec
+    agentdescent plan    <spec.json>                                validate + cost, no run
+    agentdescent evolve  <spec.json> [--detach] [--budget USD]      start a run
+    agentdescent status  [<run_id>] [--brief]                       one run or all
+    agentdescent watch   <run_id>                                   follow rounds
+    agentdescent show    <run_id> [--diff]                          the evolved tree
+    agentdescent apply   <run_id> [--to PATH] [--dry-run]           install it, backed up
+    agentdescent cancel  <run_id>  /  resume <run_id>
+    agentdescent algorithms list|show|run …                         named Algorithm cards
+    agentdescent demo                                               one offline run, no key
+    agentdescent mcp [--advanced]                                   MCP: Path A by default
+
+**Advanced** (opt-in; MCP needs ``--advanced`` / ``AGENTDESCENT_MCP_ADVANCED=1``)::
+
+    agentdescent portfolio / exam / audit / safety / release / …
+    agentdescent install|uninstall <host>                           wire a host
+    agentdescent serve   [--port N]                                 read-only run panel
+
+See ``docs/mcp-path-a.md``. ``argparse`` only: the CLI is in the core and the
+core has no dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+import difflib
+import errno
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+import tempfile
+import time
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+
+from . import runstore
+from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_path,
+                        reward_set_line)
+from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
+                         compose, estimate, fold_kind, load_spec, resolve_kind,
+                         _POLICY_SLOTS)
+
+__all__ = ["main", "doctor_report", "starter_spec"]
+
+
+def _version() -> str:
+    """``agentdescent.__version__``, resolved lazily.
+
+    Not a module-level import: with an ``agentdescent/`` directory in the cwd
+    shadowing the package (the case #394 diagnoses) the name resolves to a
+    namespace package that never ran ``__init__``, and an import-time failure
+    here would be a raw traceback ahead of ``cmd_mcp``'s one-line explanation.
+    """
+    try:
+        from . import __version__
+        return __version__
+    except ImportError:          # shadowed / namespace-package import
+        try:
+            from importlib.metadata import version
+            return version("agentdescent")
+        except Exception:  # noqa: BLE001 - reporting a version must never raise
+            return "unknown"
+
+#: Set in every worker's environment by the plugin runner and the MCP server so a
+#: host that is itself being evolved cannot start a nested run. See docs/plugins.md.
+NESTED_ENV = "AGENTDESCENT_NESTED"
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _out(payload: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    elif isinstance(payload, str):
+        print(payload)
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+
+
+def _cannot_write(path: str, e: OSError) -> "runstore.RunStoreError":
+    """One `error: cannot write <path>: <reason>` line instead of a traceback.
+
+    `#907` gave the run store that contract inside `runstore.create`. The
+    artifact writers outside the store (``init``/``algorithms run --out``,
+    ``apply --to``) are wrapped at the writer, not with a blanket ``except
+    OSError`` in ``main()``: refusals (``refusing to write ...``) and unrelated
+    bugs still raise (#990).
+    """
+    return runstore.RunStoreError(f"cannot write {path}: {e.strerror or e}")
+
+
+def _spec_error(a: argparse.Namespace, e: Exception) -> int:
+    """Report a spec that cannot be read or compiled; returns exit code 2.
+
+    With `--json` it is the same `{"ok": false, "error": ...}` object `plan`
+    prints, so a script never has to special-case stderr; otherwise the
+    usual `spec error: ...` line on stderr (#650).
+    """
+    if getattr(a, "json", False):
+        _out({"ok": False, "error": str(e)}, as_json=True)
+    else:
+        print(f"spec error: {e}", file=sys.stderr)
+    return 2
+
+
+def _surface_error(a: argparse.Namespace, error: Exception) -> int:
+    """A product-surface error: JSON under --json, one stderr line otherwise.
+
+    A ``SurfaceError`` is a refusal the caller is meant to read, so it keeps the
+    ``error: <message>`` envelope the ``cannot write`` writers already use
+    (#1008, #1017, #1015): one line, no class name in front of it (#1032). Any
+    other exception keeps its class, which is diagnostic rather than noise.
+    """
+    if os.environ.get("AGENTDESCENT_DEBUG"):
+        raise error
+    from .surface_common import SurfaceError
+
+    message = (str(error) if isinstance(error, SurfaceError)
+               else f"{type(error).__name__}: {error}")
+    if getattr(a, "json", False):
+        _out({"ok": False, "error": message}, as_json=True)
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    return 2
+
+
+def _status_line(st: runstore.RunStatus) -> str:
+    reward = "" if st.best_reward is None else f" best={st.best_reward:.3f}"
+    rounds = f"{st.round}/{st.rounds}" if st.rounds else f"{st.round}"
+    usd = "" if st.usd is None else f" ${st.usd:.2f}"
+    tok = f" tok={st.tokens:,}" if st.tokens else ""
+    # Show in-flight work so a long first propose is not mistaken for a hang
+    # at calls=0 (#358). Hidden when nothing is pending.
+    pending = ""
+    if st.pending_calls:
+        ph = f" phase={st.phase}" if st.phase else ""
+        pending = f" pending={st.pending_calls}{ph}"
+    tail = f" [{st.stop_reason}]" if st.stop_reason else ""
+    err = f" error: {st.error}" if st.error else ""
+    # Reflector exceptions, cumulative (#395): a run can finish `done` with only
+    # these to say that it never learned anything.
+    perr = ""
+    if st.propose_errors:
+        perr = f" propose_errors={st.propose_errors}"
+        if st.propose_error and not st.error:
+            perr += f" (first: {st.propose_error})"
+    return (f"{st.run_id}  {st.state:<9} round {rounds:<6} "
+            f"calls={st.calls}{pending}{tok}{perr}{reward}{usd}"
+            f"  {st.kind or '?'}:{st.target or '?'}{tail}{err}")
+
+
+#: Which worker CLI ``init`` picks when several are on PATH (#361): the first
+#: present one wins. Same refs as ``_CLI_BINARIES``; ``claude_code`` stays the
+#: placeholder when none is installed.
+_DEFAULT_AGENT_ORDER = ("claude_code", "codex", "dsh", "opencode")
+_PLACEHOLDER_AGENT = "claude_code"
+
+
+def default_agent_ref() -> Tuple[str, bool]:
+    """``(ref, found)``: the worker CLI ``init`` writes when ``--agent`` is omitted.
+
+    Uses :func:`doctor_report` (the same view ``plan`` gates on, #346), so a
+    machine with only ``opencode`` on PATH gets ``opencode`` rather than a
+    ``claude_code`` spec that ``plan`` immediately refuses (#361). ``found`` is
+    False when no worker CLI is on PATH; the ref is then the ``claude_code``
+    placeholder and the caller should warn.
+    """
+    clis = doctor_report()["agent_clis"]
+    for ref in _DEFAULT_AGENT_ORDER:
+        if clis.get(_CLI_BINARIES[ref]):
+            return ref, True
+    return _PLACEHOLDER_AGENT, False
+
+
+#: What ``init`` writes where only the user knows the value (#451): the model a
+#: reflector names and, for a non-OpenAI key, its endpoint. The shipped SKILL.md
+#: says "ask the user for the endpoint and the model; never guess either", and a
+#: guessed pair (``deepseek-v4-flash`` against api.openai.com) passed ``plan``
+#: and failed every call. ``plan`` refuses a spec that still holds one.
+PLACEHOLDER_MODEL = "<your-model>"
+PLACEHOLDER_URL = "<your-endpoint-url>"
+
+
+def _is_ark_endpoint(url: Optional[str]) -> bool:
+    """True when ``url`` is a Volcengine Ark host (``*.volces.com``).
+
+    Used by the starter writer and ``plan`` so Ark reasoning models get a
+    reliable transport (`stream: true`) without changing the global
+    ``openai_compatible`` default for library callers (#832).
+    """
+    if not (isinstance(url, str) and url) or url == PLACEHOLDER_URL:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host.endswith("volces.com")
+
+
+def starter_model_block(*, model: Optional[str] = None, base_url: Optional[str] = None,
+                        key_env: Optional[str] = None,
+                        keys: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
+    """The ``openai_compatible`` block ``init`` writes, matched to the keys set here.
+
+    The same reading of the environment ``doctor`` gives (#451): with
+    ``OPENAI_API_KEY`` the adapter's defaults apply; with only another provider
+    key (``ARK_API_KEY``, ``DEEPSEEK_API_KEY``, ...) the block names it in
+    ``api_key_env`` and needs ``default_base_url`` -- otherwise that key would be
+    sent to api.openai.com. The model, and that endpoint, are the user's
+    (``--model`` / ``--base-url``) or a placeholder ``plan`` refuses; never a guess.
+
+    When ``base_url`` is an Ark host, the block also sets ``"stream": true`` so a
+    reasoning model (e.g. ``deepseek-v4-flash``) does not sit silent past the
+    default 120 s non-streaming timeout (#832).
+    """
+    if keys is None:
+        keys = doctor_report()["provider_keys_present"]
+    if key_env is None and not keys.get("OPENAI_API_KEY"):
+        from .integrations import provider_key_names
+
+        other = [n for n in provider_key_names()
+                 if keys.get(n) and n not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
+        if other:
+            key_env = other[0]
+    block: Dict[str, Any] = {"ref": "openai_compatible", "model": model or PLACEHOLDER_MODEL}
+    if key_env and key_env != "OPENAI_API_KEY":
+        block["api_key_env"] = key_env
+        if not base_url and "OPENAI" not in key_env.upper():
+            base_url = PLACEHOLDER_URL
+    if base_url:
+        block["default_base_url"] = base_url
+    if _is_ark_endpoint(base_url):
+        block["stream"] = True
+    return block
+
+
+def _opencode_provider_id(base_url: str) -> str:
+    """The provider id an ``init``-written OpenCode config uses for ``base_url``.
+
+    ``ark`` for Volcengine Ark, matching docs/plugins.md; ``custom`` otherwise.
+    It is only a local name inside the file ``init`` writes, so nothing about
+    the endpoint is guessed from it.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(base_url).hostname or "").lower()
+    return "ark" if host.endswith("volces.com") else "custom"
+
+
+def opencode_coding_recipe(*, model: str, base_url: str, key_env: str,
+                           config_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The ``agent`` block and provider-only config for an isolated OpenCode worker (#485).
+
+    The documented Coding recipe (docs/plugins.md): ``-m <provider>/<model>`` plus
+    ``env.OPENCODE_CONFIG`` naming a file that holds only a ``provider`` block,
+    with the key as ``{env:VAR}`` -- never inline. Returns ``(agent, config)``;
+    the caller writes ``config`` to ``config_path`` (an absolute path).
+    """
+    provider = _opencode_provider_id(base_url)
+    agent = {"ref": "opencode", "extra_args": ["-m", f"{provider}/{model}"],
+             "env": {"OPENCODE_CONFIG": config_path}}
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {provider: {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Ark" if provider == "ark" else "Custom",
+            "options": {"baseURL": base_url, "apiKey": "{env:%s}" % key_env},
+            "models": {model: {"name": model}},
+        }},
+    }
+    return agent, config
+
+
+def parse_cli_params(pairs: Optional[Sequence[str]]) -> Dict[str, Any]:
+    """``--param k=v`` -> a JSON-typed dict (bare strings when JSON cannot parse).
+
+    Repeated keys are an error: silently keeping the last one makes a typo or a
+    copied flag look applied.
+    """
+    out: Dict[str, Any] = {}
+    for item in pairs or ():
+        if "=" not in item:
+            raise ValueError(f"--param {item!r} must be KEY=VALUE")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--param {item!r} has an empty name")
+        if key in out:
+            raise ValueError(f"--param {key!r} was given more than once")
+        try:
+            out[key] = json.loads(raw)
+        except ValueError:
+            out[key] = raw
+    return out
+
+
+def algorithm_override(name: Optional[str], params: Optional[Mapping[str, Any]],
+                       kind: str, target: Optional[str] = None) -> Optional[Any]:
+    """Validate ``--algorithm``/``--param`` for ``kind`` and return the spec value.
+
+    Returns ``None`` when no algorithm was named, the name itself when it takes
+    no parameters, and ``{"name": ..., "params": {...}}`` otherwise. Raises
+    :class:`~agentdescent.algorithms.AlgorithmError` for an unknown name, an
+    unsupported kind or a bad parameter -- the same errors ``plan`` would give,
+    but before a spec is written.
+    """
+    if not name:
+        if params:
+            raise ValueError("--param needs --algorithm")
+        return None
+    from . import algorithms
+
+    alg = algorithms.get(name, where="--algorithm")
+    if kind not in alg.kinds:
+        raise algorithms.AlgorithmError(algorithms.kind_mismatch_message(
+            alg, kind, target=target, prefix="--algorithm"))
+    if params:
+        params = algorithms._canonical_param_map(alg, params, where="algorithm.params")
+    resolved = algorithms.resolve_params(alg, params)  # types/unknowns/choices
+    # Write the registered name, not the alias the user typed (`GEPA`,
+    # `archive-selection`), so the spec reads the same as `algorithms list`.
+    if not params:
+        return alg.name
+    # Store user-supplied keys only, with coerced (folded) values (#888).
+    return {"name": alg.name, "params": {k: resolved[k] for k in params}}
+
+
+def missing_target_message(path: str) -> str:
+    """One-line error when ``init`` / ``algorithms run`` get a PATH that is not there (#706)."""
+    return f"target {path!r} does not exist (cwd {os.getcwd()})"
+
+
+def require_existing_target(path: str, kind: Optional[str]) -> Optional[str]:
+    """Error text when PATH must exist for this kind, else ``None``.
+
+    ``text`` and ``policy_slot`` may name a non-path (inline prompt / slot name).
+    When ``kind`` is omitted a missing PATH must not fall through ``guess_kind``
+    to ``skill_dir`` (#706).
+    """
+    if kind in ("text", "policy_slot"):
+        return None
+    if os.path.exists(os.path.expanduser(path)):
+        return None
+    return missing_target_message(path)
+
+
+def guess_kind(path: str) -> str:
+    """The spec kind ``init`` / ``algorithms run`` assume for ``path`` without ``--kind``.
+
+    A path that does not exist is never guessed as ``skill_dir``: callers must
+    report :func:`missing_target_message` first (#706). A directory holding ≥2
+    ``*/SKILL.md`` and no root ``SKILL.md`` is a ``skill_library`` (#866).
+    """
+    p = os.path.expanduser(path)
+    if not os.path.exists(p):
+        raise ValueError(missing_target_message(path))
+    if os.path.isfile(p):
+        return "text"
+    if os.path.isdir(p) and os.path.exists(os.path.join(p, "tests")) and any(
+            f.endswith(".py") for f in os.listdir(p)):
+        return "agent_code"
+    if os.path.isdir(p) and (os.path.exists(os.path.join(p, ".claude-plugin"))
+                             or os.path.exists(os.path.join(p, "cordis.patch.yml"))):
+        return "plugin"
+    if os.path.basename(os.path.dirname(p.rstrip(os.sep))) == "agents":
+        return "agent_dir"
+    # A multi-file skill library: no root SKILL.md, ≥2 ``*/SKILL.md`` children —
+    # the layout ``kind=skill_library`` evolves (#866). A root SKILL.md stays
+    # ``skill_dir`` (one Agent Skill with helpers beside it).
+    if (not os.path.exists(os.path.join(p, "SKILL.md"))
+            and count_library_skills(p) >= 2):
+        return "skill_library"
+    return "skill_dir"
+
+
+def starter_spec(path: str, *, kind: Optional[str] = None, data: Optional[str] = None,
+                 agent: Optional[str] = None,
+                 agent_explicit: bool = False, model: Optional[str] = None,
+                 base_url: Optional[str] = None,
+                 key_env: Optional[str] = None,
+                 algorithm: Optional[str] = None,
+                 algorithm_params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """A spec to edit, with ``kind`` guessed from what ``path`` is.
+
+    ``agent=None`` picks the worker from the CLIs on PATH (:func:`default_agent_ref`).
+    ``agent_explicit`` says the user named ``agent`` (``init --agent``): it is
+    then kept for every kind instead of being replaced by the kind's default
+    model (#456).
+    ``model`` / ``base_url`` / ``key_env`` fill the ``openai_compatible`` blocks
+    (:func:`starter_model_block`); left out, they are placeholders or follow the
+    keys in the environment.
+    """
+    if agent is None:
+        agent = default_agent_ref()[0]
+    llm = starter_model_block(model=model, base_url=base_url, key_env=key_env)
+    p = os.path.expanduser(path)
+    if kind is None:
+        kind = guess_kind(path)
+    spec: Dict[str, Any] = {
+        "version": 1, "kind": kind, "target": path,
+        "data": {"path": data or "eval/cases.jsonl", "prompt": "prompt", "gold": "gold"},
+        "score": "contains",
+        "agent": {"ref": agent},
+        "evolve": {"rounds": 6, "n_workers": 4},
+    }
+    if kind == "text":
+        if not agent_explicit or agent == "openai_compatible":
+            spec["agent"] = dict(llm)
+        spec["evolve"] = {"rounds": 8, "n_workers": 8}
+    if kind == "skill_dir":
+        spec["reflect"] = dict(llm)
+        if agent == "claude_code":
+            spec["agent"] = {"ref": "claude_code",
+                             "extra_args": ["--permission-mode", "acceptEdits"]}
+    if kind == "skill_library":
+        spec["reflect"] = dict(llm)
+        spec["layout"] = "skill_library"
+        if agent == "claude_code":
+            spec["agent"] = {"ref": "claude_code",
+                             "extra_args": ["--permission-mode", "acceptEdits"]}
+    if kind == "agent_dir":
+        spec["reflect"] = dict(llm)
+    if kind == "agent_code":
+        spec["entrypoint"] = ["python", "main.py"]
+        spec["reflect"] = dict(llm)
+    if kind == "plugin":
+        spec["host"] = ("claude_code" if os.path.exists(os.path.join(p, ".claude-plugin"))
+                        else "dsh")
+        spec["reflect"] = dict(llm)
+    if kind == "policy_slot":
+        # `target` is a slot, not a path, and `data` holds refs rather than rows
+        # -- an inner problem is a callable and no row format can express one.
+        spec["target"] = path if path in _POLICY_SLOTS else "selection"
+        spec["data"] = {"problems": data or "mypkg.problems:build", "seeds": [0]}
+        spec["score"] = "auc"
+        if not agent_explicit or agent == "openai_compatible":
+            spec["agent"] = dict(llm)
+        # A round is `n_workers` whole inner searches, so ask for few and budget
+        # in wall clock: the recorded run asked for 8 rounds and got 2 in 90 min.
+        spec["evolve"] = {"rounds": 4, "n_workers": 2, "max_seconds": 5400}
+        spec["allow"] = ["mypkg"]
+    params = dict(algorithm_params or {})
+    # #847: short skill_library / skill_dir starter runs must still induce —
+    # evoskill's paper default batch_size=4 can exit with zero proposes.
+    if algorithm:
+        from . import algorithms as _algs
+        try:
+            alg = _algs.get(algorithm, where="init")
+            params = _algs._canonical_param_map(alg, params, where="algorithm.params")
+            if alg.name == "evoskill":
+                # Honour a hyphen/case alias (`batch-size`) so setdefault
+                # does not collide with it in resolve_params (#876).
+                params.setdefault("batch_size", 1)
+        except _algs.AlgorithmError:
+            pass
+    chosen = algorithm_override(algorithm, params or None, spec["kind"],
+                                target=path)
+    if chosen is not None:
+        spec["algorithm"] = chosen
+    return spec
+
+
+#: Every published `mcp` requires Python >= 3.10, and this project supports 3.9.
+#: On 3.9 the extra installs nothing (see the marker in pyproject.toml), so
+#: "pip install agentdescent[mcp]" is not advice, it is a dead end -- the only
+#: true instruction is a newer interpreter.
+MCP_MIN_PYTHON = (3, 10)
+
+
+def mcp_unavailable() -> Optional[str]:
+    """Why the MCP server cannot run here, or None if it can."""
+    if sys.version_info < MCP_MIN_PYTHON:
+        return ("the MCP SDK needs Python >= %d.%d and this is %s, so "
+                "`agentdescent[mcp]` installs nothing here -- the CLI verbs are "
+                "the whole surface on this interpreter, and the shipped SKILL.md "
+                "falls back to them" % (MCP_MIN_PYTHON[0], MCP_MIN_PYTHON[1],
+                                        ".".join(map(str, sys.version_info[:3]))))
+    # Delegated so there is one answer to "is the SDK here", and so a caller
+    # that stubs it (the install-warning test does) steers every message.
+    from .integrations import mcp_sdk_missing
+
+    if mcp_sdk_missing():
+        return ('the mcp package is missing: pip install "agentdescent[mcp]" '
+                "to serve tools (the CLI works without it)")
+    return None
+
+
+def doctor_report(*, home: Optional[str] = None) -> Dict[str, Any]:
+    """What this machine can run: agent CLIs, provider keys, optional pieces.
+
+    ``home`` is the same probe directory ``install --home`` / ``uninstall --home``
+    take (#605): host skill/MCP status is read under that tree, and an explicit
+    home wins over ``CODEX_HOME`` / ``DSH_HOME`` / ``XDG_CONFIG_HOME``. Omit it
+    to keep reading the real home (and those variables).
+    """
+    # Refuse an empty home before the per-host try/except can turn it into
+    # ``state: unknown`` (#412 / #605). Same helper install/uninstall use.
+    if home is not None:
+        from .integrations import _resolve_home
+        _resolve_home(home)
+    clis = {name: shutil.which(name)
+            for name in ("claude", "codex", "dsh", "opencode", "git", "node", "pnpm")}
+    from .integrations import provider_key_names
+
+    # The four names this dict has always had come first, so the output keeps its
+    # order; every other key `FORWARDED_ENV` carries (``ARK_API_KEY``, ...) follows.
+    # One list, not two: it used to be a hard-coded three, and a key every
+    # installer forwards read as "no provider key" (#423).
+    key_names = provider_key_names()
+    keys = {name: bool(os.environ.get(name)) for name in (
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "DEEPSEEK_API_KEY",
+        *key_names)}
+    # The *value* of the base URL, not just its presence: it is a URL and not a
+    # secret, and without it a caller writing a spec cannot tell that
+    # `OPENAI_API_KEY` points at some other provider entirely. Measured: an
+    # agent given only "OPENAI_API_KEY: true" wrote `"model": "gpt-4o-mini"`
+    # against an endpoint that serves nothing of the sort.
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    optional: Dict[str, bool] = {}
+    for mod in ("anthropic", "mcp"):
+        try:
+            __import__(mod)
+            optional[mod] = True
+        except ImportError:
+            optional[mod] = False
+    try:
+        from .sandbox_container import detect_engine
+        container = detect_engine()
+    except Exception:  # noqa: BLE001 - detection must never fail the report
+        container = None
+    problems: List[str] = []
+    if not clis["git"]:
+        problems.append("git is not on PATH; the ledger needs it")
+    if not any(clis[c] for c in ("claude", "codex", "dsh", "opencode")):
+        problems.append("no worker agent CLI on PATH (claude / codex / dsh / opencode); "
+                        "directory kinds need one")
+    if base_url:
+        problems.append(
+            f"OPENAI_BASE_URL is {base_url} -- an OpenAI-compatible endpoint that "
+            "is not OpenAI, so its model names are its own; ask the user which "
+            "model to name in a spec rather than assuming an OpenAI one")
+    present_keys = [n for n in key_names if keys[n]]
+    if not present_keys:
+        problems.append("no provider key in the environment; a reflector needs one "
+                        "(under dsh, forward keys in the mcp-client env block)")
+    why = mcp_unavailable()
+    if why:
+        problems.append(why)
+    hosts, hints = _host_integrations(clis, home=home)
+    other = [n for n in present_keys if n not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")]
+    if other and len(other) == len(present_keys):
+        # `openai_compatible` reads OPENAI_API_KEY and talks to api.openai.com unless
+        # told otherwise, so a key like ARK_API_KEY works only when the spec says so.
+        hints.append(
+            f"only {', '.join(other)} is set: use it with `openai_compatible` and "
+            f'`"api_key_env": "{other[0]}"` plus `default_base_url` (or `base_url_env`) '
+            "for its endpoint; the endpoint and the model name come from the user, "
+            "never guess them")
+    # Reflect is not the only role: an isolated `opencode` worker with a gateway
+    # key still needs the Coding recipe (#455). Same predicate as `init`
+    # (`_opencode_gateway_keys`): warn whenever a gateway key is present, even
+    # alongside OPENAI_API_KEY, so the two commands never disagree.
+    gateway = _opencode_gateway_keys(keys)
+    if gateway and clis.get("opencode"):
+        hints.append(
+            "opencode is on PATH and %s is set: for an isolated worker %s"
+            % (", ".join(gateway), _opencode_coding_recipe(gateway)))
+    for name, info in hosts.items():
+        if name == "grok-bot" and info.get("user_skill") == "stale":
+            # Grok Bot loads its saved user skill; `install` cannot rewrite that
+            # (doctor/install never write the Bot's skill store, #675).
+            problems.append(
+                f"{name}: the saved Grok Bot user skill is stale "
+                f"({info.get('user_skill_path')}); run `agentdescent install {name}`, "
+                f"then in a Grok Bot chat ask it to rewrite its `agentdescent` skill "
+                f"from {info['path']}")
+        elif info.get("mcp") == "broken":
+            problems.append(
+                f"{name}: the MCP launcher points at a deleted interpreter; "
+                f"run `agentdescent install {name}`")
+        elif info["state"] in ("stale", "partial"):
+            msg = (
+                f"{name}: the installed integration is {info['state']} "
+                f"(skill {info['skill']}, mcp {info['mcp']}); "
+                f"run `agentdescent install {name}`")
+            # Scaffold refresh alone is not enough when the Bot never saved the
+            # skill (#825): keep the save/rewrite tip next to the install tip.
+            if name == "grok-bot" and info.get("user_skill") == "missing":
+                msg += (
+                    f"; then in a Grok Bot chat ask it to save "
+                    f"`skills/agentdescent/SKILL.md` as a user skill from "
+                    f"{info['path']}")
+            problems.append(msg)
+        elif (name == "grok-bot"
+              and info.get("user_skill") == "missing"
+              and info.get("skill") != "missing"):
+            # Scaffold is present (ok/partial already handled above) but the Bot
+            # has no saved user skill — install notes say this once; doctor must
+            # keep surfacing it (#825). Hint, not problem: host state may be ok.
+            hints.append(
+                f"grok-bot: scaffold is installed but no saved user skill named "
+                f"`agentdescent` was found; ask Grok Bot to save "
+                f"`skills/agentdescent/SKILL.md` as a user skill from "
+                f"{info['path']} (doctor/install never write the Bot's skill store)")
+    return {
+        # Which install answered: the version and the interpreter running it. A host
+        # starts its own `agentdescent mcp` (often through the interpreter `install`
+        # pinned, #394), which can be a different install from the one in the user's
+        # shell; with these two fields a host-side `doctor` and a shell-side `doctor`
+        # compare directly (#416).
+        "version": _version(),
+        "executable": sys.executable,
+        "python": sys.version.split()[0],
+        "agent_clis": clis, "provider_keys_present": keys,
+        "openai_base_url": base_url,
+        "optional": optional, "container_engine": container,
+        "hosts": hosts, "hints": hints,
+        "nested": bool(os.environ.get(NESTED_ENV)),
+        "run_store": runstore.root(),
+        "problems": problems,
+    }
+
+
+def _host_integrations(clis: Dict[str, Any], *, home: Optional[str] = None):
+    """Per-host install state for :func:`doctor_report`, plus the hints.
+
+    A host whose CLI is on ``PATH`` but has no integration gets a *hint*, not a
+    problem: ``pip install`` does not wire anything, and nobody wants every
+    host on the machine touched, so the exit code stays about what is broken.
+    A stale or half-written integration is a problem, because it is installed
+    and teaching the host a procedure the package no longer has.
+    ``home`` is forwarded to :func:`host_status` so ``doctor --home`` matches
+    ``install --home`` (#605)."""
+    from .integrations import HOST_CLI, host_status
+
+    hosts: Dict[str, Dict[str, Any]] = {}
+    hints: List[str] = []
+    for name, binary in HOST_CLI.items():
+        try:
+            info: Dict[str, Any] = dict(host_status(name, home=home))
+        except Exception:  # noqa: BLE001 - reading a config must never fail doctor
+            info = {"state": "unknown", "skill": "unknown", "mcp": "unknown", "path": ""}
+        # ``None`` binary: scaffold-only hosts (Grok Bot) have no desktop CLI.
+        info["cli"] = clis.get(binary) if binary else None
+        hosts[name] = info
+        if info["cli"] and info["state"] == "missing":
+            # Installed through the host's own marketplace leaves no files here.
+            extra = {"codex": " (or `codex plugin add agentdescent@agentdescent`)",
+                     "claude-code": " (or `/plugin install agentdescent@agentdescent`)",
+                     }.get(name, "")
+            hints.append(f"{binary} is on PATH but agentdescent is not wired into it: "
+                         f"`agentdescent install {name}`{extra}")
+    return hosts, hints
+
+
+def _tree_diff(before: Dict[str, str], after: Dict[str, str]) -> str:
+    out: List[str] = []
+    for path in sorted(set(before) | set(after)):
+        a, b = before.get(path), after.get(path)
+        if a == b:
+            continue
+        out.extend(difflib.unified_diff(
+            (a or "").splitlines(keepends=True), (b or "").splitlines(keepends=True),
+            fromfile=f"a/{path}" if a is not None else "/dev/null",
+            tofile=f"b/{path}" if b is not None else "/dev/null"))
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# verbs
+# ---------------------------------------------------------------------------
+
+
+def _demo_offline_algorithms() -> Tuple[str, ...]:
+    from . import demo as demo_mod
+    return demo_mod.OFFLINE_ALGORITHMS
+
+
+def _drop_temp_demo_root(root: str, directory: Optional[str]) -> None:
+    """#906: a bare run's root is only worth keeping while its payload returns."""
+    if directory:
+        return
+    import shutil
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def demo_payload(
+    algorithm: Optional[str] = None,
+    *,
+    kind: Optional[str] = None,
+    directory: Optional[str] = None,
+    store: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run the offline demo and return the same dict as ``demo --json``.
+
+    Shared by the CLI and the MCP ``demo`` tool (#903). Raises
+    :class:`SpecError` for an unknown or real-model-only algorithm, or a
+    ``kind`` with no offline fixture, so both surfaces report the same
+    message.
+    """
+    import tempfile
+
+    from . import algorithms
+    from . import demo as demo_mod
+
+    algo = None
+    if algorithm:
+        try:
+            algo = algorithms.get(algorithm, where="demo --algorithm").name
+        except algorithms.AlgorithmError as e:
+            raise SpecError(str(e)) from None
+        why = demo_mod.skip_reason(algo)
+        if why:
+            raise SpecError(f"demo --algorithm: {why}")
+        if algo not in demo_mod.OFFLINE_ALGORITHMS:
+            raise SpecError(
+                f"demo --algorithm: {algo!r} does not run against the offline demo "
+                f"agent (it needs a real model); offline: "
+                f"{list(demo_mod.OFFLINE_ALGORITHMS)}. Run it for real with "
+                f"`agentdescent algorithms run {algo} <path> <cases.jsonl>` "
+                f"(`agentdescent algorithms show {algo}` for its parameters)")
+    try:
+        demo_mod.resolve_demo_kind(algo, kind)
+    except ValueError as e:
+        # Keep the #905 MCP contract: a bad --kind is actionable from a host
+        # too, so name the offline fixtures beside the resolver's message.
+        raise SpecError(f"{e} (offline kinds: ['skill_dir', 'text', "
+                        "'skill_library'])") from None
+
+    root = (os.path.abspath(os.path.expanduser(directory)) if directory
+            else tempfile.mkdtemp(prefix="agentdescent-demo-"))
+    os.makedirs(root, exist_ok=True)
+    try:
+        spec_dict = demo_mod.build(root, algorithm=algo, kind=kind)
+    except ValueError as e:
+        _drop_temp_demo_root(root, directory)
+        raise SpecError(str(e)) from None
+    used_kind = spec_dict["kind"]
+
+    spec = EvolveSpec.from_dict(spec_dict)
+    comp = compose(spec)
+    est = estimate(comp)
+    rd = runstore.create(spec.to_dict(), store=store)
+    try:
+        result = runstore.execute(rd)
+    except BaseException:
+        # #906: a failed run cannot be reported, so its own root is dead weight.
+        _drop_temp_demo_root(root, directory)
+        raise
+
+    init = getattr(result, "initial_reward", None)
+    learned = demo_mod.learned_summary(result.state, kind=used_kind)
+    ok = result.final_reward >= 1.0
+    # #902: one list feeds both the human footer and --json.next, and with
+    # --algorithm NAME the "your own run" steps keep the algorithm just shown.
+    target = {"text": "<your-prompt.txt>",
+              "skill_library": "<your-skill-library>"}.get(used_kind, "<your-skill-dir>")
+    if algo:
+        own_steps = [
+            f"agentdescent algorithms run {algo} {target} <your-cases.jsonl> "
+            f"--model <model> [--base-url <url>] --rounds 1 --workers 1",
+            "agentdescent doctor",
+            f"agentdescent evolve agentdescent.{algo}.spec.json",
+        ]
+    elif used_kind == "text":
+        own_steps = [
+            f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json",
+            "agentdescent doctor",
+            "agentdescent plan spec.json",
+        ]
+    elif kind == "skill_library":
+        own_steps = [
+            f"agentdescent init {target} --kind skill_library --data <your-cases.jsonl> --out spec.json",
+            "agentdescent doctor",
+            "agentdescent plan spec.json",
+        ]
+    else:
+        own_steps = [
+            f"agentdescent init {target} --data <your-cases.jsonl> --out spec.json",
+            "agentdescent doctor",
+            "agentdescent plan spec.json",
+        ]
+    next_steps = [
+        f"agentdescent show  {rd.run_id}",
+        f"agentdescent apply {rd.run_id} --dry-run",
+        *own_steps,
+    ]
+    return {
+        "ok": ok,
+        "dir": root,
+        "kind": used_kind,
+        "algorithm": algo,
+        "run_id": rd.run_id,
+        "plan": {
+            "tasks": len(comp.tasks),
+            "rounds": comp.kwargs["rounds"],
+            "n_workers": comp.kwargs["n_workers"],
+            "agent_calls_upper_bound": est["agent_calls_upper_bound"],
+        },
+        "initial_reward": init,
+        "final_reward": result.final_reward,
+        "outcomes": result.outcomes(),
+        "learned": learned,
+        "history": [
+            {"round": info.round,
+             "held_out_reward": info.held_out_reward,
+             "committed": info.committed,
+             "rejected": info.rejected}
+            for info in result.history
+        ],
+        "next": next_steps,
+        **({} if ok else {"note": "lower than expected for the demo; see the run store"}),
+    }
+
+
+def _print_demo_human(payload: Dict[str, Any], *, store: Optional[str] = None,
+                      keep: bool = True) -> None:
+    """Reprint the narrative ``cmd_demo`` used to stream while the run ran."""
+    from . import demo as demo_mod
+
+    root = payload["dir"]
+    # #906: say which case keeps the files, so the line matches what is on disk.
+    where = root if keep else f"{root} (removed at exit)"
+    kind = payload["kind"]
+    algo = payload["algorithm"]
+    if kind == "text":
+        prompt_path = os.path.join(root, "prompt.txt")
+        print(f"A text prompt that totals a CSV column, in {where}")
+        print(f"  prompt.txt   ->  {open(prompt_path).read().strip()!r}   "
+              f"(wrong: `id` is a row number)")
+        print("  cases.jsonl  ->  12 prompts with embedded CSVs and known totals")
+    elif kind == "skill_library":
+        csv_rules = os.path.join(root, "csv-total", "references", "rules.md")
+        date_rules = os.path.join(root, "date-parse", "references", "rules.md")
+        print(f"A two-skill library (csv-total + date-parse), in {where}")
+        print(f"  csv-total/references/rules.md   ->  "
+              f"{open(csv_rules).read().strip()!r}   (wrong: `id` is a row number)")
+        print(f"  date-parse/references/rules.md  ->  "
+              f"{open(date_rules).read().strip()!r}   (wrong: date tasks ask for year)")
+        print("  cases.jsonl                      ->  12 tasks (CSV totals + date years)")
+    else:
+        skill = os.path.join(root, demo_mod.DEMO_SKILL)
+        rules = os.path.join(skill, "references", "rules.md")
+        print(f"A skill that totals a column of a CSV, in {where}")
+        print(f"  {demo_mod.DEMO_SKILL}/references/rules.md  ->  "
+              f"{open(rules).read().strip()!r}   (wrong: `id` is a row number)")
+        print("  cases.jsonl                        ->  12 CSVs with known totals")
+    print("  the agent is a local program, so this costs nothing and needs no key")
+    if kind != "skill_library":
+        print("  note: this is a smoke trajectory; for multi-round library edits see")
+        print("        agentdescent demo --kind skill_library")
+    if algo:
+        print(f"  algorithm: {algo}   (`agentdescent algorithms show {algo}`)")
+    print()
+
+    plan = payload["plan"]
+    print(f"plan: {plan['tasks']} tasks, "
+          f"{plan['rounds']} rounds x {plan['n_workers']} workers, "
+          f"up to {plan['agent_calls_upper_bound']} agent calls\n")
+    print(f"running ({payload['run_id']})...")
+    for info in payload["history"]:
+        print(f"  round {info['round']:>2}  reward={info['held_out_reward']:.3f}  "
+              f"+{info['committed']}/-{info['rejected']}")
+
+    init = payload["initial_reward"]
+    if init is not None:
+        print(f"\nheld-out reward: {init:.3f} -> {payload['final_reward']:.3f}   "
+              f"outcomes: {payload['outcomes']}")
+    else:
+        print(f"\nheld-out reward: {payload['final_reward']:.3f}   "
+              f"outcomes: {payload['outcomes']}")
+    print(f"what it learned:  {payload['learned']}")
+    if not payload["ok"]:
+        print("\n(that is lower than expected for the demo; the run store has the detail:")
+        try:
+            print(f" {runstore.get(payload['run_id'], store=store).path})")
+        except runstore.RunStoreError:
+            print(f" {payload['run_id']})")
+        return
+
+    own_steps = payload["next"][2:]
+    own = "\n".join(f"  {step}" + ("        # what is missing before a real run"
+                                     if step == "agentdescent doctor" and kind != "text"
+                                     else "")
+                     for step in own_steps)
+    run_id = payload["run_id"]
+    if keep:
+        headline = {
+            "text": "The prompt on disk is untouched -- an evolved artifact only "
+                    "lands when you say so:",
+            "skill_library": "The library on disk is untouched -- an evolved "
+                             "artifact only lands when you say so:",
+        }.get(kind, "The skill on disk is untouched -- an evolved artifact only "
+                    "lands when you say so:")
+        steps = (f"  agentdescent show  {run_id}          the diff\n"
+                 f"  agentdescent apply {run_id} --dry-run  what it would write")
+    else:
+        # #1047: a bare run removes its root at exit (#906), so `show` would
+        # render every file as new and `apply` would rebuild the directory that
+        # was just deleted. Point at `--dir`, which keeps the root and prints
+        # these two steps for the run it keeps.
+        headline = ("This demo's directory is removed at exit, so there is nothing "
+                    "left to show or\napply. Keep it, and that run prints the same "
+                    "two steps:")
+        steps = "  agentdescent demo --dir ./demo        # keeps the files, then shows the diff"
+    if kind == "text":
+        print(f"""
+{headline}
+
+{steps}
+
+Your own run is the same shape with a real model instead of the offline pair:
+
+{own}""")
+    elif kind == "skill_library":
+        print(f"""
+{headline}
+
+{steps}
+
+Your own run is the same spec with three things changed -- your library, your
+cases.jsonl, and a real agent instead of the offline one:
+
+{own}""")
+    else:
+        print(f"""
+{headline}
+
+{steps}
+
+Your own run is the same spec with three things changed -- your directory, your
+cases.jsonl, and a real agent instead of the offline one:
+
+{own}""")
+
+
+def cmd_demo(a: argparse.Namespace) -> int:
+    """Build a complete example and run it, so the first thing seen works."""
+    import shutil
+
+    payload = demo_payload(
+        getattr(a, "algorithm", None),
+        kind=getattr(a, "kind", None),
+        directory=getattr(a, "dir", None),
+        store=a.store,
+    )
+    # #906: a bare demo's root lives only for this run. `--dir` is the user
+    # keeping it; `--json` hands the path to a host that reads it after exit.
+    keep = bool(getattr(a, "dir", None)) or bool(getattr(a, "json", False))
+    try:
+        if getattr(a, "json", False):
+            # #862: honour the advertised --json flag so hosts can assert an
+            # offline algo smoke without scraping the human narrative.
+            _out(payload, as_json=True)
+            return 0 if payload["ok"] else 1
+        _print_demo_human(payload, store=a.store, keep=keep)
+        return 0 if payload["ok"] else 1
+    finally:
+        if not keep:
+            shutil.rmtree(payload["dir"], ignore_errors=True)
+
+
+def _starter_model_warnings(spec: Dict[str, Any], out: str) -> List[str]:
+    """What ``init`` says about the blocks it just wrote.
+
+    One answer with ``doctor`` (#451): for ``openai_compatible`` it names the key
+    the block will read -- the one that is set here, not always OPENAI_API_KEY --
+    and every value left for the user to fill in, which ``plan`` refuses until
+    they do. For a bare ``opencode`` worker with only a gateway key (#455), it
+    points at the documented ``OPENCODE_CONFIG`` Coding recipe so ``init`` does
+    not leave a silent ``{"ref": "opencode"}`` that dies on OpenCode's built-in
+    Volcengine default under isolation.
+    """
+    lines: List[str] = []
+    for field in ("agent", "reflect"):
+        block = spec.get(field)
+        if not (isinstance(block, dict) and block.get("ref") == "openai_compatible"):
+            continue
+        key_env = _key_env(block, "OPENAI_API_KEY")
+        todo = [f"`{field}.{k}`" for k in ("model", "default_base_url")
+                if _is_placeholder(block.get(k))]
+        if todo:
+            via = (f" It reads {key_env}, the provider key set here." if key_env != "OPENAI_API_KEY"
+                   and os.environ.get(key_env) else "")
+            # Hand-filling reflect alone does not wire a bare opencode worker (#790).
+            agent_block = spec.get("agent")
+            bare_oc = (
+                (isinstance(agent_block, dict) and agent_block.get("ref") == "opencode"
+                 and not _opencode_configured(agent_block))
+                or agent_block == "opencode" or agent_block == {"ref": "opencode"})
+            fill_hint = (
+                " Filling reflect alone is not enough when `agent` is bare "
+                "`opencode` — also pass `--model` / `--base-url` (or write the "
+                "OpenCode Coding recipe) so the worker is not left on OpenCode's "
+                "default model"
+                if bare_oc and field == "reflect" else
+                f" Fill {'it' if len(todo) == 1 else 'them'} in, or re-run with "
+                "`--model` / `--base-url`")
+            lines.append(
+                f"{' and '.join(todo)} in {out} {'is a placeholder' if len(todo) == 1 else 'are placeholders'}"
+                f": the model (and the endpoint for a non-OpenAI key) come from you, never "
+                f"a guess.{via}{fill_hint}; `plan` refuses the spec until then")
+        if not os.environ.get(key_env):
+            # The starter reflector is a model call whatever worker CLI was found,
+            # so a machine with only `opencode` / `claude` gets one it cannot call.
+            # Run, it used to finish `done` with nothing learned (#395).
+            lines.append(
+                f"`{field}` is `openai_compatible` and {key_env} is not set, so every "
+                "call would fail" + (" and the run would learn nothing" if field == "reflect" else "")
+                + ". Export a provider key (`agentdescent doctor` lists the ones it "
+                "knows), or pass `--key-env NAME` for one that is set")
+    # Bare isolated OpenCode + gateway key: same trap `plan` already names (#455).
+    # Warn at init so the written `{"ref": "opencode"}` is not silent.
+    agent = spec.get("agent")
+    if ((isinstance(agent, dict) and agent.get("ref") == "opencode"
+         and not _opencode_configured(agent))
+            or agent == "opencode"):
+        block = agent if isinstance(agent, dict) else {"ref": "opencode"}
+        keys = doctor_report()["provider_keys_present"]
+        remedy = _opencode_provider_remedy(block, keys)
+        if remedy and not _opencode_model_arg(block):
+            lines.append(
+                f"`agent` in {out} is bare `opencode`: {remedy}. "
+                "Filling `reflect` alone is not enough — pass `--model` / "
+                "`--base-url` (or write the full agent Coding recipe); "
+                "`plan` / `evolve` refuse a bare worker when a gateway key is set. "
+                "See docs/plugins.md (OpenCode Coding / OPENCODE_CONFIG)")
+    return lines
+
+
+#: Built-in short refs by what they resolve to; keep in step with
+#: ``evolvespec.SHORT_REFS`` / ``WORKSPACE_AGENT_REFS``. A full
+#: ``module:attribute`` ref outside these is not checked here (``plan`` does).
+_WORKSPACE_REFS = ("claude_code", "codex", "dsh", "opencode", "cli_agent")
+_PLAIN_REFS = ("openai_compatible", "host_model", "claude", "echo")
+
+
+def fold_agent_ref(ref: str) -> str:
+    """Canonical built-in agent short ref when ``ref`` is a case/hyphen alias.
+
+    ``claude-code`` and ``CLAUDE_CODE`` become ``claude_code``. A value that
+    is not such an alias — including ``module:attribute`` and install-only
+    host names like ``deepseek-harness`` — is returned unchanged, so
+    :func:`init_agent_unknown` can still hint or refuse it.
+    """
+    if not isinstance(ref, str) or ":" in ref:
+        return ref
+    folded = ref.strip().casefold().replace("-", "_")
+    if folded in _WORKSPACE_REFS + _PLAIN_REFS:
+        return folded
+    return ref
+
+
+def init_agent_unknown(ref: str) -> Optional[str]:
+    """Why ``--agent ref`` can never resolve, or None (#745).
+
+    ``plan`` would refuse a name that is neither a built-in agent short ref nor
+    ``module:attribute``; say so before a spec is written, list only the agent
+    refs (not the policy classes ``SHORT_REFS`` also holds), and point a host
+    name such as ``deepseek-harness`` at its worker spelling. Callers should
+    run :func:`fold_agent_ref` first so ``claude-code`` is stored as
+    ``claude_code`` rather than rejected (#884).
+    """
+    agents = _WORKSPACE_REFS + _PLAIN_REFS
+    if ref in agents or ":" in ref:
+        return None
+    msg = (f"--agent {ref}: not a known agent; use one of {', '.join(agents)} "
+           "or a custom 'module:attribute'")
+    guess = ref.strip().lower().replace("-", "_")
+    if guess in agents:
+        return msg + f" (did you mean `--agent {guess}`?)"
+    # An `install` host name or alias (#752): point it at its worker ref, or
+    # say plainly that the host has none.
+    from .integrations import HOST_CLI, canonical_host
+
+    host = canonical_host(ref)
+    if host in HOST_CLI:
+        worker = host.replace("-", "_")
+        if worker in agents:
+            msg += f" (did you mean `--agent {worker}`? `{ref}` is the install host name)"
+        else:
+            msg += (f"; `{ref}` is an install host with no worker CLI, so pick a "
+                    "worker that runs on its computer (`agentdescent doctor` lists "
+                    "them), e.g. `--agent openai_compatible --model M --key-env K`, "
+                    "or omit --agent for the default")
+    return msg
+
+
+def init_agent_mismatch(kind: str, ref: str) -> Optional[str]:
+    """Why ``plan`` would refuse agent ``ref`` for ``kind``, or None (#456).
+
+    The same two rules ``compose`` enforces, checked before ``init`` writes a
+    spec that is doomed at ``plan``: a directory kind needs a WorkspaceAgent,
+    and kind=text needs a plain Completion.
+    """
+    short = ref.split(":", 1)[1] if ref.startswith("agentdescent.agents:") else ref
+    if short == "agentdescent.host_sampling:host_model":
+        short = "host_model"
+    if kind in ("skill_dir", "skill_library", "agent_dir") and short in _PLAIN_REFS:
+        return (f"kind={kind!r} needs a WorkspaceAgent "
+                f"({' / '.join(_WORKSPACE_REFS)}) so the directory is put in front "
+                f"of it; `{ref}` is a plain model call")
+    if kind == "text" and short in _WORKSPACE_REFS:
+        return (f"kind='text' needs a plain Completion ({' / '.join(_PLAIN_REFS[:3])}), "
+                f"not a WorkspaceAgent; `{ref}` is a file-editing agent and would "
+                "cost a whole agent session per case")
+    return None
+
+
+#: Common column names ``init --data`` maps onto ``data.prompt`` / ``data.gold``
+#: when the cases file does not use the defaults (#561).
+_PROMPT_ALIASES = ("input", "question", "query", "problem")
+_GOLD_ALIASES = ("expected", "answer", "output", "target")
+
+
+def detect_data_columns(path: Optional[str]) -> Tuple[Dict[str, str], List[str]]:
+    """Read the first row of ``path`` and pick ``prompt``/``gold`` columns (#561).
+
+    Returns ``(mapping, notes)``: ``mapping`` holds only the fields to change
+    from the ``prompt``/``gold`` defaults, ``notes`` the lines to print (prefixed
+    ``warning:`` when nothing matched). A missing or unreadable file returns
+    nothing -- ``init`` already says what to create, and ``plan`` reports bad files.
+    """
+    if not path or not os.path.isfile(os.path.expanduser(path)):
+        return {}, []
+    try:
+        from .evolvespec import _read_rows_file
+        rows = _read_rows_file(path)
+    except Exception:            # plan reports a malformed file with line numbers
+        return {}, []
+    if not rows or not isinstance(rows[0], dict):
+        return {}, []
+    cols = [str(c) for c in rows[0]]
+    mapping: Dict[str, str] = {}
+    notes: List[str] = []
+    for field, default, aliases in (("prompt", "prompt", _PROMPT_ALIASES),
+                                    ("gold", "gold", _GOLD_ALIASES)):
+        if default in cols:
+            continue
+        hits = [c for c in aliases if c in cols]
+        if len(hits) == 1:
+            mapping[field] = hits[0]
+            notes.append(f"data.{field}: using column {hits[0]!r} from {path}")
+        else:
+            why = (f"several candidates ({', '.join(hits)})" if hits
+                   else "no known alias")
+            notes.append(f"warning: data.{field}: {path} has no {default!r} column "
+                         f"and {why}; columns: {', '.join(cols)}. Set "
+                         f'"data": {{"{field}": "<column>"}} in the spec before `plan`')
+    return mapping, notes
+
+
+def _backup_existing_spec(out: str, spec: Any) -> Optional[str]:
+    """Copy an existing, different ``out`` to ``<out>.bak-N`` before it is replaced.
+
+    Returns the backup path, or ``None`` when ``out`` is new or already holds
+    exactly ``spec`` as JSON (a plain re-run is not worth a backup). Backups
+    are numbered like ``apply``'s, so a second replacement never overwrites
+    the first one's copy (#725, #727). Used for the spec and for the OpenCode
+    provider-only config written next to it.
+    """
+    if not os.path.isfile(out):
+        return None
+    try:
+        with open(out, "r", encoding="utf-8") as fh:
+            old_text = fh.read()
+    except OSError:
+        old_text = None
+    if old_text is not None:
+        try:
+            if json.loads(old_text) == json.loads(json.dumps(spec)):
+                return None
+        except ValueError:
+            pass
+    backup = _backup_slot(out)
+    try:
+        shutil.copyfile(out, backup)
+    except OSError as e:
+        raise _cannot_write(backup, e) from None
+    return backup
+
+
+
+#: Starter pair for ``init --kind skill_library`` when the target has <2 skills.
+_STARTER_LIBRARY_SKILLS = (
+    ("example-alpha",
+     "---\n"
+     "name: example-alpha\n"
+     "description: Example library skill A. Replace with a real skill.\n"
+     "---\n"
+     "# example-alpha\n"
+     "Replace this body. The agent should read this skill off disk.\n"),
+    ("example-beta",
+     "---\n"
+     "name: example-beta\n"
+     "description: Example library skill B. Replace with a real skill.\n"
+     "---\n"
+     "# example-beta\n"
+     "Replace this body. A library needs at least two skills.\n"),
+)
+
+
+def count_library_skills(path: str) -> int:
+    """How many ``*/SKILL.md`` folders sit directly under ``path``."""
+    root = os.path.expanduser(path)
+    if not os.path.isdir(root):
+        return 0
+    n = 0
+    for name in os.listdir(root):
+        if os.path.isfile(os.path.join(root, name, "SKILL.md")):
+            n += 1
+    return n
+
+
+def _preflight_write(path: str) -> None:
+    """Refuse now, before the seed writes, when ``path`` cannot be written (#1003).
+
+    A read-only directory, a regular file where a directory belongs, or a name
+    the filesystem cannot hold all refuse here -- before any starter
+    ``*/SKILL.md`` reaches the target, and without creating anything on the way.
+    """
+    dest = os.path.abspath(path)
+    parent = os.path.dirname(dest) or "."
+    probe_dir = parent
+    while not os.path.exists(probe_dir):
+        up = os.path.dirname(probe_dir)
+        if up == probe_dir:
+            break
+        probe_dir = up
+    try:
+        if not os.path.isdir(probe_dir):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR),
+                                     probe_dir)
+        if os.path.exists(dest):
+            os.close(os.open(dest, os.O_WRONLY))     # test the bit, no truncate
+        elif probe_dir == parent:
+            os.close(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+            os.unlink(dest)
+        else:                       # the write creates the parent; probe the ancestor
+            fd, probe = tempfile.mkstemp(dir=probe_dir, prefix=".ad-probe-")
+            os.close(fd)
+            os.unlink(probe)
+    except OSError as e:
+        raise _cannot_write(path, e) from None
+
+
+def _refuse_linked_dest(root: str, path: str) -> None:
+    """Refuse a link planted at the destination, before any backup or write (#1008).
+
+    ``_preflight_write`` tests writability only and every test it makes follows a
+    link, so a symlink named exactly like the writer's destination was
+    dereferenced: the spec landed outside the tree and the ``.bak-N`` copy kept
+    the linked file's bytes. The rule is ``filetree.dest_problem`` -- what
+    ``apply --to`` and the tree writer already use (#977) -- with ``root`` set to
+    the directory the writer was given, so a link *above* it stays allowed
+    (dotfiles and homedir layouts) and only the destination itself is refused.
+    """
+    from .filetree import dest_problem
+
+    problem = dest_problem(root, path)
+    if problem is not None:
+        raise runstore.RunStoreError(
+            f"cannot write {os.path.abspath(path)}: {problem}")
+
+
+def _skill_library_seed_plan(path: str) -> List[Tuple[str, str, str]]:
+    """``(skill_dir, dest, body)`` for the starters still needed; writes nothing (#1003)."""
+    root = os.path.expanduser(path)
+    if not os.path.isdir(root):
+        return []
+    have = count_library_skills(root)
+    existing = {name for name in os.listdir(root)
+                if os.path.isfile(os.path.join(root, name, "SKILL.md"))}
+    planned: List[Tuple[str, str, str]] = []
+    for name, body in _STARTER_LIBRARY_SKILLS:
+        if have >= 2:
+            break
+        if name in existing:
+            continue
+        dest = os.path.join(root, name, "SKILL.md")
+        if not os.path.exists(dest):
+            planned.append((os.path.join(root, name), dest, body))
+            have += 1
+    return planned
+
+
+def _write_skill_library_seed(planned: Sequence[Tuple[str, str, str]]) -> List[str]:
+    """Write a preflighted seed plan; every step refuses with ``cannot write``."""
+    written: List[str] = []
+    for skill_dir, dest, body in planned:
+        try:
+            os.makedirs(skill_dir, exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        written.append(dest)
+    return written
+
+
+def ensure_skill_library_tree(path: str) -> List[str]:
+    """Seed ≥2 ``*/SKILL.md`` under ``path`` when fewer exist. Returns written paths."""
+    root = os.path.expanduser(path)
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        raise _cannot_write(root, e) from None
+    planned = _skill_library_seed_plan(root)
+    for _skill_dir, dest, _body in planned:
+        _refuse_linked_dest(root, dest)
+        _preflight_write(dest)
+    return _write_skill_library_seed(planned)
+
+
+def write_starter_spec(
+    path: str,
+    *,
+    kind: Optional[str] = None,
+    data: Optional[str] = None,
+    agent: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    key_env: Optional[str] = None,
+    algorithm: Optional[str] = None,
+    param: Optional[Sequence[str]] = None,
+    out: Optional[str] = None,
+    follow_up: Optional[str] = "plan",
+    params: Optional[Mapping[str, Any]] = None,
+    rounds: Optional[int] = None,
+    workers: Optional[int] = None,
+) -> Tuple[str, Dict[str, Any], List[Tuple[str, str]], Optional[str]]:
+    """Build and write a starter spec (shared by ``init`` and ``algorithms run``).
+
+    Returns ``(out_path, spec, report, providers_out)``. Raises ``ValueError``
+    (including :class:`~agentdescent.algorithms.AlgorithmError`) for a bad
+    algorithm / param / agent mismatch. ``follow_up`` is ``"plan"`` for ``init``
+    (appends ``then: agentdescent plan …``) or ``None`` when the caller will
+    plan itself (#674). ``rounds`` / ``workers`` (``--rounds`` / ``--workers``)
+    replace the kind's ``evolve.rounds`` / ``evolve.n_workers`` so a cheap
+    trial needs no hand-edited JSON; left out, the kind defaults stay (#707).
+    ``params`` is an already-parsed ``{name: value}`` mapping (the MCP
+    ``algorithm_spec`` tool); it replaces ``param`` so keys and values are
+    never round-tripped through ``KEY=VALUE`` strings (#729).
+    """
+    for flag, value in (("--rounds", rounds), ("--workers", workers)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or value < 1):
+            raise ValueError(f"{flag} must be an integer >= 1, got {value!r}")
+    if kind is not None:
+        kind = resolve_kind(kind, where="--kind")
+    agent_explicit = agent is not None
+    if agent is None:
+        agent, found = default_agent_ref()
+    else:
+        found = True
+        agent = fold_agent_ref(agent)
+    # Refuse a missing PATH before kind guess / agent mismatch / writing (#706).
+    missing = require_existing_target(path, kind)
+    if missing:
+        raise ValueError(missing)
+    params = dict(params) if params is not None else parse_cli_params(param)
+    spec = starter_spec(path, kind=kind, data=data, agent=agent,
+                        agent_explicit=agent_explicit, model=model,
+                        base_url=base_url, key_env=key_env,
+                        algorithm=algorithm, algorithm_params=params)
+    if spec["kind"] == "text":
+        from .evolvespec import text_target_dir_message
+        why = text_target_dir_message(path)
+        if why:
+            # Refuse before writing: `plan` refuses it too, and a spec over a
+            # directory used to run on the path string and crash `apply` (#755).
+            raise ValueError(why)
+    if rounds is not None:
+        spec["evolve"]["rounds"] = rounds
+    if workers is not None:
+        spec["evolve"]["n_workers"] = workers
+    if agent_explicit:
+        why = init_agent_unknown(agent)
+        if why:
+            # Refuse before writing, as for a kind mismatch: `plan` cannot resolve it.
+            raise ValueError(why)
+        why = init_agent_mismatch(spec["kind"], agent)
+        if why:
+            # Refuse before writing: `plan` would reject this spec anyway, and a
+            # spec that silently swaps the user's --agent is worse (#456).
+            raise ValueError(
+                f"--agent {agent}: {why}; pick a matching ref "
+                "(see `agentdescent doctor`) or omit --agent for the default")
+    if out is None:
+        out = os.path.join(
+            ".agentdescent",
+            f"{os.path.basename(path.rstrip('/')) or 'spec'}.evolve.json")
+    # Every destination is link-checked before any backup or seed write (#1008):
+    # a link at the `--out` leaf, at the providers file, or at a starter
+    # directory was dereferenced, so the spec landed outside the tree and the
+    # `.bak-N` copy kept the linked file's bytes. A link *above* these paths is
+    # still allowed, so a symlinked homedir keeps working.
+    out_dir = os.path.dirname(os.path.abspath(out)) or os.sep
+    _refuse_linked_dest(out_dir, out)
+    if os.path.isfile(out):
+        _refuse_linked_dest(out_dir, _backup_slot(out))
+    providers_out = None
+    if spec.get("agent") == {"ref": "opencode"} and model and base_url:
+        stem = os.path.splitext(os.path.basename(out))[0]
+        providers_out = os.path.join(out_dir, f"{stem}.opencode-providers.json")
+        _refuse_linked_dest(out_dir, providers_out)
+        if os.path.isfile(providers_out):
+            _refuse_linked_dest(out_dir, _backup_slot(providers_out))
+    library_seeded: List[str] = []
+    if spec["kind"] == "skill_library":
+        # Preflight both destinations before anything is written (#1003): the
+        # seed ran before the wrapped `--out` writer, so a refused `--out` left
+        # the starters behind; the `.bak-N` copy is the other late write.
+        root = os.path.expanduser(path)
+        plan = _skill_library_seed_plan(path)
+        for _skill_dir, dest, _body in plan:
+            _refuse_linked_dest(root, dest)
+            _preflight_write(dest)
+        _preflight_write(out)
+        if os.path.isfile(out):
+            _preflight_write(_backup_slot(out))
+        library_seeded = _write_skill_library_seed(plan)
+    column_notes: List[str] = []
+    if spec["kind"] != "policy_slot" and isinstance(spec.get("data"), dict):
+        columns, column_notes = detect_data_columns(data)
+        spec["data"].update(columns)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    except OSError as e:
+        raise _cannot_write(out, e) from None
+    providers_key_env = None
+    providers_backup = None
+    if spec.get("agent") == {"ref": "opencode"} and model and base_url:
+        # The user named the model and endpoint, so wire them into the worker
+        # too, not only the reflector: a bare `opencode` would ignore both and
+        # fall back on OpenCode's own default (#485). Without both flags the
+        # bare ref and the #455 warning stay -- nothing is guessed.
+        llm = next((b for b in (spec.get("reflect"), spec.get("agent"))
+                    if isinstance(b, dict) and b.get("ref") == "openai_compatible"), {})
+        providers_key_env = llm.get("api_key_env") or key_env or "OPENAI_API_KEY"
+        agent_block, providers = opencode_coding_recipe(
+            model=model, base_url=base_url, key_env=providers_key_env,
+            config_path=providers_out)
+        spec["agent"] = agent_block
+        providers_backup = _backup_existing_spec(providers_out, providers)
+        try:
+            with open(providers_out, "w", encoding="utf-8") as fh:
+                json.dump(providers, fh, indent=2)
+        except OSError as e:
+            raise _cannot_write(providers_out, e) from None
+    backup = _backup_existing_spec(out, spec)
+    try:
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(spec, fh, indent=2)
+    except OSError as e:
+        raise _cannot_write(out, e) from None
+    report: List[Tuple[str, str]] = [("wrote", f"wrote {out}")]
+    for seeded in library_seeded:
+        report.append(("wrote", f"seeded {seeded}"))
+    if library_seeded:
+        # Name only what was actually written: when the target already had one
+        # skill, ensure_skill_library_tree seeds a single starter (#868).
+        seeded_names = [os.path.basename(os.path.dirname(p)) for p in library_seeded]
+        report.append(("note", "kind=skill_library needs ≥2 */SKILL.md; "
+                       f"seeded {' / '.join(seeded_names)} — replace before evolve"))
+    if backup:
+        # Re-running init / `algorithms run` on the same --out used to drop a
+        # hand-edited spec without a word; keep the old copy and say so (#725).
+        report.append(("note", f"{out} already existed with different content; "
+                       f"the previous copy is saved as {backup}"))
+    for line in column_notes:
+        report.append(("note", line))
+    if spec["kind"] == "text":
+        from .evolvespec import looks_like_path_target
+        if looks_like_path_target(path) and not os.path.isfile(os.path.expanduser(path)):
+            report.append((
+                "warning",
+                f"target {path!r} is not a file; kind=text will use the path "
+                "string itself as the prompt text"))
+    if providers_out:
+        report.append(("wrote", f"wrote {providers_out} (OpenCode provider-only config for the worker; "
+              f"key read from ${providers_key_env}, never inline)"))
+        if providers_backup:
+            report.append(("note", f"{providers_out} already existed with different "
+                           f"content; the previous copy is saved as {providers_backup}"))
+    if not found and spec["kind"] not in ("text", "policy_slot"):
+        report.append(("warning", "no worker CLI (claude, codex, dsh, opencode) is on PATH; "
+                       f"wrote the placeholder agent `{agent}`. Run `agentdescent doctor`, "
+                       "install a CLI, or re-run with `--agent <ref>` / edit `agent.ref` "
+                       "before `plan`"))
+    elif not agent_explicit and spec["kind"] not in ("text", "policy_slot"):
+        report.append(("note", f"agent: `{agent}` (the worker CLI found on PATH; "
+                       "override with `--agent <ref>`)"))
+    for line in _starter_model_warnings(spec, out):
+        report.append(("warning", line))
+    host = spec.get("host") if spec["kind"] == "plugin" else None
+    if host in _CLI_BINARIES and not doctor_report()["agent_clis"].get(_CLI_BINARIES[host]):
+        # The plugin's format fixes its host; the worker found on PATH does
+        # not run it, so say so here rather than only at `plan` (#368).
+        report.append(("warning", f"this plugin's host `{host}` needs `{_CLI_BINARIES[host]}` "
+                       f"on PATH to load it and run rollouts, and it is not there; "
+                       f"`plan` will refuse until it is installed"))
+    if follow_up == "plan":
+        if spec["kind"] == "policy_slot":
+            problems = spec["data"]["problems"]
+            report.append(("next", f"provide {problems} -- a zero-argument builder "
+                           "returning a mapping of inner problems"))
+            report.append(("next", "make its module importable and include its package "
+                           "in the spec's allow list"))
+        else:
+            data_path = spec["data"]["path"]
+            if not os.path.exists(os.path.expanduser(data_path)):
+                report.append(("next", f"create {data_path} -- one JSON object per line, "
+                               '{"prompt": "...", "gold": "..."}'))
+                if spec["kind"] == "skill_library":
+                    # #864 / #846: demo is skill_dir smoke; name the library card path.
+                    report.append(("next",
+                                   "(`agentdescent demo --kind skill_library` is "
+                                   "the offline library demo; `demo --algorithm "
+                                   "archive_selection` is a one-skill smoke of the "
+                                   "same card — see docs/quickstart-skill.md)"))
+                else:
+                    report.append(("next", "(`agentdescent demo` runs a complete example, "
+                                   "offline, to copy from)"))
+        if spec["kind"] == "skill_library":
+            # Always tip which wheel cards apply.
+            report.append(("note",
+                           "skill_library cards: archive_selection "
+                           "(selection rule) or evoskill (proposer/generator); "
+                           "`agentdescent demo --algorithm evoskill` runs evoskill offline; "
+                           "`agentdescent algorithms list --kind skill_library`"))
+        report.append(("then", f"agentdescent plan {out}"))
+    return out, spec, report, providers_out
+
+
+def _print_init_report(report: List[Tuple[str, str]], *,
+                       skip: Optional[set] = None) -> set:
+    """Print report lines once each; return the set of bodies printed (#848)."""
+    printed: set = set(skip or ())
+    first_next = True
+    for kind, text in report:
+        if text in printed:
+            continue
+        printed.add(text)
+        if kind == "warning":
+            print(f"warning: {text}")
+        elif kind == "note":
+            print(f"note: {text}")
+        elif kind == "next":
+            print(("next: " if first_next else "      ") + text)
+            first_next = False
+        elif kind == "then":
+            print(f"then: {text}")
+        else:
+            print(text)
+    return printed
+
+
+def cmd_init(a: argparse.Namespace) -> int:
+    try:
+        out, spec, report, providers_out = write_starter_spec(
+            a.path, kind=a.kind, data=a.data, agent=a.agent, model=a.model,
+            base_url=a.base_url, key_env=a.key_env,
+            algorithm=getattr(a, "algorithm", None),
+            param=getattr(a, "param", None), out=a.out, follow_up="plan",
+            rounds=getattr(a, "rounds", None), workers=getattr(a, "workers", None))
+    except ValueError as e:      # AlgorithmError is a ValueError
+        # Same {"ok": false, "error": ...} object under --json as plan/rsi (#660).
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
+    # Plain output keeps its line order; --json collects the same text by
+    # category into one {"ok": true, ...} object (#662).
+    if getattr(a, "json", False):
+        _out({"ok": True, "spec": out, "kind": spec["kind"],
+              "providers_config": providers_out,
+              "warnings": [t for k, t in report if k == "warning"],
+              "notes": [t for k, t in report if k == "note"],
+              "next": [t for k, t in report if k in ("next", "then")]}, as_json=True)
+        return 0
+    _print_init_report(report)
+    return 0
+
+#: What an isolated worker of each CLI can fall back on, once it has been
+#: pointed away from the config directory its interactive login lives in.
+#:
+#: Only `dsh` is confirmed: its own error names the variable ("or export
+#: DEEPSEEK_API_KEY in the launching environment"). `codex` is confirmed to be
+#: the opposite -- measured against codex-cli 0.153, with OPENAI_API_KEY and
+#: OPENAI_BASE_URL both set it ignored the base URL, went to api.openai.com and
+#: sent no credentials at all ("Missing bearer or basic authentication in
+#: header"). The other two are unverified, so they get the mechanism and not a
+#: promise: claiming a key would fix it is the false assurance this warning
+#: exists to remove.
+_CLI_ENV_FALLBACK = {"dsh": "DEEPSEEK_API_KEY"}
+
+
+def _opencode_model_arg(block: Any) -> Optional[str]:
+    """The ``provider/model`` an ``opencode`` agent block pins with ``-m/--model``.
+
+    A static look at ``extra_args`` -- no network, no OpenCode. ``None`` when the
+    block pins nothing or pins a bare model name with no provider part.
+    """
+    args = block.get("extra_args") if isinstance(block, dict) else None
+    if not isinstance(args, (list, tuple)):
+        return None
+    args = [a for a in args if isinstance(a, str)]
+    for i, a in enumerate(args):
+        value = None
+        if a in ("-m", "--model") and i + 1 < len(args):
+            value = args[i + 1]
+        elif a.startswith("--model="):
+            value = a[len("--model="):]
+        if value and "/" in value:
+            return value
+    return None
+
+
+def _opencode_has_config(block: Any) -> bool:
+    """The block hands an isolated ``opencode`` its own provider config file."""
+    env = block.get("env") if isinstance(block, dict) else None
+    return isinstance(env, dict) and (
+        "OPENCODE_CONFIG" in env or "OPENCODE_CONFIG_CONTENT" in env)
+
+
+def _opencode_configured(block: Any) -> bool:
+    """An isolated ``opencode`` that needs no login: ``-m p/m`` plus a config (#455).
+
+    The documented recipe (``docs/plugins.md``): a pinned ``provider/model`` and
+    ``env.OPENCODE_CONFIG`` naming a provider-only file whose key comes from
+    ``{env:VAR}``. Measured with Ark Coding under isolation, it answers in ~7 s
+    and a 1-round evolve made 4 calls with 0 failures, so "a login does not carry
+    over" is no warning for it.
+    """
+    return bool(_opencode_model_arg(block)) and _opencode_has_config(block)
+
+
+def _opencode_gateway_keys(keys: Optional[Dict[str, bool]]) -> List[str]:
+    """Present gateway keys: set ``*_API_KEY`` other than OpenAI / Anthropic.
+
+    OpenAI / Anthropic accounts serve their provider's default model; a gateway
+    key such as ARK_API_KEY is where OpenCode's default was unusable (#455).
+    One predicate for ``init``, ``plan`` and ``doctor``.
+    """
+    return [n for n, v in (keys or {}).items()
+            if v and n.endswith("_API_KEY")
+            and n not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
+
+
+def _opencode_coding_recipe(gateway: List[str]) -> str:
+    """The OpenCode Coding worker recipe, concrete only where it was measured.
+
+    Ark wording (Volcengine default, ``ark/deepseek-v4-flash``) only when
+    ARK_API_KEY is among the present keys; any other gateway gets the generic
+    recipe whose provider and model come from the user, never guessed.
+    """
+    if "ARK_API_KEY" in gateway:
+        return ("use the OpenCode Coding recipe in docs/plugins.md: a bare "
+                "`ref: opencode` falls back to OpenCode's built-in Volcengine "
+                "default, which a Coding-only account may not have activated "
+                "(measured with only ARK_API_KEY set: every call failed). Pin the "
+                'model and hand the worker a provider-only config: '
+                '"extra_args": ["-m", "ark/deepseek-v4-flash"], '
+                '"env": {"OPENCODE_CONFIG": "/abs/path/providers.json"} '
+                "(the file as in docs/plugins.md, keys via {env:ARK_API_KEY}, "
+                "never inline)")
+    return ("use the OpenCode Coding recipe in docs/plugins.md: pin "
+            '"extra_args": ["-m", "<provider>/<model>"] and set '
+            '"env": {"OPENCODE_CONFIG": "/abs/path/providers.json"} with the key '
+            "as {env:%s} (never inline); the provider and model come from the "
+            "user, never guess them" % gateway[0])
+
+
+def _opencode_provider_remedy(block: Any, keys: Optional[Dict[str, bool]] = None
+                              ) -> Optional[str]:
+    """The plan warning's remedy for an isolated ``opencode``.
+
+    With ``-m p/m`` pinned and no ``OPENCODE_CONFIG`` in the block's ``env``: the
+    custom-provider trap (#373). With no pin while a provider key is set: the
+    default-model trap (#455) -- OpenCode then picks its own default model for
+    that provider, which the account may not have activated. ``None`` keeps the
+    generic remedy.
+    """
+    model = _opencode_model_arg(block)
+    if not model:
+        present = _opencode_gateway_keys(keys)
+        if not present:
+            return None
+        return (f"a provider key ({', '.join(present)}) is not enough on its own: "
+                "with no `-m`, OpenCode picks its own default model for that "
+                "provider, which the account may not have activated. "
+                + _opencode_coding_recipe(present))
+    if _opencode_has_config(block):
+        return None
+    return (f"`-m {model}` works only if that provider is built into OpenCode: a "
+            "custom provider (an OpenAI-compatible endpoint, a local server, a "
+            "gateway) lives in your opencode.json, which an isolated worker cannot "
+            "read, and every call then fails with an opaque `UnknownError`. To keep "
+            "isolation instead, point the agent at a provider-only config file: "
+            '"env": {"OPENCODE_CONFIG": "/abs/path/providers.json"} (keys via '
+            "{env:VAR}, never inline; an OPENCODE_CONFIG exported in your shell is "
+            "dropped for an isolated worker)")
+
+
+_CLI_ENV_USELESS = {
+    "codex": ("an environment key is not a substitute here: measured, `codex` "
+              "ignored OPENAI_API_KEY and OPENAI_BASE_URL and called "
+              "api.openai.com unauthenticated"),
+}
+
+#: Short ref -> binary on PATH. Missing binary is a hard plan/start error (#346);
+#: isolation/login when the binary *is* present stays a soft warning.
+_CLI_BINARIES = {
+    "claude_code": "claude",
+    "codex": "codex",
+    "dsh": "dsh",
+    "opencode": "opencode",
+}
+
+
+def _missing_cli_messages(spec: EvolveSpec,
+                          fields: Optional[Sequence[str]] = None) -> List[str]:
+    """Hard-fail messages when a CLI the run will execute is absent from PATH.
+
+    ``plan`` exists so a host does not start a doomed run; soft ``warnings`` were
+    easy for MCP hosts to ignore while ``ok`` stayed true (#346).
+
+    Checks every role separately: ``agent`` and ``reflect``, and for
+    ``kind="plugin"`` the ``host`` CLI that actually loads the plugin and runs
+    each rollout (``plugin_runner(spec.host)``). An installed agent must not
+    make an absent host pass (#368). Spec-driven runs execute the host on this
+    machine's PATH, so that is the context checked here.
+
+    ``fields`` limits the check to those roles (``"agent"``, ``"reflect"``,
+    ``"host"``); ``None`` checks all of them.
+
+    The install/switch remedy is kind-aware (#791): for ``agent`` on a directory
+    kind (``skill_dir`` / ``agent_dir`` / ``plugin`` / ``agent_code`` / ...) it
+    only points at WorkspaceAgent CLIs, never ``openai_compatible``. ``reflect``
+    and kind=``text`` / ``policy_slot`` may still name a non-CLI agent.
+    """
+    report = doctor_report()
+    clis = report["agent_clis"]
+    present = [b for b in ("claude", "codex", "dsh", "opencode") if clis.get(b)]
+    bin_to_ref = {v: k for k, v in _CLI_BINARIES.items()}
+    roles: List[Tuple[str, Optional[str]]] = []
+    for field in ("agent", "reflect"):
+        block = getattr(spec, field, None)
+        if isinstance(block, dict):
+            ref = block.get("ref")
+        elif isinstance(block, str):
+            ref = block
+        else:
+            ref = None
+        roles.append((field, ref))
+    if spec.kind == "plugin":
+        roles.append(("host", spec.host))
+    if fields is not None:
+        roles = [(f, r) for f, r in roles if f in fields]
+    out: List[str] = []
+    for field, ref in roles:
+        if not ref or ref not in _CLI_BINARIES:
+            continue
+        binary = _CLI_BINARIES[ref]
+        if clis.get(binary):
+            continue
+        if field == "host":
+            # The host is fixed by the plugin's format (a `.claude-plugin/`
+            # tree is a Claude Code plugin); switching it to whatever CLI is
+            # installed would load the plugin into a host that cannot read it.
+            out.append(f"host: `{ref}` loads the plugin and runs every rollout, "
+                       f"and needs `{binary}` on PATH; install `{binary}` (the "
+                       f"host must match the plugin's format, so a different "
+                       f"`agent.ref` does not help); see `agentdescent doctor`")
+            continue
+        # Directory kinds refuse a plain Completion for `agent` (#791): naming
+        # `openai_compatible` here sends the user into `init_agent_mismatch` /
+        # compose. Reflect (and kind=text / policy_slot agent) may still use it.
+        allow_plain = (
+            field != "agent"
+            or spec.kind in ("text", "policy_slot")
+        )
+        if present:
+            # Map binary -> short ref for the switch hint.
+            alts = ", ".join(f"`{bin_to_ref[b]}`" for b in present)
+            if allow_plain:
+                remedy = (f"install `{binary}`, or switch `{field}.ref` to a CLI that "
+                          f"is on PATH ({alts}), or use a non-CLI agent "
+                          f"(e.g. `openai_compatible`); see `agentdescent doctor`")
+            else:
+                remedy = (f"install `{binary}`, or switch `{field}.ref` to a CLI that "
+                          f"is on PATH ({alts}); see `agentdescent doctor`")
+        else:
+            if allow_plain:
+                remedy = (f"install `{binary}`, or set `{field}.ref` to a non-CLI agent "
+                          f"(e.g. `openai_compatible`); see `agentdescent doctor`")
+            else:
+                remedy = (f"install `{binary}`, or set `{field}.ref` to another "
+                          f"WorkspaceAgent ({' / '.join(_WORKSPACE_REFS)}); "
+                          f"see `agentdescent doctor`")
+        out.append(f"{field}: `{ref}` needs `{binary}` on PATH; {remedy}")
+    return out
+
+
+
+def _agent_ref_block(spec: EvolveSpec):
+    """Return ``(ref, block)`` for the worker agent role."""
+    block = getattr(spec, "agent", None)
+    if isinstance(block, dict):
+        return block.get("ref"), block
+    if isinstance(block, str):
+        return block, block
+    return None, block
+
+
+def _bare_opencode_gateway_messages(spec: EvolveSpec) -> List[str]:
+    """Hard-fail when a gateway key + bare isolated ``opencode`` would burn calls (#790).
+
+    Filling ``reflect`` placeholders alone used to leave ``plan`` ``ok: true`` and
+    ``evolve`` / MCP start only soft-warned, then OpenCode fell through to its
+    built-in Volcengine default. Same fail-closed gate as placeholders (#451).
+
+    Only the fully bare case (no ``-m provider/model``) is escalated. A pin without
+    ``OPENCODE_CONFIG`` keeps the soft custom-provider warning (#373).
+    """
+    ref, block = _agent_ref_block(spec)
+    if ref != "opencode" or _opencode_model_arg(block):
+        return []
+    isolate = block.get("isolate") if isinstance(block, dict) else None
+    if isolate is False:
+        return []
+    report = doctor_report()
+    if not report["agent_clis"].get("opencode"):
+        return []  # missing binary is already a hard error via _missing_cli_messages
+    keys = report["provider_keys_present"]
+    # Only escalate the gateway-key / default-model trap (#455).
+    if not _opencode_gateway_keys(keys):
+        return []
+    remedy = _opencode_provider_remedy(block, keys)
+    if not remedy:
+        return []
+    return [
+        f"agent: `opencode` is bare (no Coding recipe) while a gateway key is set; "
+        f"{remedy}. `plan` / `evolve` refuse before starting so calls are not burned; "
+        "re-run init / `algorithms run` with `--model` / `--base-url`, or write the "
+        "full agent block (see docs/plugins.md)"
+    ]
+
+
+def require_cli_on_path(spec: EvolveSpec) -> None:
+    """Refuse evolve/MCP start when a CLI binary the run needs is missing
+    (#346; the plugin ``host`` too, #368).
+
+    Shared with :func:`plan_payload` so plan and start fail closed the same way,
+    before ``runstore.create`` / ``launch``.
+    """
+    msgs = (_missing_cli_messages(spec) + _placeholder_messages(spec)
+            + _bare_opencode_gateway_messages(spec))
+    if msgs:
+        raise SpecError("; ".join(msgs))
+
+
+def require_resume_not_solved(run_id: str, *, store: Optional[str] = None) -> None:
+    """Refuse to relaunch a run that already reached its target (#900).
+
+    A ``done [target_reward]`` run has nothing left to search for; relaunching
+    it spent calls again and overwrote its recorded initial reward and outcomes
+    with the no-op rerun, so ``show``/``diagnose`` lost what it had learned.
+    Runs that stopped on a bound, were cancelled or failed still resume.
+    """
+    st = runstore.get(run_id, store=store).status()
+    if st.state == "done" and st.stop_reason == "target_reward":
+        raise SpecError(
+            f"cannot resume {run_id}: it already reached its target "
+            f"(done [target_reward]) -- see `agentdescent show {run_id}` or "
+            f"`agentdescent apply {run_id} --dry-run`")
+
+
+#: The provider's own words, when it names one: "It will reset at
+#: 2026-11-12 23:59:59 +0800 CST." The capture stops at the sentence's period or
+#: a quote, so a JSON body does not drag the rest of the message into the hint.
+_QUOTA_RE = re.compile(r"reset at ([^.\"}]+)")
+_QUOTA_MODEL_RE = re.compile(r"for model '([^']+)'")
+
+
+def require_resume_not_quota_exhausted(run_id: str, *,
+                                       store: Optional[str] = None) -> None:
+    """Refuse to relaunch a run whose last failure spent the provider quota (#926).
+
+    ``diagnose latest`` already says "wait for the reset", and ``resume`` is the
+    natural next command -- so it relaunched the detached worker, flipped the
+    status back to ``running`` and burned a start into the same 429, rewriting a
+    status the user was reading. A quota failure is not transient on a retry
+    timescale: the provider names a reset hours away. So the default is to
+    refuse, quote that reset when the message carries one, and name ``--force``
+    as the way to retry anyway.
+
+    Only a ``failed`` run is gated. A cancelled, bounded or ordinary provider
+    failure keeps resuming, and so does a run whose stored error is not a quota
+    refusal -- the gate reads why *this* attempt ended, not whether a quota error
+    ever appeared in the run's history.
+
+    An expired subscription is gated the same way (#1006): Ark answers it with
+    a 400 ``InvalidSubscription``, so the next ``resume`` would relaunch into
+    the same refusal. It is not a reset to wait for -- the fix is renewing the
+    plan or pointing the run at another key/model -- so the message names that
+    instead of a reset time.
+    """
+    st = runstore.get(run_id, store=store).status()
+    if st.state != "failed" or not st.error:
+        return
+    err = st.error.lstrip()
+    if err.startswith("SubscriptionInactive"):
+        raise SpecError(
+            f"cannot resume {run_id}: it failed on SubscriptionInactive -- the "
+            f"account has no active subscription for that endpoint; renew it at "
+            f"the provider, or point the run's model / api_key_env at another "
+            f"plan, or pass --force to retry now")
+    if not err.startswith("QuotaExhausted"):
+        return
+    model = _QUOTA_MODEL_RE.search(err)
+    reset = _QUOTA_RE.search(err)
+    who = f" for model '{model.group(1)}'" if model else ""
+    when = (f" (provider says the quota resets at {reset.group(1).strip()})"
+            if reset else " (the provider's message names the reset)")
+    raise SpecError(
+        f"cannot resume {run_id}: it failed on QuotaExhausted{who}{when} -- "
+        f"wait for the reset, or edit the run's agent model / api_key_env, or "
+        f"pass --force to retry now")
+
+
+def require_resume_host_on_path(run_id: str, *, store: Optional[str] = None) -> None:
+    """Refuse to relaunch a stopped plugin run whose ``host`` CLI is not on PATH (#370).
+
+    The environment that resumes is often not the one that started: a run begun
+    where ``claude`` was installed and resumed where it is not would otherwise
+    reach :func:`runstore.launch`, write a fresh ``running`` status and only fail
+    inside the detached child. Only the plugin ``host`` is gated here -- the
+    agent/reflect roles keep their soft resume warnings -- and the check reads
+    the *stored* spec, never switching the host to whatever CLI is installed.
+
+    A still-live run is left to :func:`runstore.resume`'s own rejection, and a
+    stored spec that no longer parses keeps the old behaviour (no gate).
+    """
+    rd = runstore.get(run_id, store=store)
+    st = rd.status()
+    if st.state == "running" and st.alive():
+        return
+    try:
+        spec = EvolveSpec.from_dict(rd.spec_dict())
+    except Exception:  # noqa: BLE001 - an unreadable spec fails in the child as before
+        return
+    if spec.kind != "plugin":
+        return
+    msgs = _missing_cli_messages(spec, fields=("host",))
+    if msgs:
+        raise SpecError(f"cannot resume {run_id}: " + "; ".join(msgs))
+
+
+def _is_placeholder(value: Any) -> bool:
+    """A value ``init`` left for the user (``<your-model>``), not a real one."""
+    return isinstance(value, str) and value.startswith("<") and value.endswith(">")
+
+
+def _placeholder_messages(spec: EvolveSpec) -> List[str]:
+    """Hard-fail messages for a starter-spec placeholder that was never filled in (#451).
+
+    ``openai_compatible(model="<your-model>")`` composes fine and fails on every
+    call, so the shape check alone would let it through to a run."""
+    msgs: List[str] = []
+    for field in ("agent", "reflect"):
+        block = getattr(spec, field, None)
+        if not isinstance(block, dict):
+            continue
+        for key, value in block.items():
+            if _is_placeholder(value):
+                msgs.append(f"{field}.{key} is still the placeholder {value!r} that `init` "
+                            "wrote; put the real value there (it comes from the user, "
+                            "never guess it)")
+    return msgs
+
+
+def _key_env(block: Any, default: str, *, field: str = "api_key_env") -> str:
+    """The variable the adapter will read: the block's own ``api_key_env`` /
+    ``base_url_env`` when the spec sets one, else the adapter's default. A string
+    ref (``"reflect": "openai_compatible"``) has no kwargs, so it is the default."""
+    name = block.get(field) if isinstance(block, dict) else None
+    return name if isinstance(name, str) and name else default
+
+
+_OPENAI_HOST = "api.openai.com"
+
+
+def _key_sent_to_openai(block: Any, key_env: str, url_env: str) -> Optional[str]:
+    """Say so when ``openai_compatible`` would send a non-OpenAI key to OpenAI (#422).
+
+    The adapter's base URL is ``$base_url_env`` when that variable is set, else the
+    block's ``default_base_url``, else ``https://api.openai.com/v1``; the key is
+    sent as ``Authorization: Bearer`` to whatever that resolves to. A key variable
+    that is not OpenAI's (``ARK_API_KEY``) with no endpoint configured therefore
+    ships a third-party secret to OpenAI, and the run fails with a 401 from a host
+    the user never named. This is the part of "will run here" that a shape check
+    cannot see. Only a key that is *set* is warned about -- an unset one has its
+    own warning -- and a name containing ``OPENAI`` (``MY_OPENAI_KEY``) is taken
+    to be an OpenAI key."""
+    if key_env == "OPENAI_API_KEY" or "OPENAI" in key_env.upper():
+        return None
+    default = block.get("default_base_url") if isinstance(block, dict) else None
+    if not (isinstance(default, str) and default):
+        default = f"https://{_OPENAI_HOST}/v1"
+    base = os.environ.get(url_env, default)
+    try:
+        host = urlparse(base).hostname
+    except ValueError:
+        return None
+    if host != _OPENAI_HOST:
+        return None
+    return (f"`openai_compatible` would send {key_env} to {base} ({_OPENAI_HOST}): no "
+            f"other endpoint is configured ({url_env} is unset and `default_base_url` "
+            f"does not name another host), and {key_env} is not an OpenAI key. Set "
+            f"`default_base_url` (the endpoint URL) or export {url_env}")
+
+
+def _propose_fail_rounds_text(spec: EvolveSpec) -> str:
+    """How many rounds a run with a dead reflector lasts, in words.
+
+    The evolve loop stops after ``PROPOSE_FAIL_ROUNDS`` rounds in which every
+    proposal raised, but a spec asking for fewer rounds ends sooner: the quick
+    trial ``--rounds 1`` was told its run "fails after two rounds".
+    """
+    from .evolution import PROPOSE_FAIL_ROUNDS
+    n = PROPOSE_FAIL_ROUNDS
+    rounds = (spec.evolve or {}).get("rounds") if isinstance(spec.evolve, dict) else None
+    if isinstance(rounds, int) and not isinstance(rounds, bool) and 0 < rounds < n:
+        n = rounds
+    return {1: "one round", 2: "two rounds"}.get(n, f"{n} rounds")
+
+
+def _unusable_refs(spec: EvolveSpec) -> List[str]:
+    """Warnings for agents this machine cannot actually run.
+
+    `plan` is the step that exists so nobody spends a run finding out, and it
+    was only checking the spec's *shape*: a spec naming `claude` -- the Anthropic
+    SDK completion, not the CLI -- passed and was priced at 72 calls on a machine
+    with neither the `anthropic` package nor a key, and would have failed on the
+    first one. Shape is not the same as "will run here".
+    """
+    report = doctor_report()
+    keys, clis = report["provider_keys_present"], report["agent_clis"]
+    out: List[str] = []
+    for field in ("agent", "reflect"):
+        block = getattr(spec, field, None)
+        if isinstance(block, dict):
+            ref = block.get("ref")
+        elif isinstance(block, str):
+            ref = block
+        else:
+            ref = None
+        if not ref:
+            continue
+        if ref == "host_model":
+            from .host_sampling import HOST_CLI_ENV, SAMPLING_URL_ENV
+
+            if not (os.environ.get(SAMPLING_URL_ENV) or os.environ.get(HOST_CLI_ENV)):
+                # Measured: a spec with `reflect: host_model`, resumed from a
+                # shell, did four rounds with `considered: 0` and finished at
+                # reward 0.0 -- every proposal raised and the run reported
+                # nothing but silence. `host_model` means "the host that started
+                # this run", and a shell is not one.
+                out.append(
+                    f"{field}: `host_model` borrows the model of the agent session that "
+                    "started the run, and there is no host in this environment -- from a "
+                    "shell it raises on every call and the run proposes nothing. Start it "
+                    "from the agent, or name a model here")
+        elif ref == "claude":
+            missing = []
+            if not report["optional"].get("anthropic"):
+                missing.append("the `anthropic` package")
+            key_env = _key_env(block, "ANTHROPIC_API_KEY")
+            if not os.environ.get(key_env):
+                missing.append(key_env)
+            if missing:
+                out.append(f"{field}: `claude` is the Anthropic SDK completion (the "
+                           f"CLI is `claude_code`) and needs {' and '.join(missing)}")
+        elif ref in ("openai_compatible", "agentdescent.agents:openai_compatible"):
+            # The short name and the qualified one resolve to the same adapter, so
+            # both get the preflight (a qualified ref used to skip it).
+            key_env = _key_env(block, "OPENAI_API_KEY")
+            url_env = _key_env(block, "OPENAI_BASE_URL", field="base_url_env")
+            if not os.environ.get(key_env):
+                # Name what *is* set, as `doctor` does: "needs OPENAI_API_KEY" on a
+                # machine with ARK_API_KEY sent users to the wrong fix (#451).
+                # Only for the adapter's default key: a spec that named its own
+                # `api_key_env` chose it, and other keys are not the fix there.
+                present = [n for n, v in keys.items() if v and n.endswith("_KEY")
+                           and n not in (key_env, "ANTHROPIC_API_KEY")
+                           ] if key_env == "OPENAI_API_KEY" else []
+                route = (f"; {', '.join(present)} {'is' if len(present) == 1 else 'are'} "
+                         f'set -- name one with "api_key_env" plus `default_base_url` '
+                         "for its endpoint" if present else "")
+                out.append(f"{field}: `openai_compatible` needs {key_env} (and "
+                           f"{url_env} for a non-OpenAI endpoint){route}; without it "
+                           + (f"every proposal raises and the run fails after "
+                              f"{_propose_fail_rounds_text(spec)} with nothing learned"
+                              if field == "reflect" else "every call raises"))
+            else:
+                leak = _key_sent_to_openai(block, key_env, url_env)
+                if leak:
+                    out.append(f"{field}: {leak}")
+                # Hand-edited Ark specs without stream hit the 120s propose
+                # timeout on reasoning models; starter writer sets it (#832).
+                if isinstance(block, dict):
+                    ark_url = block.get("default_base_url")
+                    if not (isinstance(ark_url, str) and ark_url):
+                        ark_url = os.environ.get(url_env)
+                    if (_is_ark_endpoint(ark_url)
+                            and block.get("stream") is not True):
+                        out.append(
+                            f"{field}: Ark Coding endpoint without "
+                            '`"stream": true` -- a reasoning model can sit silent '
+                            "past the default 120s non-streaming timeout; set "
+                            '`"stream": true` (or raise `"timeout"` / disable '
+                            "thinking), see docs/plugins.md")
+        elif ref in _CLI_BINARIES:
+            binary = _CLI_BINARIES[ref]
+            # Missing binary is a hard error via _missing_cli_messages / plan ok
+            # and require_cli_on_path (#346); only soft-warn about isolation here.
+            isolate = block.get("isolate") if isinstance(block, dict) else None
+            if clis.get(binary) and isolate is not False and not keys.get(
+                    _CLI_ENV_FALLBACK.get(ref, ""), False) and not (
+                    ref == "opencode" and _opencode_configured(block)):
+                # The trap that ate a 60-round run: `codex` was on PATH, so
+                # nothing complained, but a worker runs with the host's config
+                # directory redirected -- an interactive login does not carry
+                # over. Every rollout failed. Being present is not being usable.
+                remedy = _CLI_ENV_USELESS.get(ref) or (
+                    ref == "opencode" and _opencode_provider_remedy(block, keys)) or (
+                    f"or export {_CLI_ENV_FALLBACK[ref]}"
+                    if ref in _CLI_ENV_FALLBACK else
+                    "whether a provider key in the environment is enough instead "
+                    "is untested for this CLI")
+                # Gateway-key + bare (no -m) opencode is a hard plan/evolve error (#790);
+                # do not also soft-warn the same trap on the agent role.
+                if (field == "agent" and ref == "opencode"
+                        and _opencode_gateway_keys(keys)
+                        and not _opencode_model_arg(block)):
+                    continue
+                out.append(
+                    f"{field}: `{ref}` is on PATH but a worker runs isolated, so an "
+                    f'interactive login does not carry over. Set "isolate": false '
+                    f"to use the signed-in CLI -- {remedy}")
+    return out
+
+
+def _merge_policies_replaced(comp) -> Optional[str]:
+    """Say so when merge-side Policies will be ignored by a custom aggregator.
+
+    An ``aggregator_factory`` -- the one ``gepa``, ``skillopt`` and ``dgm`` bring --
+    replaces the shipped merge pipeline, so ``conflict`` / ``fusion`` /
+    ``acceptance`` / ``promotion`` the spec (or an algorithm) installed on the
+    bundle never reach the factory path unless the factory reads them itself.
+    ``evolve()`` may warn at run time; ``plan`` is where that belongs, before a
+    detached run buries it in ``log.txt`` (#504, #805). Composing factory with
+    merge Policies without a silent drop is #807.
+    """
+    if comp.kwargs.get("aggregator_factory") is None:
+        return None
+    installed = comp.kwargs.get("policies")
+    dropped = sorted(
+        name for name in ("conflict", "fusion", "acceptance", "promotion")
+        if installed is not None and getattr(installed, name, None) is not None)
+    if not dropped:
+        return None
+    who = (f"algorithm {comp.algorithm['name']!r}" if comp.algorithm
+           else "aggregator_factory")
+    return (f"policies {dropped} are ignored on the aggregator_factory path "
+            f"({who}); the factory replaces the shipped merge pipeline — pass "
+            "those rules into the factory/aggregator constructor or drop them "
+            "from `policies` (docs/algorithm-decision-tree.md; engine follow-up "
+            "#807). evolve() may also RuntimeWarning.")
+
+
+def _selection_not_merging(comp) -> Optional[str]:
+    """Say so when `n_workers` buys selection rather than the merge it looks like.
+
+    The reflective pair is the default now, so this fires on the one case that
+    is left: a spec whose only model is a file-editing CLI agent, where paying a
+    whole agent session per merge is not something to switch on unasked. Without
+    a fusion policy a one-key artifact -- `SingleSlot`, every prompt -- has its
+    worker proposals contradict by construction and collapse to one candidate,
+    so no fusion is built. Asked against the *composed* bundle rather than the
+    spec's `policies` block, because the default never appears in the latter.
+
+    An ``aggregator_factory`` (gepa's Pareto pool) replaces that conflict
+    pipeline: each surviving proposal enters its pool on its own, so nothing
+    collapses and naming `reflect` would not change it -- stay quiet (#1039).
+    """
+    if comp.kwargs.get("aggregator_factory") is not None:
+        return None
+    installed = comp.kwargs.get("policies")
+    if installed is not None and (installed.fusion is not None
+                                  or installed.conflict is not None):
+        return None
+    strategy = comp.kwargs.get("strategy")
+    workers = comp.kwargs.get("n_workers") or 1
+    try:
+        keys = list(strategy.keys())
+    except Exception:  # noqa: BLE001 - a strategy that cannot enumerate: say nothing
+        return None
+    if workers > 1 and len(keys) == 1:
+        return (f"n_workers={workers} on a one-key artifact ({type(strategy).__name__}) "
+                "is best-of-N selection, not merging: worker proposals contradict by "
+                "construction and collapse to one candidate, so no fusion is built. "
+                "Name a cheap model in `reflect` and it merges them instead.")
+    return None
+
+
+#: Same rule as ``evolve()`` / ``_build_engine`` — keep the strings aligned (#343).
+_MIN_TASKS_FOR_SPLIT = 4
+_MIN_TASKS_MSG = "need at least 4 tasks to split train/held-out"
+
+
+def plan_payload(spec: EvolveSpec, *, usd_per_call: Optional[float] = None,
+                 budget_usd: Optional[float] = None) -> Dict[str, Any]:
+    comp = compose(spec)
+    warnings = _unusable_refs(spec)
+    selection = _selection_not_merging(comp)
+    if selection:
+        warnings.append(selection)
+    replaced = _merge_policies_replaced(comp)
+    if replaced:
+        warnings.append(replaced)
+    # kind=text missing path-looking target: also a plan warning (#706).
+    from .evolvespec import looks_like_path_target
+    if (spec.kind == "text" and looks_like_path_target(str(spec.target))
+            and not os.path.isfile(os.path.expanduser(str(spec.target)))):
+        msg = (f"target {spec.target!r} is not a file; kind=text will use the "
+               "path string itself as the prompt text")
+        if msg not in warnings:
+            warnings.append(msg)
+    audit = None
+    if comp.audit is not None:
+        audit = {"store": comp.audit.store.path,
+                 "enabled": comp.audit.enabled,
+                 "verifier_version": comp.audit.verifier_version,
+                 "oracle": type(comp.audit.reward.oracle).__name__,
+                 "sample_rate": comp.audit.reward.sample_rate,
+                 "draw_by": comp.audit.reward.draw_by}
+    n_tasks = len(comp.tasks)
+    # Fail closed here: plan exists to catch what evolve would raise, before a
+    # background run is started. Soft "8-20" notes stay for 4 <= n < 8 (#343).
+    # Missing CLI binaries are hard errors, not warnings (#346).
+    too_few = n_tasks < _MIN_TASKS_FOR_SPLIT
+    hard_errors: List[str] = []
+    if too_few:
+        hard_errors.append(
+            f"{_MIN_TASKS_MSG} (plan saw {n_tasks}; add cases until you have at "
+            f"least {_MIN_TASKS_FOR_SPLIT}, then re-run plan)"
+        )
+    hard_errors.extend(_missing_cli_messages(spec))
+    hard_errors.extend(_placeholder_messages(spec))
+    hard_errors.extend(_bare_opencode_gateway_messages(spec))
+    est = estimate(comp, usd_per_call=usd_per_call)
+    budget_warn = budget_round_overshoot_warning(est, budget_usd, usd_per_call)
+    if budget_warn and budget_warn not in warnings:
+        warnings.append(budget_warn)
+    payload = {"ok": not hard_errors, "spec": spec.to_dict(), "tasks": n_tasks,
+            "kind": spec.kind,
+            **({"layout": comp.layout} if comp.layout is not None else {}),
+            "warnings": warnings,
+            "artifact_id": spec.artifact_id(),
+            **({"audit": audit} if audit else {}),
+            "evolve_kwargs": {k: (v if isinstance(v, (int, float, str, bool, type(None)))
+                                  else type(v).__name__)
+                              for k, v in comp.kwargs.items()},
+            **({"algorithm": comp.algorithm} if comp.algorithm else {}),
+            "estimate": est, "notes": comp.notes}
+    if hard_errors:
+        payload["error"] = "; ".join(hard_errors)
+    return payload
+
+
+#: The sentence `evolve()` warns with when the held-out set is too small. `plan`
+#: records it as a note, so the human form reroutes it to stderr as a warning
+#: (the same line `evolve` prints) instead of hiding it near the JSON's bottom.
+_HELD_OUT_NOTE = "the held-out set has only"
+
+
+def _plan_target_line(payload: Dict[str, Any]) -> str:
+    """First human line of `plan`: what is evolved, by which algorithm card."""
+    spec = payload.get("spec") or {}
+    kind = payload.get("kind") or spec.get("kind") or "?"
+    target = spec.get("target") or "?"
+    line = f"ok: {kind} {target}"
+    algo = payload.get("algorithm")
+    if algo:
+        # `plan_payload` stores the algorithm *card*, not its name (#919), so
+        # take the label and the fidelity straight from the card; a bare name
+        # (an older payload) still resolves through the registry.
+        if isinstance(algo, dict):
+            name, fidelity = algo.get("name"), algo.get("fidelity")
+        else:
+            name, fidelity = algo, None
+        if name:
+            line += f"  algorithm={name}"
+            if fidelity:
+                line += f" ({fidelity})"
+            elif not isinstance(algo, dict):
+                try:
+                    from . import algorithms
+
+                    line += f" ({algorithms.get(name).fidelity})"
+                except Exception:  # noqa: BLE001 - a label must never fail a valid plan
+                    pass
+    return line
+
+
+def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
+    """The `agent:` line, when the spec names one; keys are reported, never read."""
+    agent = spec.get("agent")
+    block = agent if isinstance(agent, dict) else {}
+    ref = agent if isinstance(agent, str) else block.get("ref")
+    if not ref:
+        return None
+    line = f"agent: {ref}"
+    if block.get("model"):
+        line += f" {block['model']}"
+    if block.get("default_base_url"):
+        line += f" @ {block['default_base_url']}"
+    key_env = block.get("api_key_env")
+    if key_env:
+        try:
+            present = bool(doctor_report()["provider_keys_present"].get(key_env))
+        except Exception:  # noqa: BLE001 - a hint, not a preflight decision
+            present = bool(os.environ.get(key_env))
+        line += f" (key {key_env}: {'set' if present else 'not set'})"
+    return line
+
+
+def _print_plan(payload: Dict[str, Any], *, spec_path: str,
+                next_line: Optional[str] = None,
+                printed: Optional[set] = None) -> None:
+    """Print the human `plan` summary; warnings and the held-out note go to stderr.
+
+    `payload` is exactly the object `--json` prints, so both surfaces carry the
+    same facts and `--json` stays byte-identical (#919). `printed` holds lines an
+    earlier report already showed (`algorithms run` prints init's report first),
+    so a warning is never repeated.
+    """
+    already = set(printed or ())
+    for line in payload.get("warnings") or []:
+        if line not in already:
+            print(f"warning: {line}", file=sys.stderr)
+            already.add(line)
+    notes = list(payload.get("notes") or [])
+    for line in notes:
+        if line.startswith(_HELD_OUT_NOTE) and line not in already:
+            print(f"warning: {line}", file=sys.stderr)
+            already.add(line)
+    est = payload.get("estimate") or {}
+    rounds, workers = est.get("rounds"), est.get("n_workers")
+    tasks = est.get("tasks", payload.get("tasks")) or 0
+    held = est.get("held_out_tasks")
+    calls = est.get("agent_calls_upper_bound")
+    summary = f"plan: {tasks} task{'' if tasks == 1 else 's'}"
+    if held is not None:
+        summary += f" ({held} held out)"
+    if rounds is not None and workers is not None:
+        summary += (f", {rounds} round{'' if rounds == 1 else 's'}"
+                    f" x {workers} worker{'' if workers == 1 else 's'}")
+    if calls is not None:
+        summary += f", up to {calls} agent calls"
+    usd = est.get("usd_upper_bound")
+    summary += (f"  (${usd:.2f} upper bound)" if usd is not None
+                else "  (no $ estimate: pass --usd-per-call)")
+    lines = [_plan_target_line(payload), summary]
+    agent = _plan_agent_line(payload.get("spec") or {})
+    if agent:
+        lines.append(agent)
+    other_notes = [n for n in notes if not n.startswith(_HELD_OUT_NOTE)]
+    for line in other_notes[:3]:
+        lines.append(f"note: {line}")
+    if len(other_notes) > 3:
+        lines.append(f"note: (+{len(other_notes) - 3} more; --json lists every note)")
+    lines.append(f"next: {next_line or f'agentdescent evolve {spec_path}'}")
+    print("\n".join(lines))
+
+
+def _apply_algorithm_flag(spec: EvolveSpec, a: argparse.Namespace) -> None:
+    """`plan/evolve --algorithm ... --param ...` override the spec in memory.
+
+    A same-name override **merges** params (the CLI wins per key), so
+    `--param b_min=2` on a spec that already set `b_max: 3` keeps `b_max`; a
+    different name replaces the method and its params. `--param` without
+    `--algorithm` tweaks the method the spec already names.
+    """
+    name = getattr(a, "algorithm", None)
+    params = parse_cli_params(getattr(a, "param", None))
+    current = spec.algorithm
+    current_name = (current.get("name") if isinstance(current, dict) else current)
+    current_params = (dict(current.get("params") or {})
+                      if isinstance(current, dict) else {})
+    if not name:
+        if not params:
+            return
+        if not isinstance(current_name, str):
+            raise ValueError("--param needs --algorithm (this spec names none)")
+        name = current_name
+    merged = ({**current_params, **params} if name == current_name else dict(params))
+    spec.algorithm = algorithm_override(name, merged, spec.kind,
+                                        target=str(spec.target))
+
+
+def cmd_plan(a: argparse.Namespace) -> int:
+    try:
+        # Loading sits inside the guard so an unreadable or malformed spec file
+        # answers `--json` with the same `{"ok": false, "error": ...}` object a
+        # spec that fails to compile already gets (#648).
+        spec = load_spec(a.spec)
+        _apply_algorithm_flag(spec, a)
+        payload = plan_payload(spec, usd_per_call=a.usd_per_call,
+                                budget_usd=getattr(a, 'budget', None))
+    except (SpecError, ValueError) as e:
+        # JSON only on request; otherwise the same `error: ...` line on stderr
+        # that an unreadable spec file already gets (#551).
+        if a.json:
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
+    if not a.json and not payload.get("ok", True):
+        # A hard check failed (too few tasks, missing CLI, placeholder): same
+        # human `error: ...` line on stderr as a spec that does not compile (#553).
+        print(f"error: {payload.get('error', 'plan failed')}", file=sys.stderr)
+        return 2
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        # The human form is the default; `--json` above is the machine form and
+        # stays exactly the object it always was (#919).
+        next_line = f"agentdescent evolve {a.spec}"
+        # Keep an ad-hoc `--algorithm` / `--param` override in the suggested
+        # command: it lives in memory, not in the spec file.
+        if getattr(a, "algorithm", None):
+            next_line += f" --algorithm {a.algorithm}"
+            for param in getattr(a, "param", None) or []:
+                next_line += f" --param {param}"
+        _print_plan(payload, spec_path=a.spec, next_line=next_line)
+    return 0 if payload.get("ok", True) else 2
+
+
+def _warn_unusable(spec: EvolveSpec) -> None:
+    """Print `plan`'s warnings on the verbs that actually start a run.
+
+    They were only ever shown by `plan`, which is the one verb that does not
+    spend anything -- so a spec that could not work reached `evolve` and
+    `resume` in silence.
+    """
+    for line in _unusable_refs(spec):
+        print(f"warning: {line}", file=sys.stderr)
+
+
+def _warn_budget_round(comp, budget_usd: Optional[float],
+                       usd_per_call: Optional[float]) -> Optional[str]:
+    """Print the seed+one-round budget overshoot warning (#764); return it.
+
+    Shared by CLI ``evolve`` and MCP ``start`` so a host that skips ``plan``
+    still hears that ``--budget`` only binds between rounds.
+    """
+    est = estimate(comp, usd_per_call=usd_per_call)
+    line = budget_round_overshoot_warning(est, budget_usd, usd_per_call)
+    if line:
+        print(f"warning: {line}", file=sys.stderr)
+    return line
+
+
+def cmd_evolve(a: argparse.Namespace) -> int:
+    try:
+        spec = load_spec(a.spec)
+        _apply_algorithm_flag(spec, a)
+        comp = compose(spec)                 # fail here, not in the detached child
+    except (SpecError, ValueError) as e:
+        return _spec_error(a, e)
+    # Before create/launch: a missing --usd-per-call must not leave an orphan run
+    # whose status later reads as "process ended without reporting" (#342).
+    runstore.require_budget_pair(a.budget, a.usd_per_call)
+    # Same gate as plan / MCP start: missing CLI binary must not report started (#346).
+    require_cli_on_path(spec)
+    _warn_unusable(spec)
+    _warn_budget_round(comp, a.budget, a.usd_per_call)
+    rd = runstore.create(spec.to_dict(), store=a.store)
+    if a.detach:
+        # The child composes again and rewrites `notes`, but only once it is up;
+        # recording them here means `status` has them from the first poll (#414).
+        rd.update_status(notes=comp.notes)
+        st = runstore.launch(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call)
+        if not a.json:
+            for line in comp.notes:
+                print(f"note: {line}", file=sys.stderr)
+        _out({"run_id": rd.run_id, "state": st.state, "pid": st.pid, "dir": rd.path,
+              "notes": comp.notes}
+             if a.json else f"{rd.run_id}  started (pid {st.pid})  {rd.path}", as_json=a.json)
+        return 0
+    try:
+        result = runstore.execute(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call)
+    except Exception as e:  # noqa: BLE001 - not BaseException: Ctrl-C stays loud
+        return _run_failed(a, rd, e)
+    st = rd.status()
+    init = getattr(result, "initial_reward", None)
+    payload = {"run_id": rd.run_id, "state": st.state, "final_reward": result.final_reward,
+               "initial_reward": init, "stop_reason": result.stop_reason,
+               # #843: the reward set, so `--json` callers do not have to
+               # re-derive it from a flag that may have been edited since.
+               "test_reward": getattr(result, "test_reward", None),
+               "test_tasks": getattr(result, "test_tasks", 0),
+               "select_tasks": getattr(result, "select_tasks", 0),
+               "outcomes": result.outcomes(), "error": result.error, "dir": rd.path}
+    from .diagnose import SEED_SOLVED_HINT, seed_already_solved
+    seed_solved = seed_already_solved(init, result.final_reward, result.stop_reason)
+    if seed_solved:
+        payload["note"] = SEED_SOLVED_HINT
+    set_line = reward_set_line(result.final_reward,
+                               getattr(result, "test_reward", None))
+    if init is not None:
+        plain = (f"{_status_line(st)}\n"
+                 f"held-out reward: {init:.3f} -> {result.final_reward:.3f}  "
+                 f"outcomes: {result.outcomes()}\n"
+                 f"{set_line}\n"
+                 + (f"{SEED_SOLVED_HINT}\n" if seed_solved else "")
+                 + f"{rd.path}")
+    else:
+        plain = (f"{_status_line(st)}\nfinal reward: {result.final_reward:.3f}  "
+                 f"outcomes: {result.outcomes()}\n{set_line}\n{rd.path}")
+    _out(payload if a.json else plain, as_json=a.json)
+    return 0 if result.error is None else 1
+
+
+def _run_failed(a: argparse.Namespace, rd: "runstore.RunDir", e: Exception) -> int:
+    """Report a foreground run that raised; returns exit code 1 (#652).
+
+    ``runstore.execute`` has already recorded ``state=failed`` and the error
+    in ``status.json`` before re-raising, so the CLI only has to say so: one
+    ``error:`` line (e.g. a ``ProviderConfigError`` hint) and where to look,
+    instead of a traceback; with ``--json`` the same ``{"ok": false, ...}``
+    shape as a spec error. ``AGENTDESCENT_DEBUG=1`` re-raises for a traceback.
+    """
+    if os.environ.get("AGENTDESCENT_DEBUG", "").strip() not in ("", "0"):
+        raise e
+    try:
+        st: Optional[runstore.RunStatus] = rd.status()
+    except Exception:  # noqa: BLE001 - the report must not fail on top of the failure
+        st = None
+    error = (st.error if st is not None and st.error else None) or f"{type(e).__name__}: {e}"
+    if getattr(a, "json", False):
+        _out({"ok": False, "run_id": rd.run_id,
+              "state": st.state if st is not None else "failed",
+              "error": error, "dir": rd.path}, as_json=True)
+    else:
+        if st is not None:
+            print(_status_line(st))
+        print(f"error: {error}", file=sys.stderr)
+        print(f"{rd.run_id}  {rd.path}")
+        print(f"next: agentdescent diagnose {rd.run_id}", file=sys.stderr)
+    return 1
+
+
+def cmd_run(a: argparse.Namespace) -> int:
+    """The body of a detached run; not for people."""
+    rd = runstore.RunDir(a.run_dir)
+    result = runstore.execute(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call)
+    return 0 if result.error is None else 1
+
+
+def status_payload(run_id: Optional[str], *, store: Optional[str] = None,
+                   recent_rounds: int = 3) -> Any:
+    if run_id:
+        run_id = resolve_run_id(run_id, store=store)
+        rd = runstore.get(run_id, store=store)
+        st = rd.status().to_dict()
+        st["recent_rounds"] = rd.rounds()[-recent_rounds:]
+        if os.path.exists(rd.audit_path):
+            # Only once it exists: a path to a file that was never written
+            # invites `audit_status` to report an empty store as an answer.
+            st["audit_store"] = rd.audit_path
+        st["checkpoint"] = _checkpoint_summary(rd)
+        return st
+    return [st.to_dict() for st in runstore.list_runs(store=store)]
+
+
+def _checkpoint_summary(rd: "runstore.RunDir") -> Optional[dict]:
+    """The latest checkpoint of this run's ledger, for the status line.
+
+    ``None`` when the run has none (no checkpointing aggregator, or never
+    got through a round). A present checkpoint is what makes a resume
+    continue the *search* rather than just the artifact — worth showing,
+    because "resumed" has meant two very different things since checkpoints
+    landed and only one of them keeps the archive.
+    """
+    from .checkpoint import load_checkpoint
+    if not os.path.isdir(rd.ledger_path):
+        return None
+    payload = load_checkpoint(rd.ledger_path)
+    if payload is None:
+        return None
+    return {
+        "round": payload.get("round"),
+        "aggregator": payload.get("aggregator_type"),
+        "early_stop": payload.get("early_stop"),
+    }
+
+
+def _fmt_reward(value: Any) -> str:
+    """A ``rounds.jsonl`` reward for a text line.
+
+    ``append_round`` stores a non-finite reward as ``null`` (#271), so a row can
+    carry ``None``; ``:.3f`` on that raised ``TypeError`` and took ``status`` /
+    ``watch`` down with it. Anything else that is not a number prints as-is.
+    """
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _round_errors(r: Dict[str, Any]) -> str:
+    """``  propose_errors=N: <first>`` for a ``rounds.jsonl`` row that has any (#395)."""
+    n = r.get("propose_errors") or 0
+    return f"  propose_errors={n}: {r.get('propose_error')}" if n else ""
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    if a.run_id:
+        rd = runstore.get(a.run_id, store=a.store)
+        st = rd.status()
+        if a.json:
+            _out(status_payload(a.run_id, store=a.store), as_json=True)
+        else:
+            print(_status_line(st))
+            if not a.brief:
+                for note in st.notes:
+                    print(f"  note: {note}")
+                for r in rd.rounds()[-3:]:
+                    print(f"  round {r['round']:>3}  reward={_fmt_reward(r.get('held_out_reward'))}  "
+                          f"+{r['committed']}/-{r['rejected']}  {r.get('reasons', {})}"
+                          f"{_round_errors(r)}")
+                cp = _checkpoint_summary(rd)
+                if cp:
+                    es = cp.get("early_stop") or {}
+                    stalled = es.get("stalled", "?")
+                    print(f"  checkpoint: round {cp['round']} "
+                          f"({cp['aggregator']}) — a resume continues the "
+                          f"search, stall counter at {stalled}")
+                else:
+                    print("  checkpoint: none — a resume restarts the search "
+                          "from the ledger head")
+        return 0
+    runs = runstore.list_runs(store=a.store)
+    if a.brief:
+        live = [s for s in runs if s.state == "running"]
+        if not live:
+            return 0
+        for s in live:
+            print(_status_line(s))
+        return 0
+    if a.json:
+        _out([s.to_dict() for s in runs], as_json=True)
+    elif not runs:
+        print(f"no runs under {runstore.store_path(a.store)}")
+    else:
+        for s in runs:
+            print(_status_line(s))
+    return 0
+
+
+def cmd_watch(a: argparse.Namespace) -> int:
+    rd = runstore.get(a.run_id, store=a.store)
+    seen = 0
+    while True:
+        rounds = rd.rounds()
+        for r in rounds[seen:]:
+            print(f"round {r['round']:>3}  reward={_fmt_reward(r.get('held_out_reward'))}  "
+                  f"+{r['committed']}/-{r['rejected']}  {r.get('reasons', {})}"
+                  f"{_round_errors(r)}", flush=True)
+        seen = len(rounds)
+        st = rd.status()
+        if st.state != "running":
+            print(_status_line(st))
+            return 0 if st.state == "done" else 1
+        time.sleep(a.interval)
+
+
+#: How many failing rollouts ``show`` lists, how much of each answer it keeps,
+#: and the hard ceiling on the whole ``samples`` block in bytes of JSON, so an
+#: MCP ``show`` stays small however long the agent's answers were (#452).
+SHOW_SAMPLES = 5
+SHOW_SAMPLE_CHARS = 300
+SHOW_SAMPLES_MAX_BYTES = 4096
+
+
+def _head(value: Any, limit: int = SHOW_SAMPLE_CHARS) -> Optional[str]:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def show_samples(rd: "runstore.RunDir", spec: EvolveSpec, rendered: Optional[str], *,
+                 n: int = SHOW_SAMPLES,
+                 max_bytes: int = SHOW_SAMPLES_MAX_BYTES) -> List[Dict[str, Any]]:
+    """The lowest-reward rollouts of the run's final artifact, next to their gold.
+
+    A run that learned nothing used to leave nothing to say why: the reward
+    curve shows *that* the agent missed, never *what* it answered (#452). The
+    engine already records each rollout's boundary (task id, output, reward);
+    this reads those records back. Rollouts of the final artifact come first
+    (its rendering is the record's identity, so the match is exact); if none
+    were recorded against it, every recorded rollout is a candidate. One
+    sample per task, worst first. Diagnostics: any failure yields ``[]``.
+    """
+    try:
+        from .trajectory import TrajectoryStore
+        records = list(TrajectoryStore(rd.trajectories_path).iter_records())
+    except Exception:  # noqa: BLE001 - diagnostics must never break `show`
+        return []
+    if not records:
+        return []
+    own = [r for r in records if rendered is not None and r.rendered == rendered]
+    pool = own or records
+    try:
+        from .evolvespec import build_tasks
+        gold = {t.id: t.meta.get("gold") for t in build_tasks(spec)}
+    except Exception:  # noqa: BLE001 - the dataset may have moved since the run
+        gold = {}
+    pool.sort(key=lambda r: (r.reward, r.task_id, r.purpose, r.ts))
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for r in pool:
+        if r.task_id in seen:
+            continue
+        seen.add(r.task_id)
+        raw_gold = gold.get(r.task_id)
+        out.append({"task_id": r.task_id, "reward": r.reward,
+                    "output": _head(r.output), "gold": _head(raw_gold),
+                    "output_truncated": len(str(r.output)) > SHOW_SAMPLE_CHARS,
+                    "gold_truncated": (raw_gold is not None
+                                       and len(str(raw_gold)) > SHOW_SAMPLE_CHARS),
+                    "purpose": r.purpose,
+                    "of": "final" if own else "any"})
+        if len(out) >= n:
+            break
+    while out and len(json.dumps(out, default=str).encode("utf-8")) > max_bytes:
+        out.pop()
+    return out
+
+
+#: How many rejected candidates ``show`` lists, and the byte ceiling on the
+#: block -- both files are diagnostic, so an MCP payload must stay small (#452).
+SHOW_REJECTED = 5
+SHOW_REJECTED_MAX_BYTES = 4096
+
+
+def show_rejected(rd: "runstore.RunDir", *, n: int = SHOW_REJECTED,
+                  max_bytes: int = SHOW_REJECTED_MAX_BYTES) -> List[Dict[str, Any]]:
+    """The last few diffs the merger measured and did not adopt (#452).
+
+    ``runstore.execute`` writes one line per rejected candidate: touched files,
+    a short diff, the rationale, the gated probability and the outcome. That is
+    the other half of "why did this run learn nothing" -- the rollouts say what
+    the agent answered, these say what the reflector tried to change. Read from
+    the tail so a long run stays cheap; any failure yields ``[]``.
+    """
+    try:
+        with open(rd.candidates_path, encoding="utf-8", errors="replace") as fh:
+            lines = deque(fh, maxlen=200)
+    except (OSError, AttributeError):
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(record, dict):
+            out.append(record)
+        if len(out) >= n:
+            break
+    out.reverse()
+    while out and len(json.dumps(out, default=str).encode("utf-8")) > max_bytes:
+        out.pop(0)
+    return out
+
+
+#: How many rounds a resultless ``show`` lists (the latest ones).
+SHOW_HISTORY = 20
+
+
+def _partial_show(rd: "runstore.RunDir", st: Any) -> Dict[str, Any]:
+    """What ``show`` can say about a run that has no result (#466)."""
+    out: Dict[str, Any] = {}
+    try:
+        rounds = rd.rounds()
+    except Exception:  # noqa: BLE001 - diagnostics must never break `show`
+        rounds = []
+    if rounds:
+        out["rounds"] = len(rounds)
+        keep = ("round", "held_out_reward", "committed", "rejected", "reasons",
+                "propose_errors", "propose_error")
+        out["history"] = [{k: r[k] for k in keep if r.get(k) not in (None, {})}
+                          for r in rounds[-SHOW_HISTORY:]]
+    if getattr(st, "initial_reward", None) is not None:
+        out["initial_reward"] = st.initial_reward
+    if getattr(st, "best_reward", None) is not None:
+        out["best_reward"] = st.best_reward
+    perr = getattr(st, "propose_errors", 0) or sum(
+        int(r.get("propose_errors") or 0) for r in rounds)
+    if perr:
+        out["propose_errors"] = perr
+        out["propose_error"] = getattr(st, "propose_error", None) or next(
+            (r.get("propose_error") for r in rounds if r.get("propose_error")), None)
+    try:
+        spec = EvolveSpec.from_dict(rd.spec_dict())
+        samples = show_samples(rd, spec, None)
+    except Exception:  # noqa: BLE001
+        samples = []
+    if samples:
+        out["samples"] = samples
+    rejected = show_rejected(rd)
+    if rejected:
+        out["rejected"] = rejected
+    return out
+
+
+def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
+                 max_chars: int = 40_000) -> Dict[str, Any]:
+    run_id = resolve_run_id(run_id, store=store) or run_id
+    rd = runstore.get(run_id, store=store)
+    st = rd.status()
+    result = rd.result()
+    payload: Dict[str, Any] = {"run_id": run_id, "state": st.state,
+                               "stop_reason": st.stop_reason, "error": st.error}
+    if result is None:
+        # A failed, cancelled or still-running run has no artifact and no diff,
+        # but what it did is on disk: the rounds that finished, the reflector
+        # error, the recorded rollouts. Those are the runs most in need of a
+        # diagnosis, so say what is known instead of only "no result yet"
+        # (#466). A run with nothing recorded is unchanged.
+        payload.update(_partial_show(rd, st))
+        payload["note"] = "no result yet"
+        return payload
+    payload.update(final_reward=result.final_reward,
+                   initial_reward=getattr(result, "initial_reward", None),
+                   # #843: which set each number is. `final_reward` is the
+                   # select set; `test_reward` is None unless the run carved a
+                   # test partition with `test_frac`.
+                   test_reward=getattr(result, "test_reward", None),
+                   test_tasks=getattr(result, "test_tasks", 0),
+                   select_tasks=getattr(result, "select_tasks", 0),
+                   outcomes=result.outcomes(),
+                   rounds=len(result.history))
+    # Reflector exceptions (#395). Only when there were some, so a healthy run's
+    # payload is unchanged.
+    perr = sum(h.propose_errors for h in result.history)
+    if perr:
+        payload["propose_errors"] = perr
+        payload["propose_error"] = next(
+            (h.propose_error for h in result.history if h.propose_error), None)
+    # Reflective-merge health (#834 / #766): contested vs unranked vs losses.
+    # Always attach when a result exists so Path A / MCP show can see merge
+    # ranking without reading the ledger Python API.
+    from dataclasses import asdict
+    stats = result.fusion_stats()
+    payload["fusion_stats"] = asdict(stats)
+    if stats.trials:
+        payload["fusion_summary"] = stats.summary()
+    spec = EvolveSpec.from_dict(rd.spec_dict())
+    # Why the reward is what it is (#452): the worst rollouts of the final
+    # artifact, output vs gold. Only when some were recorded, so a run with
+    # `record_rollouts: false` (or one from before #452) is unchanged.
+    samples = show_samples(rd, spec, getattr(result, "rendered", None))
+    if samples:
+        payload["samples"] = samples
+    rejected = show_rejected(rd)
+    if rejected:
+        payload["rejected"] = rejected
+    # What `apply` would overwrite, on every kind. Without it the caller can see
+    # the evolved artifact and still not know which file it belongs to -- and an
+    # agent that cannot name the file it is about to overwrite is right to
+    # refuse, which is what happened.
+    payload.update(kind=spec.kind, target=spec.target)
+    if spec.kind == "policy_slot":
+        # The artifact is source text, like `text` -- but `target` is a *slot*,
+        # so there is no file it came from and none to diff against. Listing it
+        # as a tree gave a file called `value` and an `apply_plan` holding an
+        # error, which is worse than saying plainly where it can go.
+        payload["rendered"] = result.rendered[:max_chars]
+        payload["apply_plan"] = {
+            "needs": "--to PATH",
+            "why": f"the target is the {spec.target!r} policy slot, not a file; "
+                   "an evolved rule is pasted into a spec or passed to "
+                   "evolve(policies=...), so apply must be told where to write it",
+            "chars": len(result.rendered)}
+        return payload
+    if spec.kind == "text":
+        payload["rendered"] = result.rendered[:max_chars]
+        payload["apply_plan"] = _text_plan(os.path.expanduser(spec.target), result.rendered)
+        return payload
+    payload["files"] = sorted(result.state)
+    if diff:
+        from .filetree import load_tree
+        try:
+            before = load_tree(spec.target)
+        except Exception as e:  # noqa: BLE001 - the original may have moved
+            before, payload["diff_note"] = {}, f"could not read original {spec.target}: {e}"
+        payload["diff"] = _tree_diff(before, result.state)[:max_chars]
+        try:
+            payload["apply_plan"] = result.write_to(os.path.expanduser(spec.target), dry_run=True)
+        except Exception as e:  # noqa: BLE001
+            payload["apply_plan"] = {"error": str(e)}
+    return payload
+
+
+def cmd_show(a: argparse.Namespace) -> int:
+    payload = show_payload(a.run_id, store=a.store, diff=a.diff)
+    if a.json:
+        _out(payload, as_json=True)
+        return 0
+    for k in ("run_id", "state", "stop_reason", "error", "initial_reward",
+              "final_reward", "test_reward", "outcomes",
+              "best_reward", "propose_errors", "propose_error", "note"):
+        if payload.get(k) is not None:
+            print(f"{k}: {payload[k]}")
+    # #843: `final_reward` alone does not say whether it is the set that selected
+    # the winner or an unseen test. Keep the pinned `final_reward:` line and add
+    # the sentence that names the set; a split run also prints `test_reward:`
+    # above, which is the number that was never used for selection.
+    if payload.get("final_reward") is not None:
+        if payload.get("test_reward") is not None:
+            print("(final_reward is the select set; test_reward was never used "
+                  "for accept/select)")
+        else:
+            print(f"({SELECT_SET_NOTE})")
+    if payload.get("fusion_summary"):
+        print(payload["fusion_summary"])
+    if payload.get("history"):
+        print("rounds so far:")
+        for h in payload["history"]:
+            line = f"  round {h.get('round')}"
+            if h.get("held_out_reward") is not None:
+                line += f"  held_out_reward={h['held_out_reward']:.3f}"
+            for k in ("committed", "rejected", "propose_errors"):
+                if h.get(k):
+                    line += f"  {k}={h[k]}"
+            if h.get("propose_error"):
+                line += f"  propose_error={h['propose_error']!r}"
+            print(line)
+    if "rendered" in payload:
+        print("\n" + payload["rendered"])
+    if payload.get("diff"):
+        print("\n" + payload["diff"])
+    elif "files" in payload:
+        print("files:", ", ".join(payload["files"]))
+    if payload.get("apply_plan"):
+        print("apply would:", json.dumps(payload["apply_plan"]))
+    if payload.get("samples"):
+        print("\nlowest-reward rollouts (output vs gold):")
+        for smp in payload["samples"]:
+            print(f"  {smp['task_id']}  reward={smp['reward']:.3f}  "
+                  f"output={smp['output']!r}  gold={smp['gold']!r}")
+    if payload.get("rejected"):
+        print("\nrejected candidates (what the reflector tried):")
+        for rec in payload["rejected"]:
+            head = f"  round {rec.get('round', '?')}  {rec.get('outcome', 'rejected')}"
+            if rec.get("gated_reward") is not None:
+                head += f"  p_improve={rec['gated_reward']:.3f}"
+            print(head)
+            if rec.get("rationale"):
+                print(f"    rationale: {rec['rationale']}")
+            if rec.get("files"):
+                print(f"    files: {', '.join(rec['files'])}")
+            if rec.get("diff"):
+                for line in str(rec["diff"]).splitlines()[:8]:
+                    print(f"      {line}")
+    return 0
+
+
+def _text_plan(dest: str, rendered: str) -> Dict[str, Any]:
+    """What applying a single-file artifact to ``dest`` would do (#396).
+
+    One judgement for ``show``, ``apply --dry-run`` and ``apply``: a file that
+    already holds the evolved text is ``unchanged`` -- nothing is written and no
+    backup is made.
+    """
+    try:
+        with open(dest, encoding="utf-8", newline="") as fh:     # verbatim, CRLF included
+            same = fh.read() == rendered
+    except (OSError, UnicodeDecodeError):
+        same = False
+    if same:
+        return {"would_write": None, "written": [], "unchanged": [dest],
+                "chars": len(rendered), "noop": True}
+    return {"would_write": dest, "written": [dest], "unchanged": [],
+            "chars": len(rendered), "noop": False}
+
+
+
+class GrokBotInstallError(runstore.RunStoreError):
+    """Raised when ``--install-to`` targets ``grok-bot`` (read-only user skills)."""
+
+
+def _resolve_install_to(value: str, *, home: Optional[str]) -> Tuple[str, Optional[str], bool]:
+    """Map a bare known host name/alias to its user skills root when unambiguous."""
+    from .integrations import HOSTS, _resolve_home, canonical_host, host_skills_dir
+
+    canonical = canonical_host(value)
+    if canonical in HOSTS:
+        # Preserve local relative-path semantics if a same-named entry exists in cwd (#935).
+        if os.path.lexists(value):
+            if home is not None:
+                try:
+                    _resolve_home(home)
+                except ValueError as e:
+                    raise runstore.RunStoreError(str(e)) from None
+            return value, (
+                f"note: local path {value!r} exists in cwd; treating --install-to "
+                f"{value!r} as a path (pass ./{value} to silence)"), False
+        try:
+            skills_dir = host_skills_dir(canonical, home=home)
+        except ValueError as e:
+            raise runstore.RunStoreError(str(e)) from None
+        if skills_dir is None:
+            raise GrokBotInstallError(
+                "grok-bot does not allow direct writes ($AGENTDESCENT_GROK_BOT_SKILLS "
+                "is read-only); ask Grok Bot to save each SKILL.md as a user skill")
+        return skills_dir, f"install-to {value} -> {skills_dir}", True
+    if home is not None:
+        try:
+            _resolve_home(home)
+        except ValueError as e:
+            raise runstore.RunStoreError(str(e)) from None
+    return value, None, False
+
+
+def resolve_apply_dest(to: Optional[str], install_to: Optional[str], *,
+                       home: Optional[str] = None,
+                       notes: Optional[List[str]] = None) -> Optional[str]:
+    """Combine ``--to`` and ``--install-to``, resolving host names/aliases (#823, #935)."""
+    resolved_install = None
+    note = None
+    resolved_host = False
+    if install_to:
+        resolved_install, note, resolved_host = _resolve_install_to(
+            install_to, home=home)
+    elif home is not None:
+        from .integrations import _resolve_home
+        try:
+            _resolve_home(home)
+        except ValueError as e:
+            raise runstore.RunStoreError(str(e)) from None
+    if to and resolved_install:
+        if os.path.normpath(os.path.expanduser(to)) != os.path.normpath(
+                os.path.expanduser(resolved_install)):
+            raise runstore.RunStoreError(
+                f"--to {to!r} and --install-to {install_to!r} disagree; pass one")
+    if notes is not None:
+        if note:
+            notes.append(note)
+        if home is not None and not resolved_host:
+            notes.append(
+                "note: --home only applies when --install-to resolves to a host; "
+                "ignored for path destination")
+    return resolved_install if install_to else to
+
+
+def _grok_bot_apply_message(*, run_id: Optional[str] = None,
+                            source: Optional[str] = None,
+                            store: Optional[str] = None,
+                            home: Optional[str] = None) -> str:
+    """Build manual user-skill save instructions for ``grok-bot`` without writing."""
+    from .integrations import _resolve_home, grok_bot_user_skills_dir
+
+    try:
+        resolved_home, honour_env = _resolve_home(home)
+    except ValueError as e:
+        raise runstore.RunStoreError(str(e)) from None
+    user_dir = grok_bot_user_skills_dir(resolved_home, honour_env)
+    if source:
+        src = os.path.abspath(os.path.expanduser(source))
+        if os.path.islink(src):
+            raise runstore.RunStoreError(
+                f"--from {src} is a symlink; refuse to apply (would dereference)")
+        if not os.path.exists(src):
+            raise runstore.RunStoreError(f"--from {src} does not exist")
+        if os.path.isfile(src):
+            paths = [src]
+        else:
+            rels: List[str] = []
+            for dirpath, dirnames, filenames in os.walk(src):
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if d not in (".git", "__pycache__")
+                    and not os.path.islink(os.path.join(dirpath, d)))
+                for fname in sorted(filenames):
+                    full = os.path.join(dirpath, fname)
+                    if fname == "SKILL.md" and not os.path.islink(full):
+                        rels.append(os.path.relpath(full, src))
+            paths = [os.path.join(src, rel) for rel in sorted(rels)] or [src]
+        return "\n".join([
+            f"grok-bot does not allow direct writes ({user_dir} is read-only). "
+            "ask Grok Bot to save each skill below as a user skill:",
+            *[f"  - {p}" for p in paths],
+        ])
+    if run_id:
+        resolved_id = resolve_run_id(run_id, store=store) or run_id
+        rd = runstore.get(resolved_id, store=store)
+        result = rd.result()
+        if result is None:
+            raise runstore.RunStoreError(f"{resolved_id} has no result to apply yet")
+        stage_dir = os.path.abspath(
+            os.path.join(tempfile.gettempdir(), f"agentdescent-apply-{resolved_id}"))
+        if isinstance(result.state, dict):
+            rels = sorted(
+                k for k in result.state
+                if k == "SKILL.md" or k.endswith("/SKILL.md"))
+            if not rels:
+                rels = sorted(result.state)
+            stage_target = stage_dir
+            paths = [os.path.join(stage_dir, rel.replace("/", os.sep)) for rel in rels]
+        else:
+            spec = EvolveSpec.from_dict(rd.spec_dict())
+            fname = os.path.basename(spec.target) or "SKILL.md"
+            stage_target = os.path.join(stage_dir, fname)
+            paths = [stage_target]
+        return "\n".join([
+            f"grok-bot does not allow direct writes ({user_dir} is read-only). "
+            f"First materialize without touching Grok Bot's store: "
+            f"`agentdescent apply {resolved_id} --to {stage_target}`; "
+            "then ask Grok Bot to save each file below as a user skill:",
+            *[f"  - {p}" for p in paths],
+        ])
+    return (
+        f"grok-bot does not allow direct writes ({user_dir} is read-only); "
+        "materialize with `agentdescent apply <run_id> --to <dir>` and ask "
+        "Grok Bot to save each SKILL.md as a user skill")
+
+
+def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
+                      install_to: Optional[str] = None, source: Optional[str] = None,
+                      store: Optional[str] = None, home: Optional[str] = None,
+                      dry_run: bool = False, backup: bool = True,
+                      cli_flags: bool = True,
+                      check_write: Optional[Callable[[str, str], Any]] = None
+                      ) -> Tuple[Dict[str, Any], List[str], str]:
+    """Shared CLI + MCP entry point for ``apply`` (#823, #935)."""
+    notes: List[str] = []
+    if source and run_id:
+        raise runstore.RunStoreError(
+            "pass a run_id or --from PATH, not both"
+            if cli_flags else "pass a run_id or from PATH, not both")
+    try:
+        dest = resolve_apply_dest(to, install_to, home=home, notes=notes)
+    except GrokBotInstallError:
+        raise GrokBotInstallError(
+            _grok_bot_apply_message(
+                run_id=run_id, source=source, store=store, home=home)) from None
+    if source:
+        if not dest:
+            raise runstore.RunStoreError(
+                "--from needs --to/--install-to PATH (where to install the artifact)"
+                if cli_flags
+                else "from needs to/install_to PATH (where to install the artifact)")
+        return (apply_from_payload(source, to=dest, dry_run=dry_run, backup=backup,
+                                   check_write=check_write),
+                notes, source)
+    if not run_id:
+        raise runstore.RunStoreError(
+            "apply needs a run_id, or --from PATH --to/--install-to PATH"
+            if cli_flags
+            else "apply needs a run_id, or from PATH and to/install_to PATH")
+    return (apply_payload(run_id, to=dest, store=store, dry_run=dry_run, backup=backup,
+                          check_write=check_write),
+            notes, f"run {run_id}")
+
+
+def _refuse_dest_link(top: str, path: str) -> None:
+    """Refuse a link planted in the destination, before any backup or write (#977).
+
+    ``apply`` link-checked the source only and then handed ``--to`` to
+    ``shutil.copy2`` / ``open``, both of which follow a link: probe
+    ``skills/SKILL.md -> id_rsa`` overwrote the target and left
+    ``skills/SKILL.md.bak-0`` holding the target's bytes inside a directory host
+    scanners read. The rule is ``filetree.dest_problem`` -- the tree writer's
+    boundary -- not a second copy of it.
+    """
+    from .filetree import dest_problem
+
+    top = os.path.abspath(top)
+    if top == os.path.abspath(path) and os.path.islink(top):
+        raise runstore.RunStoreError(
+            f"--to {top} is a symlink; refuse to apply (a destination link is "
+            "never dereferenced)")
+    problem = dest_problem(top, path)
+    if problem is not None:
+        raise runstore.RunStoreError(
+            f"refuse to apply to {os.path.abspath(path)!r}: {problem} under "
+            f"--to {top}; a destination link is never dereferenced, and no "
+            ".bak-N may hold what it points at. Remove the link or pick "
+            "another --to")
+
+
+def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str] = None,
+                  dry_run: bool = False, backup: bool = True,
+                  check_write: Optional[Callable[[str, str], Any]] = None) -> Dict[str, Any]:
+    run_id = resolve_run_id(run_id, store=store) or run_id
+    rd = runstore.get(run_id, store=store)
+    result = rd.result()
+    if result is None:
+        raise runstore.RunStoreError(f"{run_id} has no result to apply yet")
+    spec = EvolveSpec.from_dict(rd.spec_dict())
+    if spec.kind == "policy_slot" and not to:
+        # Without this the slot name is treated as a path and `write_to` raises
+        # a TreeError that `main()` does not catch, so the command traces back.
+        raise runstore.RunStoreError(
+            f"{run_id} evolved the {spec.target!r} policy slot, which is not a file: "
+            "pass --to PATH to write the rule, or read it with `show`")
+    dest = os.path.expanduser(to or spec.target)
+    if spec.kind in ("text", "policy_slot"):
+        if os.path.isdir(dest):
+            # Same refusal for --dry-run and the real write: the dry run used to
+            # report it would write the directory, then apply traced back on
+            # IsADirectoryError (#755).
+            raise runstore.RunStoreError(
+                f"{run_id} evolved a single text artifact and {dest!r} is a "
+                "directory; pass --to FILE to write it to a file, or read it "
+                "with `show`")
+        _refuse_dest_link(os.path.dirname(os.path.abspath(dest)) or os.sep, dest)
+        plan = _text_plan(dest, result.rendered)
+        slot = (_backup_slot(dest)
+                if backup and not plan["noop"] and os.path.exists(dest) else None)
+        _check_apply_paths(dest, plan["written"], slot, check_write)
+        if dry_run:
+            return {**plan, "dest": dest}
+        if plan["noop"]:
+            return {"written": [], "unchanged": [dest], "backup": [], "noop": True,
+                    "dest": dest}
+        saved = []
+        if slot is not None:
+            # `.bak-N`, never a fixed `.bak`: the directory path a few lines down
+            # has always numbered its backups, and this one overwrote the single
+            # slot on every apply. Apply, hand-edit, apply again and the second
+            # backup was the hand-edit -- the original the first apply had saved
+            # was gone, from the same command that promises to keep one.
+            try:
+                shutil.copy2(dest, slot)
+            except OSError as e:
+                raise _cannot_write(slot, e) from None
+            saved = [slot]
+        try:
+            with open(dest, "w", encoding="utf-8", newline="") as fh:
+                fh.write(result.rendered)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
+                "dest": dest}
+    _refuse_dest_link(dest, dest)
+    try:
+        plan = result._write_to(dest, backup=backup, dry_run=dry_run,
+                                check_write=check_write)
+    except OSError as e:
+        # `filetree.materialize` writes the tree, so a refused write there is an
+        # artifact write too (#990).
+        raise _cannot_write(dest, e) from None
+    plan["dest"] = dest
+    if spec.kind == "skill_library":
+        # write_to default prune=False: host skills outside the evolved keys
+        # stay as `extra` and are not deleted (#823).
+        plan.setdefault("notes", [])
+        if isinstance(plan["notes"], list):
+            plan["notes"].append(
+                "kind=skill_library: only evolved tree keys are written; "
+                "unrelated host skills under the destination are left alone "
+                "(listed as extra when present; no prune)")
+        n_skills = len({p.split("/", 1)[0] for p in result.state
+                        if p and "/" in p and p.endswith("/SKILL.md")})
+        plan["library_skills"] = n_skills
+    return plan
+
+
+def _backup_slot(dest: str) -> str:
+    n = 0
+    # `lexists`, not `exists`: a dangling link at `.bak-0` is still a link, and
+    # copying onto it would write through it, outside the destination (#977).
+    while os.path.lexists(f"{dest}.bak-{n}"):
+        n += 1
+    return f"{dest}.bak-{n}"
+
+
+def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
+                       backup: bool = True,
+                       check_write: Optional[Callable[[str, str], Any]] = None) -> Dict[str, Any]:
+    """Install an artifact that lives on disk, not in the run store (#533).
+
+    ``agentdescent campaign`` leaves its best artifact in a workspace copy and
+    keeps no run id, so ``apply <run_id>`` has nothing to point at. This takes
+    the artifact path itself and gives it the same guarantees: a dry-run plan,
+    a backup of whatever ``to`` held (sibling ``.bak-N`` for a text file;
+    under ``$AGENTDESCENT_HOME/backups/`` for a directory, so host skill scanners
+    do not load the backup as another skill — #758), and a no-op when ``to``
+    already matches. Files in ``to`` that the artifact does not have are reported
+    as ``extra`` and left alone.
+
+    Symlinks are refused (never dereferenced into real files). ``apply
+    <run_id>`` materialises from FileTree state, which already skips symlinks
+    at load time; a campaign workspace written by worker CLIs must not be able
+    to smuggle ``~/.ssh`` / ``/etc/hostname`` content into ``--to`` via a link.
+    """
+    src = os.path.abspath(os.path.expanduser(source))
+    dest = os.path.abspath(os.path.expanduser(to))
+    if src == dest:
+        raise runstore.RunStoreError(f"--from and --to are the same path: {src}")
+    # ``isfile`` / ``isdir`` follow the final link; catch the source itself first.
+    if os.path.islink(src):
+        raise runstore.RunStoreError(
+            f"--from {src} is a symlink; refuse to apply (would dereference)")
+    if os.path.isfile(src):
+        if os.path.isdir(dest):
+            raise runstore.RunStoreError(
+                f"{src} is a file but --to {dest} is a directory; name the file")
+        try:
+            with open(src, encoding="utf-8", newline="") as fh:
+                rendered = fh.read()
+        except (OSError, UnicodeDecodeError) as e:
+            raise runstore.RunStoreError(f"cannot read {src}: {e}") from None
+        _refuse_dest_link(os.path.dirname(dest) or os.sep, dest)
+        plan = _text_plan(dest, rendered)
+        slot = (_backup_slot(dest)
+                if backup and not plan["noop"] and os.path.exists(dest) else None)
+        _check_apply_paths(dest, plan["written"], slot, check_write)
+        if dry_run:
+            return {**plan, "source": src, "dest": dest}
+        if plan["noop"]:
+            return {"written": [], "unchanged": [dest], "backup": [], "noop": True,
+                    "source": src, "dest": dest}
+        saved = []
+        if slot is not None:
+            try:
+                shutil.copy2(dest, slot)
+            except OSError as e:
+                raise _cannot_write(slot, e) from None
+            saved = [slot]
+        parent = os.path.dirname(dest)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        try:
+            with open(dest, "w", encoding="utf-8", newline="") as fh:
+                fh.write(rendered)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
+        return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
+                "source": src, "dest": dest}
+    if not os.path.isdir(src):
+        raise runstore.RunStoreError(f"--from {src} does not exist")
+    if os.path.isfile(dest):
+        raise runstore.RunStoreError(
+            f"{src} is a directory but --to {dest} is a file")
+    _refuse_dest_link(dest, dest)
+
+    def _files(root: str, *, refuse_symlinks: bool = False) -> List[str]:
+        """Real files only. With ``refuse_symlinks``, raise if any link is under root.
+
+        ``os.walk`` lists symlink-to-file names in ``filenames`` and, with the
+        default ``followlinks=False``, leaves symlink dirs in ``dirnames``
+        without descending. Either form used to be fed to ``shutil.copy2``,
+        which follows the link and wrote the target's bytes into ``--to``.
+        Dest walks keep ``refuse_symlinks=False`` so a pre-existing link in
+        ``--to`` is left alone (and not listed as ``extra``).
+        """
+        out: List[str] = []
+        links: List[str] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in (".git", "__pycache__"))
+            for d in list(dirnames):
+                full_d = os.path.join(dirpath, d)
+                if os.path.islink(full_d):
+                    rel_d = os.path.relpath(full_d, root).replace(os.sep, "/")
+                    links.append(rel_d + "/")
+                    dirnames.remove(d)
+            for fname in sorted(filenames):
+                full = os.path.join(dirpath, fname)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                if os.path.islink(full):
+                    links.append(rel)
+                else:
+                    out.append(rel)
+        if refuse_symlinks and links:
+            shown = ", ".join(links[:5]) + ("…" if len(links) > 5 else "")
+            raise runstore.RunStoreError(
+                f"--from {root} contains symlink(s) ({shown}); refuse to apply "
+                "(would dereference into real files). Remove the links or replace "
+                "them with real files, matching apply <run_id> which never "
+                "materialises symlinks.")
+        return out
+
+    def _same(a_path: str, b_path: str) -> bool:
+        try:
+            # Do not treat a dest symlink as "already matches" via its target.
+            if os.path.islink(b_path) or not os.path.isfile(b_path):
+                return False
+            with open(a_path, "rb") as fa, open(b_path, "rb") as fb:
+                if fa.read() != fb.read():
+                    return False
+            return (os.stat(a_path).st_mode & 0o111) == (os.stat(b_path).st_mode & 0o111)
+        except OSError:
+            return False
+
+    planned = _files(src, refuse_symlinks=True)
+    unchanged = [rel for rel in planned
+                 if _same(os.path.join(src, rel), os.path.join(dest, rel))]
+    changed = [rel for rel in planned if rel not in set(unchanged)]
+    # Dest extras: real files only; a stray symlink in --to is left alone.
+    extra = (sorted(set(_files(dest)) - set(planned))
+             if os.path.isdir(dest) else [])
+    plan: Dict[str, Any] = {"written": changed, "unchanged": unchanged, "extra": extra,
+                            "deleted": [], "backup": [], "noop": not changed,
+                            "source": src, "dest": dest}
+    # Every leaf, before the backup is taken: a link planted in --to must not
+    # redirect the `.bak-N` copy either, or the backup holds the target's
+    # bytes inside a directory host scanners read (#977).
+    for rel in changed:
+        _refuse_dest_link(dest, os.path.join(dest, rel.replace("/", os.sep)))
+    slot = (_file_tree_backup_path(dest)
+            if backup and not plan["noop"] and os.path.isdir(dest) else None)
+    _check_apply_paths(dest, [os.path.join(dest, rel.replace("/", os.sep))
+                             for rel in changed], slot, check_write)
+    if dry_run or plan["noop"]:
+        return plan
+    if slot is not None:
+        try:
+            shutil.copytree(dest, slot, symlinks=True)
+        except OSError as e:
+            raise _cannot_write(slot, e) from None
+        plan["backup"] = [slot]
+    for rel in changed:
+        out = os.path.join(dest, rel.replace("/", os.sep))
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(out, e) from None
+        # Source entries are guaranteed non-links by `_files`; still refuse to
+        # follow if the tree changed under us.
+        src_path = os.path.join(src, rel.replace("/", os.sep))
+        if os.path.islink(src_path):
+            raise runstore.RunStoreError(
+                f"--from {src} contains symlink(s) ({rel}); refuse to apply "
+                "(would dereference into real files)")
+        try:
+            shutil.copy2(src_path, out)
+        except OSError as e:
+            raise _cannot_write(out, e) from None
+    return plan
+
+
+def cmd_apply(a: argparse.Namespace) -> int:
+    try:
+        payload, notes, what = apply_with_target(
+            getattr(a, "run_id", None),
+            to=getattr(a, "to", None),
+            install_to=getattr(a, "install_to", None),
+            source=getattr(a, "source", None),
+            store=a.store,
+            home=getattr(a, "home", None),
+            dry_run=a.dry_run,
+            backup=not a.no_backup,
+        )
+    except runstore.RunStoreError as e:
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
+    _out(payload, as_json=True)
+    for note in notes:
+        print(note, file=sys.stderr)
+    if payload.get("noop"):
+        # After the JSON, on stderr: stdout stays one machine-readable document.
+        print(f"nothing to apply: {payload.get('dest') or '(target)'} already matches "
+              f"{what}", file=sys.stderr)
+    return 0
+
+
+def cmd_cancel(a: argparse.Namespace) -> int:
+    st = runstore.cancel(a.run_id, store=a.store)
+    print(_status_line(st))
+    return 0
+
+
+def cmd_resume(a: argparse.Namespace) -> int:
+    # The environment that resumes is rarely the one that started: a run begun
+    # from an agent session and resumed from a shell has lost whatever
+    # `host_model` was borrowing.
+    runstore.require_budget_pair(a.budget, a.usd_per_call)
+    require_resume_not_solved(a.run_id, store=a.store)
+    # A spent quota is not retried by default: `diagnose` sends the user here and
+    # the relaunch only re-burned a call into the same 429 (#926).
+    if not getattr(a, "force", False):
+        require_resume_not_quota_exhausted(a.run_id, store=a.store)
+    # Hard gate, unlike the warnings below: a missing plugin host cannot run a
+    # single rollout, so do not relaunch the detached process at all (#370).
+    require_resume_host_on_path(a.run_id, store=a.store)
+    try:
+        _warn_unusable(EvolveSpec.from_dict(runstore.get(a.run_id, store=a.store).spec_dict()))
+    except Exception:  # noqa: BLE001 - a warning must never block a resume
+        pass
+    st = runstore.resume(a.run_id, store=a.store, budget_usd=a.budget,
+                         usd_per_call=a.usd_per_call)
+    print(_status_line(st))
+    return 0
+
+
+def _mcp_bit(info: Dict[str, Any]) -> str:
+    """The ``mcp …`` fragment on a doctor host line, including a dead path."""
+    if info.get("mcp") == "broken" and info.get("mcp_launcher"):
+        return f"mcp broken: {info['mcp_launcher']} not found"
+    return f"mcp {info['mcp']}"
+
+
+def cmd_doctor(a: argparse.Namespace) -> int:
+    home = getattr(a, "home", None)
+    try:
+        rep = doctor_report(home=home) if home is not None else doctor_report()
+    except ValueError as e:        # e.g. an empty --home (#412 / #605)
+        raise SpecError(f"doctor: {e}") from None
+    if a.json:
+        _out(rep, as_json=True)
+    else:
+        for k, v in rep.items():
+            if k not in ("problems", "hosts", "hints"):
+                print(f"{k}: {v}")
+        unwired: List[str] = []
+        for name, info in rep["hosts"].items():
+            if info["state"] == "missing" and info["cli"]:
+                # The CLI is here; only the integration is not. Calling that
+                # "missing" read like the CLI was absent (#535).
+                print(f"host {name}: not installed (cli {info['cli']})"
+                      f" -> agentdescent install {name}")
+                unwired.append(name)
+            elif info["state"] == "missing":
+                # Grok Bot has no desktop CLI; "no cli on PATH" would always be true
+                # and hide the install path (#165 grok-bot scaffold).
+                if name == "grok-bot":
+                    print(f"host {name}: not installed "
+                          f"-> agentdescent install {name}")
+                else:
+                    print(f"host {name}: no cli on PATH")
+            else:
+                # skill/mcp on the host line itself so stale vs MCP-missing is
+                # inspectable without reading the problems section (#165).
+                if name == "grok-bot":
+                    # No desktop CLI to report; the saved user skill is what the
+                    # Bot loads (#675).
+                    print(f"host {name}: {info['state']} "
+                          f"(skill {info['skill']}, {_mcp_bit(info)}; "
+                          f"user skill {info.get('user_skill', 'unknown')})")
+                    continue
+                cli_bit = (f"cli {info['cli']}" if info["cli"] else "cli not on PATH")
+                print(f"host {name}: {info['state']} "
+                      f"(skill {info['skill']}, {_mcp_bit(info)}; {cli_bit})")
+        for h in rep["hints"]:
+            print(f"- {h}")
+        for p in rep["problems"]:
+            print(f"! {p}")
+        if not rep["problems"]:
+            # "nothing missing" contradicted the host lines above whenever a
+            # CLI was present but unwired (#535).
+            summary = "ok: no blocking problems"
+            if len(unwired) == 1:
+                summary += f" (1 host can be wired: {unwired[0]})"
+            elif unwired:
+                summary += f" ({len(unwired)} hosts can be wired: {', '.join(unwired)})"
+            print(summary)
+    return 0 if not rep["problems"] else 1
+
+
+def _algorithm_card_text(card: Dict[str, Any]) -> str:
+    surface = card.get("surface", "card")
+    lines = [f"{card['name']}  [{card['fidelity']}; {surface}]",
+             f"  {card['summary']}",
+             f"  kinds:       {', '.join(card['kinds'])}",
+             f"  surface:     {surface} (wheel Algorithm card; not an examples/ port)",
+             f"  extra calls: {card['extra_calls']}"]
+    if card.get("research_port"):
+        lines.append(f"  research port: {card['research_port']} "
+                     "(source checkout; different fidelity — see docs/port-fidelity.md)")
+    if card.get("fidelity_note"):
+        lines.append(f"  note:        {card['fidelity_note']}")
+    if card["source"]:
+        lines.append(f"  source:      {card['source']}")
+    if card["doc"]:
+        lines.append(f"  docs:        docs/{card['doc']}")
+    lines.append("  params (spec: \"algorithm\": {\"name\": \"%s\", \"params\": {...}}):"
+                 % card["name"])
+    if not card["params"]:
+        lines.append("    (none)")
+    for p in card["params"]:
+        bounds = (f" choices={p['choices']}" if "choices" in p else "") + (
+            f" min={p['minimum']}" if "minimum" in p else "") + (
+            f" max={p['maximum']}" if "maximum" in p else "")
+        lines.append(f"    {p['name']}: {p['type']} = {json.dumps(p['default'])}{bounds}")
+        if p["help"]:
+            lines.append(f"        {p['help']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# The meta stack on the command line: portfolio, exam, audit
+# ---------------------------------------------------------------------------
+
+
+def _archive_root(archive: Optional[str]) -> str:
+    """The consolidation archive a meta command reads: ``--archive``, else
+    ``$AGENTDESCENT_HOME/archive``, else ``~/.agentdescent/archive``."""
+    if archive:
+        return os.path.abspath(os.path.expanduser(archive))
+    home = os.environ.get("AGENTDESCENT_HOME") or "~/.agentdescent"
+    return os.path.join(os.path.abspath(os.path.expanduser(home)), "archive")
+
+
+def _load_ref(ref: str) -> Any:
+    """Resolve ``module:attribute`` to the object it names."""
+    if ":" not in ref:
+        raise SpecError(f"expected 'module:attribute', got {ref!r}")
+    module_name, attr = ref.rsplit(":", 1)
+    try:
+        module = __import__(module_name, fromlist=[attr])
+        return getattr(module, attr)
+    except (ImportError, AttributeError) as error:
+        raise SpecError(f"cannot resolve {ref!r}: {error}") from error
+
+
+class MetaCommandError(Exception):
+    """A read-only meta command (portfolio / safety / audit trace) cannot answer.
+
+    ``code`` is the CLI exit status: 2 for a missing archive or store, an
+    unknown run or a bad argument; 1 when the archive exists but holds nothing
+    to report on. The MCP tools return the message as ``{"error": ...}``.
+    """
+
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _require_archive(root: str) -> None:
+    """Refuse a missing archive *before* anything opens it (#502 / #512).
+
+    ``ConsolidationStore`` makes its directory by default, so a typo'd path
+    would come back as an empty-but-valid archive. The message names the only
+    writer so a plugin host does not invent a nonexistent next step."""
+    if not os.path.isdir(root):
+        from .consolidation import missing_archive_message
+        raise MetaCommandError(missing_archive_message(root))
+
+
+def _require_file(flag: str, path: str) -> None:
+    if not os.path.isfile(os.path.expanduser(path)):
+        raise MetaCommandError(f"{flag} store {path!r} does not exist")
+
+
+def _meta_error(error: MetaCommandError,
+                a: Optional[argparse.Namespace] = None) -> int:
+    """Report a meta command that cannot answer; returns ``error.code``.
+
+    Under `--json` it is the `{"ok": false, "error": ...}` object on stdout,
+    like `_spec_error` (#658); otherwise the usual line on stderr.
+    """
+    if a is not None and getattr(a, "json", False):
+        _out({"ok": False, "error": str(error)}, as_json=True)
+    else:
+        print(f"error: {error}" if error.code == 2 else str(error),
+              file=sys.stderr)
+    return error.code
+
+
+def portfolio_payload(archive: Optional[str] = None, *, floor: float = 0.05,
+                      min_samples: int = 3, grow: float = 0.5,
+                      shrink: float = 0.5,
+                      cap: Optional[float] = None) -> Dict[str, Any]:
+    """What ``agentdescent portfolio --json`` prints, for the CLI and the MCP
+    ``portfolio`` tool alike. Reports a reallocation; writes nothing."""
+    from .consolidation import ConsolidationStore
+    from .portfolio import layers_from_archive, portfolio_report
+
+    root = _archive_root(archive)
+    _require_archive(root)
+    layers = layers_from_archive(ConsolidationStore(root, create=False))
+    if not layers:
+        raise MetaCommandError(
+            f"no rule records under {root} to build layers from; "
+            f"run continuous_meta_run (or a meta session) first", code=1)
+    report = portfolio_report(layers, floor=floor, min_samples=min_samples,
+                              grow=grow, shrink=shrink, cap=cap)
+    return {
+        "archive": root,
+        "total_budget": report.total_budget,
+        "layers": [{"name": l.name, "budget": l.budget, "spent": l.spent,
+                    "return_": l.return_, "samples": l.samples,
+                    "return_sd": l.return_sd,
+                    "diminishing": l.diminishing} for l in report.layers],
+        "reallocated": report.reallocated,
+        "reasons": report.reasons,
+    }
+
+
+def cmd_portfolio(a: argparse.Namespace) -> int:
+    """``agentdescent portfolio [archive]`` -- rank the archive's layers and
+    reallocate the next budget window."""
+    try:
+        payload = portfolio_payload(
+            getattr(a, "archive", None), floor=a.floor,
+            min_samples=a.min_samples, grow=a.grow, shrink=a.shrink, cap=a.cap)
+    except MetaCommandError as error:
+        return _meta_error(error, a)
+    if a.json:
+        _out(payload, as_json=True)
+        return 0
+    for layer in payload["layers"]:
+        spent = layer["spent"]
+        rpc = (layer["return_"] / spent) if spent > 0 else 0.0
+        new = payload["reallocated"][layer["name"]]
+        print(f"{layer['name']}: return-per-cost {rpc:.3f} "
+              f"(return {layer['return_']:.3f} / spend {spent:.1f}, "
+              f"{layer['samples']} measurements) -> budget {new:.1f}")
+        print(f"    {payload['reasons'][layer['name']]}")
+    print(f"archive: {payload['archive']}  "
+          f"(total budget {payload['total_budget']:.1f})")
+    return 0
+
+
+def cmd_exam(a: argparse.Namespace) -> int:
+    """``agentdescent exam [archive] --domain module:builder`` -- re-judge the
+    archive's adopted rules with an independent oracle."""
+    from .consolidation import ConsolidationStore
+    from .meta_exam import exam_archive
+
+    root = _archive_root(getattr(a, "archive", None))
+    if not os.path.isdir(root):
+        # A SpecError so `main` prints one {"ok": false} object under
+        # `--json` and the usual `error:` line otherwise (#670). Checked
+        # before anything opens the archive, which would create it (#502).
+        from .consolidation import missing_archive_message
+        raise SpecError(missing_archive_message(root))
+    domain = _load_ref(a.domain)
+    # A bad builder used to crash with a raw TypeError / KeyError traceback
+    # (e.g. `--domain json:dumps`). Turn those into SpecError so `main` prints
+    # one `error:` line / `{"ok": false}` under `--json` (#672).
+    try:
+        built = domain() if callable(domain) and not isinstance(domain, dict) else domain
+    except Exception as error:  # noqa: BLE001 - builder mistakes must not traceback
+        raise SpecError(
+            f"--domain builder {a.domain!r} raised {type(error).__name__}: {error}"
+        ) from None
+    required = ("oracle", "tasks_for", "run", "reward", "propose", "strategy")
+    if not isinstance(built, Mapping):
+        raise SpecError("--domain must resolve to a builder that returns a dict "
+                        "with keys: oracle, tasks_for, run, reward, propose, "
+                        "strategy (and optionally slot, spec)")
+    missing = [k for k in required if k not in built]
+    if missing:
+        raise SpecError(
+            "--domain builder must return a dict with keys: "
+            "oracle, tasks_for, run, reward, propose, strategy "
+            f"(and optionally slot, spec); missing: {', '.join(missing)}"
+        )
+    store = ConsolidationStore(root, create=False)
+    config = None
+    if getattr(a, "config", None) is not None:
+        try:
+            config = json.loads(a.config)
+        except json.JSONDecodeError as error:
+            raise SpecError(f"--config must be a JSON dict, got {a.config!r}: {error}")
+        if not isinstance(config, dict):
+            raise SpecError(f"--config must be a JSON dict, got "
+                            f"{type(config).__name__}")
+    report = exam_archive(
+        store, slot=a.slot,
+        spec=built.get("spec") or _slot_spec(a.slot),
+        oracle=built["oracle"], tasks_for=built["tasks_for"],
+        run=built["run"], reward=built["reward"], propose=built["propose"],
+        strategy=built["strategy"], config=config,
+        min_gain=a.min_gain, max_flags=a.max_flags)
+    if a.json:
+        _out({"archive": root, "slot": a.slot, "passed": report.passed,
+              "flagged": report.flagged, "demoted": report.demoted,
+              "examined": [{**({"run_id": e.run_id, "oracle_gain": e.oracle_gain,
+                                "verdict": e.verdict, "reason": e.reason})}
+                           for e in report.examined]}, as_json=True)
+        return 0
+    print(f"{report.reason}  (archive: {root})")
+    for e in report.examined:
+        print(f"  {e.run_id}: {e.verdict}  (oracle gain {e.oracle_gain:+.3f}) "
+              f"{e.reason}")
+    return 0
+
+
+def _slot_spec(slot: str) -> Any:
+    from .meta import policy_source, priority_selection
+    from .meta import SLOTS
+    if slot not in SLOTS:
+        raise SpecError(f"--slot must be an evolvable slot, one of {SLOTS}; "
+                        f"got {slot!r}")
+    if slot == "selection":
+        return priority_selection()
+    return policy_source(slot)
+
+
+def audit_trace_payload(run_id: str, *, archive: Optional[str] = None,
+                        meta_audit: Optional[str] = None,
+                        inner_audit: Optional[str] = None,
+                        harness: Any = None,
+                        bias_threshold: float = 0.1) -> Dict[str, Any]:
+    """What ``agentdescent audit <run_id> --json`` prints, for the CLI and the
+    MCP ``audit_trace`` tool alike. ``harness`` is an already-resolved
+    callable: resolving a ``module:attr`` runs code, so only the CLI does it."""
+    from .chain_audit import chain_audit
+    from .consolidation import ConsolidationStore
+    from .meta_audit import MetaAuditStore
+
+    root = _archive_root(archive)
+    _require_archive(root)
+    if meta_audit:
+        _require_file("--meta-audit", meta_audit)
+    if inner_audit:
+        _require_file("--inner-audit", inner_audit)
+    store = ConsolidationStore(root, create=False)
+    meta = MetaAuditStore(meta_audit) if meta_audit else None
+    inner = None
+    if inner_audit:
+        from .audit import AuditStore
+        inner = AuditStore(inner_audit)
+    try:
+        report = chain_audit(store, run_id, meta_audit=meta, inner_audit=inner,
+                             harness_evidence=harness,
+                             bias_threshold=bias_threshold)
+    except KeyError as error:
+        # str(KeyError) wraps the message in quotes; report the message
+        # itself, as an unknown-run error like every other (#481).
+        raise MetaCommandError(
+            str(error.args[0] if error.args else error)) from None
+    return {"run_id": run_id, "verified": report.verified, "reason": report.reason,
+            "links": [{"layer": l.layer, "status": l.status,
+                       "evidence": l.evidence, "reason": l.reason}
+                      for l in report.links]}
+
+
+def cmd_compile_skill(a: argparse.Namespace) -> int:
+    """``agentdescent compile-skill`` -- compile a skill and verify it."""
+    from .skill_compiler import SkillCompilerError, compile_skill
+    from .surface_common import atomic_write_text, load_json, resolve_ref
+
+    try:
+        with open(a.skill, encoding="utf-8") as handle:
+            source = handle.read()
+        compiler = resolve_ref(a.compiler, name="compiler")
+        if not callable(compiler):
+            raise SkillCompilerError("compiler must resolve to a callable")
+        tests = [resolve_ref(ref, name="test") for ref in a.test]
+        for test in tests:
+            if not callable(test):
+                raise SkillCompilerError("every --test must resolve to a callable")
+        reference = (resolve_ref(a.reference, name="reference")
+                     if a.reference else None)
+        if reference is not None and not callable(reference):
+            raise SkillCompilerError("reference must resolve to a callable")
+        cases = load_json(a.cases, name="cases") if a.cases else ()
+        if not isinstance(cases, (list, tuple)):
+            raise SkillCompilerError("--cases must be a JSON array")
+        skill_id = (a.skill_id or
+                    os.path.splitext(os.path.basename(a.skill))[0])
+        compiled = compile_skill(
+            skill_id, source, compiler, tests=tests,
+            reference=reference, cases=cases)
+        payload = compiled.to_dict()
+        if a.out:
+            if compiled.status == "compiled":
+                payload["out"] = atomic_write_text(a.out, compiled.code)
+            else:
+                payload["out"] = None
+    except (SkillCompilerError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        print(f"skill: {payload['skill_id']}  status: {payload['status']}")
+        print(f"tests: {payload['tests_passed']}/{payload['tests_total']}  "
+              f"equivalence: {payload['equivalence']}")
+        if payload["reason"]:
+            print(f"reason: {payload['reason']}")
+        if payload.get("out"):
+            print(f"code: {payload['out']}")
+    return 0
+
+
+def cmd_traces(a: argparse.Namespace) -> int:
+    """``agentdescent traces`` -- digest raw traces or drill into one slice."""
+    from .surface_common import atomic_write_json
+    from .trace_digest import (
+        TraceDigestConfig, TraceDigestError, digest_traces, drilldown,
+        load_trace_events,
+    )
+
+    action = getattr(a, "traces_cmd", None)
+    try:
+        events = load_trace_events(a.events)
+        if action == "digest":
+            config = TraceDigestConfig(
+                max_signatures=a.max_signatures,
+                max_digest_chars=a.max_digest_chars)
+            payload = digest_traces(events, config=config).to_dict()
+            if a.out:
+                payload["out"] = atomic_write_json(a.out, payload)
+        elif action == "show":
+            payload = drilldown(
+                events, run_id=a.run_id, task_id=a.task_id,
+                signature=a.signature, limit=a.limit)
+        else:
+            raise TraceDigestError("traces needs digest or show")
+    except (TraceDigestError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "digest":
+            print(payload["summary"])
+            for run in payload["runs"]:
+                print(f"run {run['run_id']}: {run['events']} events  "
+                      f"tasks={run['tasks']}  failures={run['failures']}  "
+                      f"reward={run['reward']}")
+            for signature in payload["signatures"]:
+                print(f"{signature['id']}  x{signature['count']}  "
+                      f"{signature['kind']}/{signature['name']}  "
+                      f"{signature['message']}")
+            if payload.get("out"):
+                print(f"digest: {payload['out']}")
+        else:
+            print(f"events: {payload['count']}")
+            for event in payload["events"]:
+                print(f"{event['run_id']}/{event['task_id']} "
+                      f"step={event['step']} {event['kind']}/{event['name']}  "
+                      f"{event['text'][:200]}")
+    return 0
+
+
+def cmd_predictions(a: argparse.Namespace) -> int:
+    """``agentdescent predictions`` -- declare, observe and score edit predictions."""
+    from .prediction import (
+        PredictionError, PredictionLog, ProposalPrediction,
+    )
+
+    action = getattr(a, "predictions_cmd", None)
+    try:
+        log = PredictionLog(a.store)
+        if action == "predict":
+            prediction = ProposalPrediction(
+                expected_delta=a.delta, confidence=a.confidence,
+                expected_tasks=a.tasks or (), rationale=a.rationale or "")
+            pid = log.predict(a.artifact_id, a.diff_id or "", prediction)
+            payload = {
+                "schema_version": 1, "ok": True, "store": log.path,
+                "prediction_id": pid, "pending": True,
+                "prediction": prediction.to_dict(),
+            }
+        elif action == "observe":
+            payload = log.observe(
+                a.prediction_id, observed_delta=a.delta,
+                observed_tasks=a.tasks or (), tolerance=a.tolerance,
+                note=a.note or "").to_dict()
+        elif action == "report":
+            payload = log.report()
+        else:
+            raise PredictionError("predictions needs predict, observe or report")
+    except (PredictionError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "predict":
+            print(f"prediction: {payload['prediction_id']}  pending")
+        elif action == "observe":
+            print(f"{payload['prediction_id']}  hit={payload['hit']}  "
+                  f"brier={payload['brier']}  "
+                  f"error={payload['delta_error']:.3f}")
+        else:
+            print(f"predictions: {payload['predictions']}  "
+                  f"observed: {payload['observed']}  pending: {payload['pending']}")
+            print(f"hit_rate: {payload['hit_rate']}  "
+                  f"mean_brier: {payload['mean_brier']}  "
+                  f"mean_abs_error: {payload['mean_abs_error']}")
+            for bucket in payload["calibration"]:
+                print(f"confidence {bucket['low']:.1f}-{bucket['high']:.1f}: "
+                      f"n={bucket['count']} hit={bucket['hit_rate']:.3f}")
+    return 0
+
+
+def cmd_hgm(a: argparse.Namespace) -> int:
+    """``agentdescent hgm`` -- inspect an HGM tree or ask for its next action."""
+    from .hgm import HGMError, load_hgm_tree
+
+    action = getattr(a, "hgm_cmd", None)
+    try:
+        tree = load_hgm_tree(a.tree)
+        if action == "next":
+            payload = tree.next_action()
+        elif action == "report":
+            payload = tree.report()
+        else:
+            raise HGMError("hgm needs next or report")
+    except (HGMError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "next":
+            print(f"action: {payload['action']}  "
+                  f"n_task_evals: {payload.get('n_task_evals')}")
+            if payload.get("node_id"):
+                print(f"node: {payload['node_id']}  "
+                      f"commit: {payload.get('commit_id') or '-'}")
+            if payload.get("task"):
+                print(f"task: {payload['task']}")
+            if payload.get("reason"):
+                print(f"reason: {payload['reason']}")
+        else:
+            print(f"nodes: {len(payload['nodes'])}  "
+                  f"n_task_evals: {payload['n_task_evals']}  "
+                  f"tasks: {payload['total_tasks']}")
+            for row in payload["nodes"]:
+                print(f"{row['node_id']}  evals={row['num_evals']}  "
+                      f"mean={row['mean_utility']}  cmp={row['cmp']}")
+    return 0
+
+
+def cmd_github(a: argparse.Namespace) -> int:
+    """``agentdescent github`` -- publish a proposal branch/PR or read a PR."""
+    from .github_surface import (
+        GitHubConfig, GitHubError, github_review, github_status, load_proposal,
+        publish_proposal,
+    )
+
+    action = getattr(a, "github_cmd", None)
+    try:
+        config = GitHubConfig(
+            a.owner, a.repo, base=a.base, token_env=a.token_env)
+        if action == "publish":
+            payload = publish_proposal(
+                config, load_proposal(a.proposal), dry_run=not a.apply)
+        elif action == "status":
+            payload = github_status(config, a.pr)
+        elif action == "review":
+            resolved = tuple(part.strip() for part in
+                             (getattr(a, "resolved", "") or "").split(",")
+                             if part.strip())
+            payload = github_review(config, a.pr, resolved_ids=resolved)
+        else:
+            raise GitHubError("github needs publish, status or review")
+    except (GitHubError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "publish":
+            print(f"dry_run: {payload['dry_run']}  branch: {payload['branch']}  "
+                  f"base: {payload['base']}")
+            for path in payload.get("files") or ():
+                print(f"file: {path}")
+            if payload.get("url"):
+                print(f"pull request: #{payload['pull_request']}  {payload['url']}")
+            if payload.get("head"):
+                print(f"head: {payload['head']}")
+            for step in payload.get("next") or ():
+                print(f"next: {step}")
+        elif action == "review":
+            counts = payload["reviews"]
+            print(f"#{payload['pull_request']}  {payload['title']}  "
+                  f"state={payload['state']}  draft={payload['draft']}")
+            print(f"reviews: approved={counts['approved']} "
+                  f"changes={counts['changes_requested']}  "
+                  f"checks={payload['checks_state']}")
+            for row in payload["constraints"]:
+                print(f"constraint: {row['severity']} {row['kind']} "
+                      f"({row['source']}) {row['text']}")
+            readiness = payload["merge_readiness"]
+            print(f"ready: {readiness['ready']}  "
+                  f"requires_human_click: {readiness['requires_human_click']}")
+            for blocker in readiness["blockers"]:
+                print(f"blocker: {blocker}")
+        else:
+            print(f"#{payload['pull_request']}  {payload['title']}  "
+                  f"state={payload['state']}  draft={payload['draft']}")
+            print(f"head={payload['head']}  base={payload['base']}  "
+                  f"mergeable={payload['mergeable']}")
+            for check in payload["checks"]:
+                print(f"check: {check['name']}  {check['status']}  "
+                      f"{check['conclusion']}")
+    return 0
+
+
+def cmd_harness(a: argparse.Namespace) -> int:
+    """``agentdescent harness`` -- inspect or enforce a harness manifest."""
+    from .harness_manifest import HarnessManifestError, load_manifest
+    from .surface_common import load_json
+
+    action = getattr(a, "harness_cmd", None)
+    try:
+        manifest = load_manifest(a.spec)
+        if action == "manifest":
+            payload = manifest.to_dict()
+            payload["tree"] = manifest.tree_kwargs()
+        elif action == "check":
+            changes = load_json(a.changes, name="changes")
+            payload = manifest.check(changes)
+        else:
+            raise HarnessManifestError("harness needs manifest or check")
+    except (HarnessManifestError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "manifest":
+            print(f"components: {len(payload['components'])}  "
+                  f"max_files: {payload['max_files']}  "
+                  f"max_lines: {payload['max_lines']}")
+            for row in payload["components"]:
+                print(f"{row['name']}  {row['responsibility']}  "
+                      f"editable={row['editable']}  frozen={row['frozen']}  "
+                      f"paths={','.join(row['paths'])}")
+            print(f"editable: {','.join(payload['tree']['editable'])}")
+            print(f"frozen: {','.join(payload['tree']['frozen'])}")
+        else:
+            print(f"ok: {payload['ok']}  files: {payload['files']}  "
+                  f"lines: {payload['lines']}")
+            for violation in payload["violations"]:
+                print(f"violation: {violation}")
+    if action == "check":
+        return 0 if payload["ok"] else 1
+    return 0
+
+
+def cmd_skills(a: argparse.Namespace) -> int:
+    """``agentdescent skills`` -- report, audit or search a skill bank."""
+    from .skill_bank import SkillBank, SkillBankError
+
+    action = getattr(a, "skills_cmd", None)
+    try:
+        bank = SkillBank(a.store)
+        if action == "report":
+            payload = bank.report()
+        elif action == "audit":
+            payload = bank.audit(
+                min_uses=a.min_uses, min_lift=a.min_lift, apply=a.apply)
+        elif action == "search":
+            payload = bank.search(a.query, k=a.k)
+        else:
+            raise SkillBankError("skills needs report, audit or search")
+    except (SkillBankError, OSError, ValueError) as error:
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "report":
+            counts = payload["counts"]
+            print(f"store: {payload['store']}  skills: {counts['skills']}  "
+                  f"active: {counts['active']}  quarantined: "
+                  f"{counts['quarantined']}  retired: {counts['retired']}")
+            print(f"baseline: {payload['baseline']:.3f}")
+            for row in payload["best"]:
+                print(f"best: {row['skill_id']}  lift={row['lift']:+.3f}  "
+                      f"uses={row['uses']}")
+            for row in payload["worst"]:
+                print(f"worst: {row['skill_id']}  lift={row['lift']:+.3f}  "
+                      f"uses={row['uses']}")
+        elif action == "audit":
+            print(f"baseline: {payload['baseline']:.3f}  "
+                  f"applied: {payload['applied']}")
+            for row in payload["actions"]:
+                lift = "-" if row["lift"] is None else f"{row['lift']:+.3f}"
+                print(f"{row['skill_id']}  {row['status']}  {row['action']}  "
+                      f"lift={lift}  uses={row['uses']}")
+        else:
+            print(f"query: {payload['query']}  hits: {len(payload['hits'])}")
+            for hit in payload["hits"]:
+                print(f"{hit['score']:.4f}  {hit['skill_id']}")
+    return 0
+
+
+def cmd_audit(a: argparse.Namespace) -> int:
+    """``agentdescent audit <run_id> --archive PATH`` -- trace one adoption
+    through its evidence rings."""
+    try:
+        root = _archive_root(a.archive)
+        _require_archive(root)
+        harness = None
+        if a.harness:
+            fn = _load_ref(a.harness)
+            if not callable(fn):
+                raise SpecError(f"--harness {a.harness!r} does not resolve to a "
+                                f"callable ({type(fn).__name__})")
+            harness = fn
+        payload = audit_trace_payload(
+            a.run_id, archive=a.archive, meta_audit=a.meta_audit,
+            inner_audit=a.inner_audit, harness=harness,
+            bias_threshold=a.bias_threshold)
+    except MetaCommandError as error:
+        return _meta_error(error, a)
+    if a.json:
+        _out(payload, as_json=True)
+        return 0
+    print(f"run {payload['run_id']}: "
+          f"{'VERIFIED' if payload['verified'] else 'NOT VERIFIED'}")
+    print(f"  {payload['reason']}")
+    for link in payload["links"]:
+        print(f"  {link['layer']}: {link['status']}  {link['reason']}")
+    return 0
+
+
+def cmd_algorithms(a: argparse.Namespace) -> int:
+    from . import algorithms
+
+    for name, error in sorted(algorithms.external_errors().items()):
+        print(f"warning: algorithm plugin {name!r} failed to load: {error}",
+              file=sys.stderr)
+    as_json = getattr(a, "json", False)
+    if a.action in (None, "list"):
+        if a.kind is not None:
+            a.kind = resolve_kind(a.kind, where="--kind")
+        found = algorithms.listing(a.kind)
+        # Same explanation MCP list_algorithms already returns for this kind
+        # (#799): policy_slot evolves a policy value, so no named algorithm
+        # applies and plan refuses one.
+        policy_slot_note = (
+            "no algorithm applies to kind 'policy_slot': that kind evolves a "
+            "policy slot, and `plan` refuses an algorithm for it")
+        if as_json:
+            # Keep the array shape scripts already parse; put product notes on
+            # stderr so hosts that only read stdout still see a list.
+            if a.kind == "policy_slot" and not found:
+                print(f"note: {policy_slot_note}", file=sys.stderr)
+            else:
+                print(f"note: {algorithms.CARDS_VS_PORTS_NOTE}", file=sys.stderr)
+            _out([x.describe() for x in found], as_json=True)
+        elif not found:
+            if a.kind == "policy_slot":
+                print(policy_slot_note)
+            else:
+                print(f"no algorithms for kind {a.kind!r}")
+        else:
+            width = max(len(x.name) for x in found)
+            print("surface=card  (Algorithm cards; same-name examples/<algo>/ "
+                  "ports are separate — docs/port-fidelity.md)")
+            for x in found:
+                port = "  +examples/" if algorithms.research_port_for(x.name) else ""
+                print(f"{x.name:<{width}}  {x.fidelity:<19}  "
+                      f"{','.join(x.kinds):<42}  {x.summary}{port}")
+            print(f"note: {algorithms.CARDS_VS_PORTS_NOTE}")
+        return 0
+    if a.action == "run":
+        return _cmd_algorithms_run(a)
+    if a.kind is not None:
+        # The group accepts --kind for the bare listing / `run`; `show` names one
+        # algorithm, so a filter there would be silently ignored (#549).
+        raise SpecError("--kind filters `algorithms list` (or sets kind for "
+                        "`algorithms run`); `algorithms show` takes only a name")
+    try:
+        card = algorithms.get(a.name, where="show").describe()
+    except algorithms.AlgorithmError as e:
+        raise SpecError(str(e)) from None
+    _out(card if as_json else _algorithm_card_text(card), as_json=as_json)
+    return 0
+
+
+def _algorithms_run_missing_data_hint(msg: str, *, cases: Optional[str]) -> str:
+    """Make a missing ``data.path`` failure actionable for ``algorithms run`` (#692).
+
+    ``init`` already prints ``next: create …``; ``algorithms run`` plans immediately,
+    so the same gap needs a tip on the error itself.
+    """
+    if "data.path" not in msg or "does not exist" not in msg:
+        return msg
+    if cases:
+        return (f"{msg}; check the cases path you passed as the third argument "
+                "(one JSON object per line with prompt/gold keys)")
+    return (f"{msg}; pass a cases.jsonl as the third argument "
+            "(see `agentdescent algorithms run --help`), or create that file "
+            "-- one JSON object per line with prompt/gold keys "
+            "(`agentdescent demo` writes a complete offline example to copy from)")
+
+
+def algorithms_run_payload(
+    name: str,
+    path: str,
+    *,
+    kind: Optional[str] = None,
+    cases: Optional[str] = None,
+    agent: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    key_env: Optional[str] = None,
+    param: Optional[Sequence[str]] = None,
+    out: Optional[str] = None,
+    rounds: Optional[int] = None,
+    workers: Optional[int] = None,
+    usd_per_call: Optional[float] = None,
+    params: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Write a starter spec for algorithm ``name`` on ``path`` and plan it.
+
+    The one code path behind ``algorithms run`` (#674) and the MCP
+    ``algorithm_spec`` tool (#723). Returns the ``--json`` object; the private
+    ``_report`` (init's report lines), ``_plan`` (the plan payload) and
+    ``_stage`` keys are for the CLI's text rendering and are popped before
+    anything is printed or returned to a host. Never starts a run. ``params``
+    (an already-parsed mapping, from MCP) replaces ``param`` (#729).
+    """
+    from . import algorithms
+
+    # Unknown name: same exit and tip as `algorithms show` (where="run").
+    # A case/hyphen variant resolves, and the spec and its file name use the
+    # registered name (#696).
+    try:
+        name = algorithms.get(name, where="run").name
+    except algorithms.AlgorithmError as e:
+        return {"ok": False, "error": str(e), "_stage": "pre"}
+    out = out or f"agentdescent.{name}.spec.json"
+    if kind is not None:
+        # The group-level --kind is free text; fold aliases and fail closed
+        # with the real choices before anything is written (#688, #882).
+        try:
+            kind = resolve_kind(kind, where="--kind")
+        except SpecError as e:
+            return {"ok": False, "_stage": "pre", "error": str(e)}
+    # The name is positional here: say so, route the one-file fix through
+    # `algorithms run`, and name --kind when the kind was only guessed (#702).
+    alg = algorithms.get(name)
+    # Missing PATH before kind guess / kind-mismatch (#706).
+    missing = require_existing_target(path, kind)
+    if missing:
+        return {"ok": False, "error": missing, "_stage": "pre"}
+    use_kind = kind if kind is not None else guess_kind(path)
+    if use_kind not in alg.kinds:
+        msg = algorithms.kind_mismatch_message(
+            alg, use_kind, target=path, prefix="algorithm", via="run")
+        dir_kinds = [k for k in alg.kinds if k != "text"]
+        if kind is None and os.path.isfile(os.path.expanduser(path)):
+            msg += (f"; {path} is a file, so its kind is 'text'; {alg.name} "
+                    f"needs a directory target (kind {dir_kinds})")
+        elif kind is None and dir_kinds:
+            # Only a directory's guess can be wrong (agent_dir vs skill_dir, a
+            # plugin without .claude-plugin), and only toward a dir kind.
+            msg += (f"; kind {use_kind!r} was guessed from {path}; if that is "
+                    f"wrong, pass --kind (one of {dir_kinds})")
+        return {"ok": False, "error": msg, "_stage": "pre"}
+    try:
+        out, _spec, report, providers_out = write_starter_spec(
+            path, kind=kind, data=cases, agent=agent, model=model,
+            base_url=base_url, key_env=key_env, algorithm=name, param=param,
+            out=out, follow_up=None, rounds=rounds, workers=workers,
+            params=params)
+    except ValueError as e:      # kind mismatch / bad --param
+        return {"ok": False, "error": str(e), "_stage": "pre"}
+    # Once the spec is on disk, a failed plan's next step is to fix it and
+    # re-plan -- never `evolve` on a spec plan just refused (#694).
+    retry_line = f"agentdescent plan {out}"
+    try:
+        spec = load_spec(out)
+        payload = plan_payload(spec, usd_per_call=usd_per_call)
+    except (SpecError, ValueError) as e:
+        err = _algorithms_run_missing_data_hint(str(e), cases=cases)
+        # `spec` kept for compatibility; `spec_path` matches the plan shape.
+        # init's notes/warnings (the .bak-N of an overwritten spec, #725) are
+        # kept here too: a failed plan is the usual reason to re-run (#749).
+        return {"ok": False, "error": err, "spec": out, "spec_path": out,
+                "next": retry_line,
+                "warnings": [t for k, t in report if k == "warning"],
+                "notes": [t for k, t in report if k == "note"],
+                "_stage": "plan", "_report": report}
+    ok = bool(payload.get("ok", True))
+    obj = dict(payload)
+    obj["spec_path"] = out
+    obj["providers_config"] = providers_out
+    obj["warnings"] = list(payload.get("warnings") or []) + [
+        t for k, t in report if k == "warning"]
+    obj["notes"] = [t for k, t in report if k == "note"]
+    obj["next"] = f"agentdescent evolve {out}" if ok else retry_line
+    obj["_stage"] = "done"
+    obj["_report"] = report
+    obj["_plan"] = payload
+    return obj
+
+
+def _public(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """``obj`` without the private ``_``-keys of :func:`algorithms_run_payload`."""
+    return {k: v for k, v in obj.items() if not k.startswith("_")}
+
+
+def _cmd_algorithms_run(a: argparse.Namespace) -> int:
+    """``algorithms run NAME PATH`` -- init + plan in one step; does not start a run (#674)."""
+    as_json = getattr(a, "json", False)
+    obj = algorithms_run_payload(
+        a.name, a.path, kind=a.kind, cases=getattr(a, "cases", None),
+        agent=getattr(a, "agent", None), model=getattr(a, "model", None),
+        base_url=getattr(a, "base_url", None), key_env=getattr(a, "key_env", None),
+        param=getattr(a, "param", None), out=a.out,
+        rounds=getattr(a, "rounds", None), workers=getattr(a, "workers", None),
+        usd_per_call=getattr(a, "usd_per_call", None))
+    stage = obj["_stage"]
+    report = obj.get("_report") or []
+    ok = bool(obj.get("ok", True))
+    if as_json:
+        # Exactly one JSON object on stdout for success and error (#674).
+        _out(_public(obj), as_json=True)
+        return 0 if ok else 2
+    if stage == "pre":
+        print(f"error: {obj['error']}", file=sys.stderr)
+        return 2
+    out = obj["spec_path"]
+    if stage == "plan":
+        # The spec is already on disk: say so before the error (#688), and
+        # keep init's notes/warnings, e.g. where an overwritten spec went (#749).
+        printed = _print_init_report(report)
+        err = obj["error"]
+        # If the error body was already shown as a warning/note, still print
+        # error: once — but do not re-print matching plan warnings below.
+        print(f"error: {err}", file=sys.stderr)
+        printed.add(err)
+        print(f"next: fix {out}, then {obj['next']}")
+        return 2
+    payload = obj["_plan"]
+    printed = _print_init_report(report)
+    if not ok:
+        for w in payload.get("warnings") or []:
+            if w in printed:
+                continue
+            print(f"warning: {w}")
+            printed.add(w)
+        err = payload.get("error", "plan failed")
+        print(f"error: {err}", file=sys.stderr)
+        print(f"next: fix {out}, then {obj['next']}")
+        return 2
+    # Same human form as `plan`: init's `wrote ...` lines above, then the plan
+    # summary with `next:` last -- never the JSON document (#919).
+    _print_plan(payload, spec_path=out, next_line=obj["next"], printed=printed)
+    calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
+    if (getattr(a, "rounds", None) is None and getattr(a, "workers", None) is None
+            and isinstance(calls, (int, float)) and calls > QUICK_TRIAL_CALLS):
+        # The kind defaults plan a full run; name the one-command cheap trial (#707).
+        print("      (for a quick trial: re-run with --rounds 1 --workers 1)")
+    return 0
+
+
+#: Above this many planned agent calls, a flagless ``algorithms run`` names
+#: ``--rounds 1 --workers 1`` as the quick-trial path (#707).
+QUICK_TRIAL_CALLS = 50
+
+
+def cmd_diagnose(a: argparse.Namespace) -> int:
+    """``agentdescent diagnose`` -- why did this run end where it did?"""
+    from .diagnose import diagnose_payload
+
+    try:
+        report = diagnose_payload(a.run_id, store=a.store)
+    except runstore.RunStoreError as e:
+        if a.json:       # same object `main()` prints for RunStoreError (#658)
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
+    if a.json:
+        _out(report.to_dict(), as_json=True)
+        return 0
+    print(f"{report.verdict}: {report.summary}")
+    # #843: the verdict talks about "the reward" without saying which set it
+    # came from. `diagnose` is the command a person runs to understand a run, so
+    # it has to name it -- select set, or select + test when the run split one.
+    try:
+        result = runstore.get(report.run_id, store=a.store).result()
+    except Exception:  # noqa: BLE001 - the diagnosis must still print
+        result = None
+    if result is not None:
+        print(reward_set_line(result.final_reward,
+                              getattr(result, "test_reward", None)))
+    if report.evidence:
+        print("evidence:", json.dumps(report.evidence, default=str)[:1200])
+    for line in report.recommendations:
+        print(f"  next: {line}")
+    return 0
+
+
+def cmd_rsi(a: argparse.Namespace) -> int:
+    """``agentdescent rsi`` -- is the archive still getting better over time?"""
+    from .rsi import rsi_report
+
+    # Mirror portfolio/safety: refuse a missing archive via MetaCommandError so
+    # `--json` gets {"ok": false, "error": ...} on stdout (#660), not stderr.
+    try:
+        root = _archive_root(getattr(a, "archive", None))
+        _require_archive(root)
+        report = rsi_report(
+            root, slot=getattr(a, "slot", None),
+            stagnation_window=getattr(a, "stagnation_window", 3))
+    except MetaCommandError as error:
+        return _meta_error(error, a)
+    except (FileNotFoundError, ValueError) as e:
+        return _meta_error(MetaCommandError(str(e)), a)
+    if a.json:
+        _out(report.to_dict(), as_json=True)
+        return 0
+    print(f"verdict: {report.verdict}  ({report.reason})")
+    print(f"archive: {root}  rules: {report.total_rules}")
+    if not report.slots:
+        print("no adopted rules with a slot descriptor yet; run more sessions")
+        return 0
+    width = max(len(name) for name in report.slots)
+    print(f"{'slot':<{width}}  {'verdict':<10}  {'records':<7}  "
+          f"{'first':<7}  {'best':<7}  {'gain':<7}  since best")
+    for name, row in report.slots.items():
+        print(f"{name:<{width}}  {row.verdict:<10}  {row.records:<7}  "
+              f"{row.first_reward:<7.3f}  {row.best_reward:<7.3f}  "
+              f"{row.gain:<+7.3f}  {row.records_since_best}")
+    return 0
+
+
+def cmd_campaign(a: argparse.Namespace) -> int:
+    """``agentdescent campaign`` -- iterate a spec, carrying the artifact forward."""
+    from .campaign import estimate_campaign, run_campaign
+
+    try:
+        spec = load_spec(a.spec)
+        if a.dry_run:
+            est = estimate_campaign(spec, sessions=a.sessions,
+                                    rounds=a.rounds, algorithm=a.algorithm)
+            if a.json:
+                _out(est, as_json=True)
+            else:
+                print(f"kind: {est['kind']}  sessions: {est['sessions']}  "
+                      f"total calls <= {est['total_calls']}")
+                print(f"  {est['calls_per_session']} calls/session x "
+                      f"{est['sessions']} = {est['total_calls']}")
+            return 0
+        report = run_campaign(
+            spec, sessions=a.sessions, rounds=a.rounds,
+            algorithm=a.algorithm, patience=a.patience,
+            workdir=a.workdir, keep_ledgers=a.keep_ledgers)
+    except (SpecError, ValueError) as e:
+        return _spec_error(a, e)
+    # The campaign keeps no run id, so the way back to the user's file is
+    # `apply --from` (#533). Print it ready to copy, dry-run first.
+    original = os.path.abspath(os.path.expanduser(str(spec.target)))
+    apply_cmd = (f"agentdescent apply --from {shlex.quote(report.final_target)} "
+                 f"--to {shlex.quote(original)}")
+    if a.json:
+        _out({**report.to_dict(), "target": original,
+              "next": [f"{apply_cmd} --dry-run", apply_cmd]}, as_json=True)
+        return 0 if report.stopped_reason != "error" else 1
+    print(f"kind: {report.kind}  stopped: {report.stopped_reason}  "
+          f"best: {report.best_reward:.3f}")
+    print(f"{'session':<8} {'reward':<8} {'best':<8} {'improved':<9} "
+          f"{'calls':<7} stop")
+    for session in report.sessions:
+        print(f"{session.index:<8} {session.reward:<8.3f} "
+              f"{session.best_reward:<8.3f} {str(session.improved):<9} "
+              f"{session.calls:<7} {session.stop_reason}"
+              + (f"  {session.error[:120]}" if session.error else ""))
+    print(f"artifact: {report.final_target}")
+    print(f"workspace: {report.workspace}")
+    if report.stopped_reason != "error":
+        print("\nnext:")
+        print(f"  diff -ru {shlex.quote(original)} {shlex.quote(report.final_target)}"
+              "   what changed")
+        print(f"  {apply_cmd} --dry-run   what apply would write")
+        print(f"  {apply_cmd}   install it (backs up {os.path.basename(original)} "
+              "to .bak-N first)")
+        print(f"  rm -rf {shlex.quote(report.workspace)}   when you are done")
+    return 0 if report.stopped_reason != "error" else 1
+
+def cmd_tournament(a: argparse.Namespace) -> int:
+    """``agentdescent tournament`` -- run one spec under several algorithms."""
+    from .tournament import estimate_tournament, run_tournament
+
+    try:
+        spec = load_spec(a.spec)
+        if a.dry_run:
+            est = estimate_tournament(
+                spec, a.algorithm, seeds=a.seed or [0], rounds=a.rounds,
+                max_seconds=a.max_seconds)
+            if a.json:
+                _out(est, as_json=True)
+            else:
+                print(f"kind: {est['kind']}  total calls <= {est['total_calls']}")
+                for row in est["arms"]:
+                    print(f"  {row['algorithm']:<20} {row['tasks']:<4} tasks  "
+                          f"{row['calls_per_arm']:<6} calls/arm x "
+                          f"{row['seeds']} seed(s) = {row['total_calls']}")
+            return 0
+        report = run_tournament(
+            spec, a.algorithm, seeds=a.seed or [0], rounds=a.rounds,
+            max_seconds=a.max_seconds, repo_root=a.repo_root,
+            keep_repos=a.keep)
+    except (SpecError, ValueError) as e:
+        return _spec_error(a, e)
+    if a.json:
+        _out(report.to_dict(), as_json=True)
+        return 0 if report.winner is not None else 1
+    print(f"kind: {report.kind}  winner: {report.winner or '-'}  "
+          f"({report.reason})")
+    print(f"{'algorithm':<20} {'mean':<8} {'range':<15} {'calls':<7} "
+          f"seeds errors")
+    for score in report.algorithms:
+        print(f"{score.algorithm:<20} {score.mean_reward:<8.3f} "
+              f"{score.min_reward:.3f}-{score.max_reward:.3f}      "
+              f"{score.mean_calls:<7.0f} {score.seeds:<5} {score.errors}")
+    if report.tied:
+        print(f"tied: {', '.join(report.tied)}")
+    for arm in report.arms:
+        if arm.error:
+            print(f"  {arm.algorithm} seed {arm.seed}: {arm.error[:160]}")
+    return 0 if report.winner is not None else 1
+
+def cmd_platform(a: argparse.Namespace) -> int:
+    """``agentdescent platform`` -- init/plan/run a five-layer campaign."""
+    from .surface_common import SurfaceError
+    from . import surface_platform as surface
+
+    try:
+        action = getattr(a, "platform_cmd", None)
+        if action == "init":
+            payload = surface.platform_init(a.out, demo=a.demo)
+        elif action == "plan":
+            payload = surface.platform_plan(a.spec)
+        elif action == "run":
+            payload = surface.platform_run(a.spec, out=a.out)
+        elif action == "status":
+            payload = surface.platform_status(
+                runs_db=a.runs_db, tenant=a.tenant, workspace=a.workspace,
+                run_id=a.run_id, limit=a.limit)
+        else:
+            raise SurfaceError("platform needs init, plan, run or status")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "init":
+            print(f"spec: {payload['spec']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "plan":
+            print(f"runs_db: {payload['runs_db']}")
+            print(f"cycles: {payload['campaign']['max_cycles']}  "
+                  f"generations/cycle: {payload['platform']['max_generations']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "status":
+            if payload.get("run_id") is not None:
+                report = payload["report"]
+                print(f"run: {payload['run_id']}  status: {payload['status']}  "
+                      f"generations: {len(report['generations'])}")
+                print(f"best_reward: {report['best_reward']}  "
+                      f"accepted: {report['accepted']}  "
+                      f"stopped: {report['stopped_reason']}")
+            else:
+                print(f"runs_db: {payload['runs_db']}  runs: {len(payload['runs'])}")
+                for row in payload["runs"]:
+                    print(f"{row['run_id']}  {row['tenant']}/{row['workspace']}  "
+                          f"{row['status']}  best={row['best_reward']}  "
+                          f"generations={row['generations']}  "
+                          f"accepted={row['accepted']}")
+                if not payload["runs"]:
+                    print("no runs matched")
+        else:
+            report = payload["report"]
+            print(f"cycles: {len(report['cycles'])}  "
+                  f"best_cycle: {report.get('best_cycle')}  "
+                  f"complete: {report['complete']}")
+            print(f"runs_db: {payload['runs_db']}")
+            if payload.get("out"):
+                print(f"report: {payload['out']}")
+    return 0
+
+
+def cmd_capability(a: argparse.Namespace) -> int:
+    """``agentdescent capability`` -- init/plan/run a failure-to-capability loop."""
+    from .surface_common import SurfaceError
+    from . import surface_capability as surface
+
+    try:
+        action = getattr(a, "capability_cmd", None)
+        if action == "init":
+            payload = surface.capability_init(a.out, demo=a.demo)
+        elif action == "plan":
+            payload = surface.capability_plan(a.spec)
+        elif action == "run":
+            payload = surface.capability_run(a.spec, out=a.out)
+        else:
+            raise SurfaceError("capability needs init, plan or run")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "init":
+            print(f"spec: {payload['spec']}")
+            print(f"traces: {payload['traces']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "plan":
+            print(f"traces: {payload['traces']}  goal: {payload['goal']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        else:
+            report = payload["report"]
+            print(f"verdict: {report['verdict']}  admitted: {report['admitted']}")
+            print(f"detail: {report['detail']}")
+            if payload.get("out"):
+                print(f"report: {payload['out']}")
+    return 0
+
+
+def cmd_ops(a: argparse.Namespace) -> int:
+    """``agentdescent ops`` -- plan/publish a campaign to the control room."""
+    from .surface_common import SurfaceError
+    from . import surface_ops as surface
+
+    try:
+        action = getattr(a, "ops_cmd", None)
+        if action == "plan":
+            payload = surface.ops_plan(
+                runs_db=a.runs_db, tenant=a.tenant, workspace=a.workspace)
+        elif action == "publish":
+            payload = surface.ops_publish(
+                runs_db=a.runs_db, tenant=a.tenant, workspace=a.workspace,
+                min_acceptance=a.min_acceptance,
+                max_cost_per_accepted=a.max_cost_per_accepted,
+                out=a.out, prometheus=a.prometheus, history=a.history)
+        elif action == "history":
+            payload = surface.ops_history(
+                history=a.history, tenant=a.tenant, workspace=a.workspace)
+        else:
+            raise SurfaceError("ops needs plan, publish or history")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "plan":
+            print(f"runs_db: {payload['runs_db']}")
+            print(f"terminal runs: {payload['terminal_runs']}  "
+                  f"generations: {payload['generations']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "history":
+            print(f"history: {payload['history']}  publishes: {payload['publishes']}")
+            print(f"decisions: {payload['decisions']}  "
+                  f"accepted: {payload['accepted']}  calls: {payload['calls']}  "
+                  f"alerts: {payload['alerts']}")
+            if payload["last"] is not None:
+                print(f"last: {payload['last_recorded_at'] or '-'}")
+            if payload["skipped"]:
+                print(f"skipped bad lines: {payload['skipped']}")
+        else:
+            print(f"published: {payload['published']}")
+            if "metrics" in payload:
+                metrics = payload["metrics"]
+                print(f"decisions: {metrics['decisions']}  "
+                      f"accepted: {metrics['accepted']}  "
+                      f"calls: {metrics['calls']}")
+                for alert in payload.get("alerts") or ():
+                    print(f"alert: {alert}")
+            else:
+                print(payload.get("detail", "nothing to publish"))
+            if payload.get("out"):
+                print(f"report: {payload['out']}")
+            if payload.get("prometheus"):
+                print(f"prometheus: {payload['prometheus']}")
+            if payload.get("history"):
+                print(f"history: {payload['history']}")
+    return 0
+
+
+def cmd_experience(a: argparse.Namespace) -> int:
+    """``agentdescent experience`` -- report/ingest/recall/update/replay memory."""
+    from .surface_common import SurfaceError
+    from . import surface_experience as surface
+
+    action = getattr(a, "experience_cmd", None)
+    try:
+        if action == "report":
+            payload = surface.experience_report(store=a.experience_store)
+        elif action == "ingest":
+            payload = surface.experience_ingest(
+                store=a.experience_store, records=a.records)
+        elif action == "recall":
+            payload = surface.experience_recall(
+                store=a.experience_store, features=a.features, k=a.k)
+        elif action == "update":
+            payload = surface.experience_update(
+                store=a.experience_store, validation=a.validation,
+                anchors=a.anchors, actions=a.actions, dim=a.dim,
+                learning_rate=a.learning_rate, l2=a.l2,
+                replay_size=a.replay_size, min_gain=a.min_gain, seed=a.seed,
+                require_anchors=a.require_anchors,
+                anchor_tolerance=a.anchor_tolerance)
+        elif action == "cycle":
+            payload = surface.experience_cycle(
+                store=a.experience_store, records=a.records,
+                validation=a.validation, anchors=a.anchors,
+                actions=a.actions, dim=a.dim,
+                learning_rate=a.learning_rate, l2=a.l2,
+                replay_size=a.replay_size, min_gain=a.min_gain, seed=a.seed,
+                require_anchors=a.require_anchors,
+                anchor_tolerance=a.anchor_tolerance,
+                features=a.features, k=a.k)
+        elif action == "replay":
+            payload = surface.experience_replay(
+                source=a.source, store=a.experience_store, pairs=a.pairs,
+                actions=a.actions, dim=a.dim, k=a.k,
+                learning_rate=a.learning_rate, l2=a.l2,
+                replay_size=a.replay_size, min_gain=a.min_gain, seed=a.seed)
+        else:
+            raise SurfaceError("experience needs report, ingest, recall, update or replay")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "report":
+            summary = payload["summary"]
+            print(f"store: {payload['store']}  exists: {payload['exists']}")
+            print(f"rows: {summary['rows']}  accepted: {summary['accepted']}  "
+                  f"last: {summary['last_run'] or '-'}")
+            if summary["actions"]:
+                print("actions: " + ", ".join(
+                    f"{name}={count}" for name, count in summary["actions"].items()))
+        elif action == "ingest":
+            print(f"ingested: {len(payload['ingested'])}  "
+                  f"existing: {payload['existing']}  "
+                  f"rows: {payload['summary']['rows']}")
+        elif action == "recall":
+            for hit in payload["hits"]:
+                record = hit["record"]
+                print(f"{hit['distance']:.4f}  {record['run_id']}  "
+                      f"accepted={record['accepted']}")
+        elif action in ("update", "cycle"):
+            if action == "cycle":
+                report = payload["report"]
+                plan = report["plan"]
+                update = report["update"]
+                print(f"ingested: {len(report['ingested'])}  "
+                      f"validation: {len(plan['validation'])}  "
+                      f"anchors: {len(plan['anchors'])}  "
+                      f"source: {plan['source']}")
+            else:
+                update = payload["update"]
+            print(f"accepted: {update['accepted']}  "
+                  f"rolled_back: {update['rolled_back']}  version: {update['version']}")
+            print(f"before: {update['before']:.4f}  after: {update['after']:.4f}  "
+                  f"drift: {update['drift']:.4f}")
+            if update["reason"]:
+                print(f"reason: {update['reason']}")
+        elif action == "replay":
+            replay = payload["replay"]
+            print(f"selected: {len(replay['selected'])}  "
+                  f"ingested: {len(replay['ingested'])}  "
+                  f"skipped: {replay['skipped']}")
+    if (action == "cycle"
+            and not payload["report"]["update"]["accepted"]):
+        return 1
+    return 0
+
+
+def cmd_tenant(a: argparse.Namespace) -> int:
+    """``agentdescent tenant`` -- init/plan/run a quota-checked platform cycle."""
+    from .surface_common import SurfaceError
+    from . import surface_tenant as surface
+
+    action = getattr(a, "tenant_cmd", None)
+    try:
+        if action == "init":
+            payload = surface.tenant_init(a.out, demo=a.demo)
+        elif action == "plan":
+            payload = surface.tenant_plan(a.spec)
+        elif action == "run":
+            payload = surface.tenant_run(a.spec, out=a.out)
+        elif action == "report":
+            payload = surface.tenant_report(
+                registry=a.registry, tenant=a.tenant,
+                workspace=a.workspace, principal=a.principal,
+                audit_limit=a.audit_limit)
+        else:
+            raise SurfaceError("tenant needs init, plan, run or report")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "init":
+            print(f"spec: {payload['spec']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "plan":
+            print(f"tenant: {payload['tenant']}  workspace: {payload['workspace']}  "
+                  f"principal: {payload['principal']}")
+            print(f"reserve: {payload['reserve']}  quota: {payload['quota']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "report":
+            print(f"registry: {payload['registry']}  "
+                  f"workspaces: {payload['counts']['workspaces']}  "
+                  f"principals: {payload['counts']['principals']}")
+            for row in payload["workspaces"]:
+                print(f"{row['tenant']}/{row['workspace']}  {row['name']}  "
+                      f"tokens={row['usage']['tokens']}  "
+                      f"cost={row['usage']['cost']}  "
+                      f"active={row['usage']['active']}")
+            if payload["audit"] is None:
+                print(f"audit: {payload['audit_note']}")
+            else:
+                print(f"audit: {len(payload['audit'])} event(s)")
+        else:
+            report = payload["report"]
+            print(f"complete: {report['complete']}  usage: {report['usage']}")
+            if payload.get("out"):
+                print(f"report: {payload['out']}")
+    return 0 if action != "run" or payload["report"]["complete"] else 1
+
+
+def cmd_meta_campaign(a: argparse.Namespace) -> int:
+    """``agentdescent meta-campaign`` -- init/plan/run continuous meta-learning."""
+    from .surface_common import SurfaceError
+    from . import surface_meta_campaign as surface
+
+    action = getattr(a, "meta_campaign_cmd", None)
+    try:
+        if action == "init":
+            payload = surface.meta_campaign_init(a.out, demo=a.demo)
+        elif action == "plan":
+            payload = surface.meta_campaign_plan(a.spec)
+        elif action == "run":
+            payload = surface.meta_campaign_run_surface(a.spec, out=a.out)
+        else:
+            raise SurfaceError("meta-campaign needs init, plan or run")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "init":
+            print(f"spec: {payload['spec']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "plan":
+            print(f"archive: {payload['archive']}  exists: {payload['archive_exists']}")
+            print(f"slot: {payload['slot']}  sessions: {payload['campaign']['max_sessions']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        else:
+            report = payload["report"]
+            print(f"sessions: {len(report['sessions'])}  "
+                  f"best_session: {report.get('best_session')}  "
+                  f"complete: {report['complete']}")
+            print(f"archive: {payload['archive']}  count: {report['archive_count']}")
+            if payload.get("out"):
+                print(f"report: {payload['out']}")
+    return 0 if action != "run" or payload["report"]["complete"] else 1
+
+
+def cmd_governed_harness(a: argparse.Namespace) -> int:
+    """``agentdescent governed-harness`` -- init/plan/run a governed change."""
+    from .surface_common import SurfaceError
+    from . import surface_governed as surface
+
+    action = getattr(a, "governed_cmd", None)
+    try:
+        if action == "init":
+            payload = surface.governed_init(a.out, demo=a.demo)
+        elif action == "plan":
+            payload = surface.governed_plan(a.spec)
+        elif action == "run":
+            payload = surface.governed_run(a.spec, out=a.out)
+        elif action == "approvals":
+            payload = surface.approvals_list(a.store, status=a.status)
+        elif action in ("approve", "reject"):
+            payload = surface.approvals_decide(
+                a.store, a.key, approve=action == "approve", note=a.note)
+        else:
+            raise SurfaceError(
+                "governed-harness needs init, plan, run, approvals, approve "
+                "or reject")
+    except Exception as error:  # noqa: BLE001 - user callbacks are part of the surface
+        return _surface_error(a, error)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        if action == "init":
+            print(f"spec: {payload['spec']}")
+            print(f"before: {payload['before']}")
+            print(f"after: {payload['after']}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "plan":
+            print(f"artifact: {payload['artifact_id']}  tasks: {payload['tasks']}")
+            print(f"gate: {payload['gate']}  prover: {payload['prover'] or '-'}")
+            print("next:")
+            for step in payload["next"]:
+                print(f"  {step}")
+        elif action == "approvals":
+            counts = payload["counts"]
+            print(f"store: {payload['store']}  status: {payload['status']}  "
+                  f"pending: {counts['pending']}")
+            for approval in payload["approvals"]:
+                print(f"{approval['key']}  {approval['status']}  "
+                      f"{approval['artifact_id']}  {approval['reason']}")
+            if not payload["approvals"]:
+                print("no matching approval requests")
+        elif action in ("approve", "reject"):
+            approval = payload["approval"]
+            print(f"{approval['key']}  {approval['status']}")
+        else:
+            report = payload["report"]
+            print(f"promoted: {payload['promoted']}  verdict: {report['verdict']}")
+            print(f"decision: {report['decision']['action']}")
+            if report["rollback"]:
+                print(f"rollback: {report['rollback']}")
+            if payload.get("out"):
+                print(f"report: {payload['out']}")
+    return 0 if action != "run" or payload.get("promoted") else 1
+
+
+def cmd_release(a: argparse.Namespace) -> int:
+    """``agentdescent release`` -- evidence-gated, signed release receipt."""
+    from .release_surface import (
+        ReleaseSurfaceError, load_rules, release_payload, release_text,
+        resolve_secret, verify_release,
+    )
+
+    verb = getattr(a, "release_cmd", None)
+    try:
+        if verb == "verify":
+            if not a.receipt:
+                raise ReleaseSurfaceError(
+                    "release verify needs --receipt PATH")
+            ignored = [
+                flag for flag, value in (
+                    ("--before", a.before), ("--after", a.after),
+                    ("--artifact-id", a.artifact_id),
+                    ("--artifact-hash", a.artifact_hash), ("--out", a.out))
+                if value
+            ]
+            if ignored:
+                raise ReleaseSurfaceError(
+                    "release verify does not take " + ", ".join(ignored)
+                    + "; use the release command to create a receipt")
+            payload = verify_release(
+                a.receipt, key_id=a.key_id, secret_env=a.secret_env,
+                secret_file=a.secret_file, lineage=a.lineage)
+        else:
+            missing = [
+                flag for flag, value in (
+                    ("--before", a.before), ("--after", a.after),
+                    ("--artifact-id", a.artifact_id),
+                    ("--artifact-hash", a.artifact_hash),
+                    ("--key-id", a.key_id))
+                if not value
+            ]
+            if missing:
+                raise ReleaseSurfaceError(
+                    "release needs " + ", ".join(missing)
+                    + " (or pass `release verify --receipt ...`)")
+            rules = load_rules(
+                a.rules, min_effect=a.min_effect, max_risk=a.max_risk)
+            secret = resolve_secret(
+                secret_env=a.secret_env, secret_file=a.secret_file)
+            metadata = None
+            if a.metadata is not None:
+                try:
+                    metadata = json.loads(a.metadata)
+                except ValueError as error:
+                    raise ReleaseSurfaceError(
+                        f"--metadata is not valid JSON: {error}") from None
+                if not isinstance(metadata, dict):
+                    raise ReleaseSurfaceError("--metadata must be a JSON object")
+            payload = release_payload(
+                a.before, a.after, artifact_id=a.artifact_id,
+                artifact_hash=a.artifact_hash, key_id=a.key_id, secret=secret,
+                rules=rules, lineage=a.lineage, parents=a.parents,
+                contaminated=a.contamination, approved=a.approval, risk=a.risk,
+                min_effect=a.min_effect, alpha=a.alpha, seed=a.seed,
+                proxy_gains=a.proxy_gains, oracle_gains=a.oracle_gains,
+                issuer=a.issuer, run_id=a.run_id, kind=a.kind,
+                metadata=metadata, out=a.out)
+    except (ReleaseSurfaceError, OSError, ValueError) as error:
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": str(error)}, as_json=True)
+        else:
+            print(f"release error: {error}", file=sys.stderr)
+        return 2
+    if a.json:
+        _out(payload, as_json=True)
+    elif verb == "verify":
+        print(f"valid: {'yes' if payload['valid'] else 'no'}")
+        print(f"reason: {payload['reason']}")
+        print(f"artifact: {payload['artifact_id']}")
+        print(f"manifest: {payload['manifest_hash']}")
+    else:
+        print(release_text(payload))
+    return 0 if (payload["valid"] if verb == "verify"
+                 else payload["released"]) else 1
+
+
+def safety_payload(archive: Optional[str] = None, *,
+                   audit: Optional[str] = None, bias_threshold: float = 0.1,
+                   min_exam: Optional[str] = "passed") -> Dict[str, Any]:
+    """What ``agentdescent safety --json`` prints, for the CLI and the MCP
+    ``safety`` tool alike. ``min_exam`` is ``passed``, ``flagged``, or
+    ``none`` / None for every non-demoted rule. Reads only."""
+    from .meta_audit import MetaAuditStore
+    from .safety import safety_report
+
+    root = _archive_root(archive)
+    store = None
+    if audit:
+        if not os.path.isfile(os.path.expanduser(audit)):
+            raise MetaCommandError(f"audit store {audit!r} does not exist")
+        store = MetaAuditStore(audit)
+    try:
+        report = safety_report(
+            root, audit=store, bias_threshold=bias_threshold,
+            min_exam=None if min_exam in (None, "none") else min_exam)
+    except (FileNotFoundError, ValueError) as error:
+        raise MetaCommandError(str(error)) from None
+    return {"archive": root, **report.to_dict()}
+
+
+def cmd_safety(a: argparse.Namespace) -> int:
+    """``agentdescent safety`` -- is this archive safe to keep seeding from?"""
+    try:
+        payload = safety_payload(
+            getattr(a, "archive", None), audit=getattr(a, "audit", None),
+            bias_threshold=getattr(a, "bias_threshold", 0.1),
+            min_exam=getattr(a, "min_exam", "passed"))
+    except MetaCommandError as error:
+        return _meta_error(error, a)
+    if a.json:
+        _out(payload, as_json=True)
+    else:
+        print(f"verdict: {payload['verdict']}  ({payload['reason']})")
+        print(f"archive: {payload['archive']}  rules: {payload['rules']}  "
+              f"unexamined: {payload['unexamined']}  "
+              f"flagged: {payload['flagged']}  demoted: {payload['demoted']}")
+        for check in payload["checks"]:
+            print(f"  [{check['status']:<4}] {check['name']:<14} {check['detail']}")
+    return {"safe": 0, "caution": 1, "unsafe": 3}.get(payload["verdict"], 1)
+
+
+_HOST_CHOICES = ("dsh", "claude-code", "codex", "opencode", "grok-bot")
+
+
+def _host_arg(value: str) -> str:
+    """argparse ``type`` for a host: fold aliases (``claude``, ``grok``) and case."""
+    from .integrations import canonical_host
+
+    return canonical_host(value)
+
+
+def _list_hosts(a: argparse.Namespace, verb: str) -> int:
+    """Bare ``install`` / ``uninstall``: say which hosts exist here and what to
+    run, instead of argparse's "the following arguments are required" (#721).
+    Exit 2: no host was named, so nothing was done."""
+    import shutil
+
+    from .integrations import HOST_CLI
+
+    home = getattr(a, "home", None)
+    clis = {b: shutil.which(b) for b in HOST_CLI.values() if b}
+    try:
+        hosts, _ = _host_integrations(clis, home=home)
+    except ValueError as e:        # e.g. an empty --home (#412)
+        raise SpecError(f"{verb}: {e}") from None
+    if verb == "install":
+        suggest = [n for n, i in hosts.items()
+                   if (i["cli"] and i["state"] != "ok") or i["state"] in ("stale", "partial")]
+    else:
+        suggest = [n for n, i in hosts.items() if i["state"] != "missing"]
+    commands = [f"agentdescent {verb} {n}" for n in suggest]
+    if getattr(a, "json", False):
+        _out({"ok": False, "error": f"{verb}: name a host", "hosts": hosts,
+              "suggested": commands}, as_json=True)
+        return 2
+    print(f"{verb}: name a host, one of {', '.join(_HOST_CHOICES)}", file=sys.stderr)
+    for name, info in hosts.items():
+        cli_bit = (f"cli {info['cli']}" if info["cli"]
+                   else ("no desktop cli" if HOST_CLI.get(name) is None else "cli not on PATH"))
+        print(f"  {name:<12} {info['state']:<8} ({cli_bit})", file=sys.stderr)
+    if commands:
+        print("next: " + "  |  ".join(commands), file=sys.stderr)
+    return 2
+
+
+def cmd_install(a: argparse.Namespace) -> int:
+    from .integrations import install
+
+    if a.host is None:
+        return _list_hosts(a, "install")
+    try:
+        written = install(a.host, dry_run=a.dry_run, home=a.home)
+    except ValueError as e:        # e.g. an empty --home (#412)
+        raise SpecError(f"install: {e}") from None
+    # A `FAILED:` line is a step `install` could not take: the host is not
+    # wired, so say so in the exit code too (#516).
+    ok = not any(line.startswith("FAILED:") for line in written)
+    if getattr(a, "json", False):
+        _out({"ok": ok, "host": a.host, "dry_run": a.dry_run, "lines": written},
+             as_json=True)
+    else:
+        for line in written:
+            print(line)
+    return 0 if ok else 1
+
+
+def cmd_uninstall(a: argparse.Namespace) -> int:
+    from .integrations import uninstall
+
+    if a.host is None:
+        return _list_hosts(a, "uninstall")
+    try:
+        lines = uninstall(a.host, dry_run=a.dry_run, home=a.home)
+    except ValueError as e:        # e.g. an empty --home (#412)
+        raise SpecError(f"uninstall: {e}") from None
+    # 1 when something was kept and so is still wired: a script or an agent can
+    # tell "fully removed" from "needs a manual step". Nothing installed is 0.
+    kept = any(line.startswith("kept ") for line in lines)
+    if getattr(a, "json", False):
+        _out({"ok": not kept, "host": a.host, "dry_run": a.dry_run, "lines": lines},
+             as_json=True)
+    else:
+        for line in lines:
+            print(line)
+    return 1 if kept else 0
+
+
+def _bind_failure(e: BaseException) -> str:
+    """One short reason a listening socket could not be opened."""
+    import errno
+
+    if isinstance(e, OverflowError):
+        return "port must be 0-65535"
+    if isinstance(e, UnicodeError):
+        return f"cannot resolve host ({e})"
+    if isinstance(e, OSError):
+        if e.errno == errno.EADDRINUSE:
+            return "address already in use"
+        if e.errno == errno.EACCES:
+            return "permission denied (ports below 1024 usually need root)"
+        return e.strerror or str(e)
+    return str(e)
+
+
+def cmd_serve(a: argparse.Namespace) -> int:
+    # The panel is read-only but unauthenticated: it lists every run in the
+    # store, including specs and artifacts. `mcp` already refuses a
+    # non-loopback bind without an opt-in (#911); `serve` publishing the store
+    # to the network from one flag was the gap.
+    from .mcp import is_loopback_host
+
+    if not is_loopback_host(getattr(a, "host", None)) and not getattr(
+            a, "allow_remote", False):
+        message = (f"refusing to listen on non-loopback host {a.host!r}: the run "
+                   "panel has no authentication and shows every run in the store. "
+                   f"Keep --host {runstore.DEFAULT_HTTP_HOST} and expose it with a "
+                   "tunnel, or pass --allow-remote if you really mean to publish "
+                   "the store to the network.")
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": message}, as_json=True)
+        else:
+            print(f"agentdescent serve: {message}", file=sys.stderr)
+        return 2
+    if not is_loopback_host(getattr(a, "host", None)):
+        print(f"agentdescent serve: WARNING: serving on {a.host}:{a.port} with no "
+              "authentication; anyone who can reach it can read every run in the "
+              "store.", file=sys.stderr)
+    # Bind before announcing the URL: a busy or invalid --port used to print
+    # the banner and then die with a traceback (exit 1), so a backgrounded
+    # panel looked up. Same contract as `mcp --transport streamable-http`
+    # (#636): one line, exit 4, and `{"ok": false}` under --json (#668).
+    try:
+        httpd = runstore.serve_http(host=a.host, port=a.port, store=a.store,
+                                    serve_forever=False)
+    except (OSError, OverflowError, UnicodeError) as e:
+        busy = _bind_failure(e)
+        port = a.port
+        suggest = port + 1 if 1024 <= port < 65535 else runstore.DEFAULT_HTTP_PORT
+        tail = (" or stop the process holding it"
+                if busy == "address already in use" else "")
+        message = (f"cannot listen on {a.host}:{port} -- {busy}; pick another "
+                   f"--port (e.g. --port {suggest}){tail}")
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": message}, as_json=True)
+        else:
+            print(f"agentdescent serve: {message}", file=sys.stderr)
+        return MCP_EXIT_PORT_UNAVAILABLE
+    bound = httpd.server_address[1]
+    print(f"agentdescent: run panel on http://{a.host}:{bound}/  (read-only; Ctrl-C to stop)",
+          file=sys.stderr)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+def _shadowing_dirs() -> Optional[List[str]]:
+    """Where ``agentdescent`` resolved to, when that is not the installed package.
+
+    ``python -m`` puts the host's current directory first on ``sys.path``, so a
+    directory called ``agentdescent/`` there (a source checkout's parent, say)
+    can win the import as a namespace package: no ``__file__``, none of our
+    modules. Returns its path entries, or None when the package is the real one.
+    """
+    pkg = sys.modules.get("agentdescent")
+    if pkg is None or getattr(pkg, "__file__", None) is not None:
+        return None
+    return [str(p) for p in getattr(pkg, "__path__", [])] or ["<unknown location>"]
+
+
+def _mcp_import_failure(e: BaseException) -> str:
+    """One line for why ``agentdescent mcp`` could not import its server.
+
+    A host shows the user nothing but "Connection closed" when this subprocess
+    dies, so this must be a single actionable line and must not itself depend on
+    the modules that just failed to import (a shadowed package breaks
+    ``mcp_unavailable``'s own ``from .integrations import ...``).
+    """
+    shadow = _shadowing_dirs()
+    if shadow:
+        return ("`agentdescent` was resolved to %s, not the installed package: a directory "
+                "named agentdescent/ in the current directory (%s) shadows it. Start the "
+                "server from another directory, or re-run `agentdescent install <host>` "
+                "(the launcher it writes ignores the current directory). Underlying "
+                "error: %s" % (", ".join(shadow), os.getcwd(), e))
+    try:
+        why = mcp_unavailable()
+    except Exception:  # noqa: BLE001 - the reason must never become a traceback
+        why = None
+    # The underlying ImportError says "pip install agentdescent[mcp]", which on
+    # 3.9 is the one thing that will not help -- so it is printed only when we
+    # have nothing better, never after a reason that contradicts it.
+    return why or ('pip install "agentdescent[mcp]" (the CLI works without it). '
+                   f'Underlying error: {e}')
+
+
+# `agentdescent mcp` exit codes: 2 refused (non-loopback --host without
+# --allow-remote), 3 MCP SDK missing / too old, 4 the streamable-http
+# host:port cannot be bound (already in use, permission, bad address) (#636).
+MCP_EXIT_PORT_UNAVAILABLE = 4
+
+
+def _mcp_port_unavailable(host: str, port: int) -> "str | None":
+    """Why ``host:port`` cannot be bound right now, or ``None`` if it can.
+
+    Binds and closes at once, with ``SO_REUSEADDR`` like uvicorn, so a port in
+    TIME_WAIT is not reported busy while one with a live listener is."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM,
+                                   flags=socket.AI_PASSIVE)
+    except (OSError, UnicodeError) as e:
+        return f"cannot resolve host ({e})"
+    family, _, _, _, addr = infos[0]
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(addr)
+    except OSError as e:
+        import errno
+
+        if e.errno == errno.EADDRINUSE:
+            return "address already in use"
+        if e.errno == errno.EACCES:
+            return "permission denied (ports below 1024 usually need root)"
+        return e.strerror or str(e)
+    return None
+
+
+def cmd_mcp(a: argparse.Namespace) -> int:
+    # A host starts this as a subprocess and shows the user nothing but
+    # "CONNECTION_CLOSED" when it dies, so the one thing that can go wrong
+    # before the protocol starts -- the SDK not being installed, or being too
+    # old for streamable-http -- has to say so in one line on stderr rather than
+    # as a traceback nobody will see.
+    #
+    # Host/port fallbacks are literals (must match mcp.DEFAULT_HTTP_*; locked by
+    # test_cli_mcp_defaults_match_module). Do not import .mcp until after these
+    # are set: a shadowed cwd makes `from .mcp import ...` raise, and that has
+    # to land in the ImportError handler below as one line, not a traceback.
+    transport = getattr(a, "transport", "stdio")
+    host = getattr(a, "host", "127.0.0.1")
+    port = getattr(a, "port", 8000)
+    token_env = getattr(a, "http_token_env", None) or None
+    try:
+        from .mcp import (DEFAULT_HTTP_HOST, STREAMABLE_HTTP_REQUIRES,
+                          HttpTokenMissing, http_token, is_loopback_host, serve)
+    except ImportError as e:
+        print(f"agentdescent mcp: cannot start the MCP server -- {_mcp_import_failure(e)}",
+              file=sys.stderr)
+        return 3
+    if transport == "stdio":
+        if token_env:
+            print("agentdescent mcp: --http-token-env only applies to "
+                  "--transport streamable-http: stdio carries no HTTP headers.",
+                  file=sys.stderr)
+            return 2
+    else:
+        if not is_loopback_host(host):
+            if not getattr(a, "allow_remote", False):
+                print(f"agentdescent mcp: refusing to listen on non-loopback host {host!r}: "
+                      "the tools can start runs and write files (`start`, `apply`). Keep "
+                      f"--host {DEFAULT_HTTP_HOST} and expose it with a tunnel, or pass "
+                      "--allow-remote if you really mean to serve the network.",
+                      file=sys.stderr)
+                return 2
+            if not token_env:
+                # The tunnel recipes bind loopback, but a network bind with no
+                # token is the same open endpoint; the token is the only gate
+                # that survives either route (#912).
+                print(f"agentdescent mcp: refusing --allow-remote on {host!r} without "
+                      "--http-token-env: anyone who can reach it can start runs and write "
+                      "files. Pass --http-token-env NAME with the bearer token in $NAME.",
+                      file=sys.stderr)
+                return 2
+            print(f"agentdescent mcp: WARNING: serving on {host}:{port}; every request must "
+                  f"carry `Authorization: Bearer <token>` from ${token_env}.",
+                  file=sys.stderr)
+        if token_env:
+            # Fail before the port probe and the URL line: a server that will
+            # answer 401 to everything must not be announced as ready.
+            try:
+                http_token(token_env)
+            except HttpTokenMissing as e:
+                print(f"agentdescent mcp: cannot start the MCP server -- {e}",
+                      file=sys.stderr)
+                return 2
+        # A busy port otherwise fails deep inside uvicorn's logs *after* we
+        # announced the URL, with the same exit code as a missing SDK, so a
+        # backgrounded server looks up and the tunnel reaches someone else's
+        # process (#636). Probe the bind first, the way uvicorn binds.
+        busy = _mcp_port_unavailable(host, port)
+        if busy is not None:
+            suggest = port + 1 if 1024 <= port < 65535 else 8001
+            tail = (" or stop the process holding it"
+                    if busy == "address already in use" else "")
+            print(f"agentdescent mcp: cannot listen on {host}:{port} -- {busy}; pick "
+                  f"another --port (e.g. --port {suggest}){tail}",
+                  file=sys.stderr)
+            return MCP_EXIT_PORT_UNAVAILABLE
+        print(f"agentdescent mcp: streamable-http on http://{host}:{port}/mcp"
+              + (" (bearer token required)" if token_env else ""),
+              file=sys.stderr)
+    try:
+        advanced = True if getattr(a, "advanced", False) else None
+        if transport == "stdio":
+            serve(store=a.store, advanced=advanced)
+        else:
+            serve(store=a.store, transport=transport, host=host, port=port,
+                  advanced=advanced, http_token_env=token_env)
+    except ImportError as e:
+        print(f"agentdescent mcp: cannot start the MCP server -- {_mcp_import_failure(e)}",
+              file=sys.stderr)
+        return 3
+    except HttpTokenMissing as e:
+        print(f"agentdescent mcp: cannot start the MCP server -- {e}", file=sys.stderr)
+        return 2
+    except RuntimeError as e:
+        # mcp < 1.8: serve() raises STREAMABLE_HTTP_REQUIRES instead of the SDK's
+        # opaque "Unknown transport" ValueError (#589).
+        if str(e) == STREAMABLE_HTTP_REQUIRES:
+            print(f"agentdescent mcp: cannot start the MCP server -- {e}",
+                  file=sys.stderr)
+            return 3
+        raise
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+
+
+# Sub-commands that exist for AgentDescent's own use and are kept out of
+# `--help`, the usage line, and unknown-verb ``choose from`` lists (#420, #886).
+_INTERNAL_COMMANDS = frozenset({"run"})
+
+
+def _visible_choices(action: argparse.Action) -> List[Any]:
+    """``action.choices`` without internal commands, in registration order."""
+    if action.choices is None:
+        return []
+    return [c for c in action.choices if c not in _INTERNAL_COMMANDS]
+
+
+def _did_you_mean_choice(value: Any, choices: Sequence[Any]) -> Optional[str]:
+    """The unique visible choice ``value`` most likely meant, or ``None``.
+
+    An exact match after folding case and ``-``/``_`` wins (``compile_skill``
+    → ``compile-skill``). Otherwise a single close typo at cutoff 0.75, the
+    same bar as unknown algorithm names (#874).
+    """
+    if not isinstance(value, str) or not choices:
+        return None
+    folded = value.strip().casefold().replace("_", "-")
+    pool: Dict[str, Any] = {}
+    for choice in choices:
+        key = str(choice).casefold().replace("_", "-")
+        # Two visible names that fold together are ambiguous; skip both.
+        if key in pool:
+            pool[key] = None
+        else:
+            pool[key] = choice
+    if folded in pool and pool[folded] is not None:
+        return str(pool[folded])
+    close = difflib.get_close_matches(
+        folded, [k for k, v in pool.items() if v is not None], n=1, cutoff=0.75)
+    return str(pool[close[0]]) if close else None
+
+
+def _invalid_choice_message(action: argparse.Action, value: Any) -> str:
+    """argparse's invalid-choice text, minus internal verbs, plus a hint (#886)."""
+    visible = _visible_choices(action)
+    shown = ", ".join(repr(c) for c in visible)
+    msg = f"invalid choice: {value!r} (choose from {shown})"
+    guess = _did_you_mean_choice(value, visible)
+    if guess is not None:
+        msg += f"; did you mean {guess!r}?"
+    return msg
+
+
+class _CliParser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors honour ``--json`` (#664).
+
+    argparse reports a missing argument or an invalid choice by printing
+    usage to stderr and exiting 2.  When the command line asked for
+    ``--json`` that leaves a script with nothing to parse on stdout, so the
+    same exit code instead comes with one ``{"ok": false, "error", "usage"}``
+    object.  Subparsers inherit this class through ``add_subparsers``.
+
+    ``_check_value`` hides internal verbs such as ``run`` from the
+    ``choose from`` list and appends ``did you mean`` for a near-miss (#886).
+    """
+
+    json_errors = False
+
+    def error(self, message: str):  # type: ignore[override]
+        if _CliParser.json_errors:
+            _out({"ok": False, "error": message,
+                  "usage": self.format_usage().strip()}, as_json=True)
+            self.exit(2)
+        super().error(message)
+
+    def _check_value(self, action, value):  # type: ignore[override]
+        if action.choices is None or value in action.choices:
+            return
+        raise argparse.ArgumentError(action, _invalid_choice_message(action, value))
+
+
+def _wants_json(argv: Sequence[str]) -> bool:
+    """True when ``--json`` appears as an option (before any ``--``).
+
+    argparse also accepts an unambiguous prefix (``--js``, ``--jso``, ``--j``)
+    and ``--json`` is the only ``--j*`` option, so those count too (#666).
+    """
+    for tok in argv:
+        if tok == "--":
+            return False
+        if len(tok) >= 3 and "--json".startswith(tok):
+            return True
+    return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = _CliParser(prog="agentdescent",
+                                description="Evolve skills, agents, prompts, code and plugins "
+                                            "with a parallel, merge-based optimiser. "
+                                            "Path A: demo | doctor | init | plan | "
+                                            "evolve | apply; named cards: algorithms.")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"%(prog)s {_version()}",
+                   help="print the AgentDescent version and exit")
+    p.add_argument("--store", help="run store directory (default ~/.agentdescent/runs "
+                                    "or $AGENTDESCENT_HOME/runs)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("demo", help="build a complete example and run it, offline")
+    s.add_argument("--dir", help="where to build it, and keep it "
+                   "(default: a temp directory, removed at exit)")
+    s.add_argument("--kind", choices=("skill_dir", "text", "skill_library"),
+                   help="demo fixture (default: skill_dir, or text when "
+                        "--algorithm is a text-only card)")
+    s.add_argument("--algorithm", metavar="NAME",
+                   help="run the demo with this named algorithm offline "
+                        "(skill_library: evoskill; skill_dir / skill_library: "
+                        "archive_selection; text: gepa, dgm, ace, skillopt, rrsi). "
+                        "Currently: " + ", ".join(_demo_offline_algorithms()))
+    s.set_defaults(fn=cmd_demo)
+
+    s = sub.add_parser("init", help="write a starter spec for a path")
+    s.add_argument("path")
+    s.add_argument("--kind", type=fold_kind, choices=KINDS)
+    s.add_argument("--data", help="cases file, or a module:attribute problems ref for policy_slot")
+    s.add_argument("--agent", default=None,
+                   help="worker agent short name (default: the first of claude_code, "
+                        "codex, dsh, opencode whose CLI is on PATH; claude_code if none)")
+    s.add_argument("--model", default=None,
+                   help="model name for the openai_compatible reflector/agent; with "
+                        "--base-url and an `opencode` worker it is also pinned into "
+                        "the worker (-m plus a provider-only OPENCODE_CONFIG) "
+                        "(default: a placeholder plan refuses -- never guessed)")
+    s.add_argument("--base-url", dest="base_url", default=None,
+                   help="endpoint URL for that model (written as default_base_url)")
+    s.add_argument("--key-env", dest="key_env", default=None,
+                   help="environment variable holding its key (default: OPENAI_API_KEY, "
+                        "or the one other provider key that is set)")
+    s.add_argument("--algorithm", default=None,
+                   help="named method from `agentdescent algorithms list` "
+                        "(e.g. rrsi); other spec fields keep their kind "
+                        "defaults and can override the method's")
+    s.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                   help="algorithm parameter, repeatable; values are JSON "
+                        "when they parse, otherwise strings")
+    s.add_argument("--rounds", type=int, default=None,
+                   help="evolve rounds (default: the kind's; --rounds 1 --workers 1 "
+                        "is a quick trial)")
+    s.add_argument("--workers", type=int, default=None,
+                   help="candidates per round, written as evolve.n_workers "
+                        "(default: the kind's)")
+    s.add_argument("--out", help="where to write the spec")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("plan", help="validate a spec and estimate its cost; runs nothing")
+    s.add_argument("spec")
+    s.add_argument("--algorithm", default=None,
+                   help="override the spec's algorithm by name (the same name "
+                        "merges --param with the spec's params)")
+    s.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                   help="algorithm parameter for --algorithm, repeatable")
+    s.add_argument("--budget", type=float,
+                   help="dollar budget you intend to pass to evolve (needs "
+                        "--usd-per-call); warns when one round can overshoot it")
+    s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.set_defaults(fn=cmd_plan)
+
+    s = sub.add_parser("evolve", help="run a spec")
+    s.add_argument("spec")
+    s.add_argument("--algorithm", default=None,
+                   help="override the spec's algorithm by name (the same name "
+                        "merges --param with the spec's params)")
+    s.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                   help="algorithm parameter for --algorithm, repeatable")
+    s.add_argument("--detach", action="store_true", help="return at once; poll with status")
+    s.add_argument("--budget", type=float, help="stop after this many dollars (needs --usd-per-call)")
+    s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.set_defaults(fn=cmd_evolve)
+
+    # The detached worker `evolve --detach` spawns (runstore: `python -m
+    # agentdescent.cli run --run-dir <dir>`); not a user verb.  argparse does
+    # not honour help=SUPPRESS on a sub-parser (it prints "==SUPPRESS==" and
+    # keeps the name in the {...} list), so register it with no help at all
+    # -- no help line -- leave it out of the metavar below (#420), and strip
+    # it from unknown-verb ``choose from`` lists (#886).
+    s = sub.add_parser("run", description="internal: the worker `agentdescent evolve "
+                                          "--detach` starts; use `evolve` instead")
+    s.add_argument("--run-dir", required=True, dest="run_dir")
+    s.add_argument("--budget", type=float)
+    s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("status", help="one run, or all of them")
+    s.add_argument("run_id", nargs="?")
+    s.add_argument("--brief", action="store_true", help="only running runs, one line each")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("watch", help="follow a run's rounds until it ends")
+    s.add_argument("run_id", help="a run id, or `latest` for the newest run")
+    s.add_argument("--interval", type=float, default=5.0)
+    s.set_defaults(fn=cmd_watch)
+
+    s = sub.add_parser("show", help="the evolved artifact, and the diff against the original")
+    s.add_argument("run_id", help="a run id, or `latest` for the newest run")
+    s.add_argument("--diff", action="store_true", default=True)
+    s.add_argument("--no-diff", action="store_false", dest="diff")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("apply", help="write the evolved artifact back, backing up first")
+    s.add_argument("run_id", nargs="?")
+    s.add_argument("--to", help="a different destination than the spec's target "
+                   "(required with --from)")
+    s.add_argument("--install-to", dest="install_to", metavar="HOST|PATH",
+                   help="install a skill_library (or any FileTree result) into a "
+                        "host skills root: pass a host name/alias (claude-code/"
+                        "claude -> ~/.claude/skills, codex -> ~/.codex/skills, "
+                        "opencode -> ~/.config/opencode/skill, dsh/"
+                        "deepseek-harness -> ~/.dsh/skills, grok-bot/grok -> "
+                        "exits 2 with manual user-skill instructions without "
+                        "writing) or any directory path; same write/backup "
+                        "semantics as --to without pruning unrelated host skills")
+    s.add_argument("--from", dest="source", metavar="PATH",
+                   help="install an artifact from disk (e.g. a campaign's "
+                   "final_target) instead of a run's result")
+    s.add_argument("--home", help="the host's home directory when --install-to "
+                   "names a host (default: the real home + host env vars)")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run")
+    s.add_argument("--no-backup", action="store_true", dest="no_backup")
+    s.set_defaults(fn=cmd_apply)
+
+    s = sub.add_parser("cancel", help="stop a run and every worker it started")
+    s.add_argument("run_id")
+    s.set_defaults(fn=cmd_cancel)
+
+    s = sub.add_parser("resume", help="continue a stopped run on its ledger")
+    s.add_argument("run_id")
+    s.add_argument("--budget", type=float)
+    s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.add_argument("--force", action="store_true",
+                   help="resume even when the run failed on a spent provider quota (#926)")
+    s.set_defaults(fn=cmd_resume)
+
+    s = sub.add_parser("portfolio",
+                       help="rank the archive's layers and reallocate the next budget window")
+    s.add_argument("archive", nargs="?", default=None,
+                   help="consolidation archive directory (default $AGENTDESCENT_HOME/archive)")
+    s.add_argument("--floor", type=float, default=0.05)
+    s.add_argument("--min-samples", type=int, default=3, dest="min_samples")
+    s.add_argument("--grow", type=float, default=0.5)
+    s.add_argument("--shrink", type=float, default=0.5)
+    s.add_argument("--cap", type=float, default=None)
+    s.set_defaults(fn=cmd_portfolio)
+
+    s = sub.add_parser("exam",
+                       help="re-judge the archive's adopted rules with an independent oracle")
+    s.add_argument("archive", nargs="?", default=None,
+                   help="consolidation archive directory (default $AGENTDESCENT_HOME/archive)")
+    s.add_argument("--domain", required=True,
+                   help="module:attribute builder returning the domain dict "
+                        "(oracle, tasks_for, run, reward, propose, strategy)")
+    s.add_argument("--slot", default="task_sampler",
+                   help="the decision slot the rules evolved (default task_sampler)")
+    s.add_argument("--min-gain", type=float, default=0.0, dest="min_gain")
+    s.add_argument("--max-flags", type=int, default=2, dest="max_flags")
+    s.add_argument("--config", default=None,
+                   help="JSON config dict used to rank the archive's rules")
+    s.set_defaults(fn=cmd_exam)
+
+    s = sub.add_parser("audit",
+                       help="trace one archived adoption through its evidence rings")
+    s.add_argument("run_id")
+    s.add_argument("--archive", default=None,
+                   help="consolidation archive directory (default $AGENTDESCENT_HOME/archive)")
+    s.add_argument("--meta-audit", default=None, dest="meta_audit",
+                   help="a MetaAuditStore path for the meta-gain ring")
+    s.add_argument("--inner-audit", default=None, dest="inner_audit",
+                   help="an inner AuditStore path for the inner-reward ring")
+    s.add_argument("--harness", default=None,
+                   help="module:attribute harness_evidence callable for the harness ring")
+    s.add_argument("--bias-threshold", type=float, default=0.1, dest="bias_threshold")
+    s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser(
+        "predictions", help="declare, observe and score edit predictions")
+    predictions_sub = s.add_subparsers(dest="predictions_cmd", required=True)
+    sp = predictions_sub.add_parser("predict", help="store a prediction before measuring")
+    sp.add_argument("--store", required=True, help="prediction JSONL")
+    sp.add_argument("--artifact-id", required=True, dest="artifact_id")
+    sp.add_argument("--diff-id", default="", dest="diff_id")
+    sp.add_argument("--delta", type=float, required=True,
+                    help="expected change in held-out reward")
+    sp.add_argument("--confidence", type=float, required=True)
+    sp.add_argument("--tasks", default="",
+                    help="comma-separated task ids expected to flip")
+    sp.add_argument("--rationale", default="")
+    sp.set_defaults(fn=cmd_predictions)
+    sp = predictions_sub.add_parser("observe", help="record the measured result")
+    sp.add_argument("--store", required=True)
+    sp.add_argument("--prediction-id", required=True, dest="prediction_id")
+    sp.add_argument("--delta", type=float, required=True,
+                    help="observed change in held-out reward")
+    sp.add_argument("--tasks", default="")
+    sp.add_argument("--tolerance", type=float, default=0.0)
+    sp.add_argument("--note", default="")
+    sp.set_defaults(fn=cmd_predictions)
+    sp = predictions_sub.add_parser("report", help="hit rate, Brier and calibration")
+    sp.add_argument("--store", required=True)
+    sp.set_defaults(fn=cmd_predictions)
+    s = sub.add_parser(
+        "hgm", help="inspect an HGM tree or ask for its next action")
+    hgm_sub = s.add_subparsers(dest="hgm_cmd", required=True)
+    sp = hgm_sub.add_parser("next", help="expand, evaluate or stop next")
+    sp.add_argument("--tree", required=True, help="HGM tree JSON")
+    sp.set_defaults(fn=cmd_hgm)
+    sp = hgm_sub.add_parser("report", help="per-node clade evidence")
+    sp.add_argument("--tree", required=True, help="HGM tree JSON")
+    sp.set_defaults(fn=cmd_hgm)
+    s = sub.add_parser(
+        "github", help="publish a proposal branch/PR or read a PR")
+    github_sub = s.add_subparsers(dest="github_cmd", required=True)
+    sp = github_sub.add_parser(
+        "publish", help="publish a proposal JSON as a branch, PR and check")
+    sp.add_argument("--proposal", required=True, help="proposal JSON file")
+    sp.add_argument("--owner", required=True, help="repository owner")
+    sp.add_argument("--repo", required=True, help="repository name")
+    sp.add_argument("--base", default="main", help="base branch (default main)")
+    sp.add_argument("--token-env", default="AGENTDESCENT_GITHUB_TOKEN",
+                    dest="token_env",
+                    help="environment variable holding the token")
+    sp.add_argument("--apply", action="store_true",
+                    help="perform the writes; without it the command is a plan")
+    sp.set_defaults(fn=cmd_github)
+    sp = github_sub.add_parser(
+        "review", help="read reviews, review constraints and merge readiness")
+    sp.add_argument("--pr", type=int, required=True, help="pull request number")
+    sp.add_argument("--owner", required=True)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--base", default="main")
+    sp.add_argument("--token-env", default="AGENTDESCENT_GITHUB_TOKEN",
+                    dest="token_env")
+    sp.add_argument("--resolved", default="",
+                    help="comma-separated review/comment ids known to be resolved")
+    sp.set_defaults(fn=cmd_github)
+
+    sp = github_sub.add_parser("status", help="read a PR and its check runs")
+    sp.add_argument("--pr", type=int, required=True, help="pull request number")
+    sp.add_argument("--owner", required=True)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--base", default="main")
+    sp.add_argument("--token-env", default="AGENTDESCENT_GITHUB_TOKEN",
+                    dest="token_env")
+    sp.set_defaults(fn=cmd_github)
+    s = sub.add_parser(
+        "harness", help="inspect or enforce a harness component manifest")
+    harness_sub = s.add_subparsers(dest="harness_cmd", required=True)
+    sp = harness_sub.add_parser("manifest", help="show components and FileTree globs")
+    sp.add_argument("--spec", required=True, help="harness manifest JSON")
+    sp.set_defaults(fn=cmd_harness)
+    sp = harness_sub.add_parser("check", help="validate edits against the contract")
+    sp.add_argument("--spec", required=True, help="harness manifest JSON")
+    sp.add_argument("--changes", required=True,
+                    help="JSON mapping of path -> content (or a path list)")
+    sp.set_defaults(fn=cmd_harness)
+    s = sub.add_parser(
+        "skills", help="report, audit or search a durable skill bank")
+    skills_sub = s.add_subparsers(dest="skills_cmd", required=True)
+    sp = skills_sub.add_parser("report", help="statuses, baseline and best/worst lifts")
+    sp.add_argument("--store", required=True, help="skill-bank JSON snapshot")
+    sp.set_defaults(fn=cmd_skills)
+    sp = skills_sub.add_parser("audit", help="quarantine skills below the lift bar")
+    sp.add_argument("--store", required=True)
+    sp.add_argument("--min-uses", type=int, default=5, dest="min_uses")
+    sp.add_argument("--min-lift", type=float, default=0.0, dest="min_lift")
+    sp.add_argument("--apply", action="store_true",
+                    help="persist quarantine decisions (default: report only)")
+    sp.set_defaults(fn=cmd_skills)
+    sp = skills_sub.add_parser("search", help="retrieve active skills by text")
+    sp.add_argument("--store", required=True)
+    sp.add_argument("--query", required=True)
+    sp.add_argument("--k", type=int, default=5)
+    sp.set_defaults(fn=cmd_skills)
+
+
+
+    s = sub.add_parser(
+        "traces", help="summarise raw agent trajectories or drill into them")
+    traces_sub = s.add_subparsers(dest="traces_cmd", required=True)
+    sp = traces_sub.add_parser("digest", help="build a layered evidence digest")
+    sp.add_argument("--events", required=True,
+                    help="trajectory JSONL or JSON array")
+    sp.add_argument("--max-signatures", type=int, default=20,
+                    dest="max_signatures")
+    sp.add_argument("--max-chars", type=int, default=4000,
+                    dest="max_digest_chars",
+                    help="upper bound on the prompt-ready digest text")
+    sp.add_argument("--out", help="write the JSON digest here")
+    sp.set_defaults(fn=cmd_traces)
+    sp = traces_sub.add_parser("show", help="show raw events behind a slice")
+    sp.add_argument("--events", required=True,
+                    help="trajectory JSONL or JSON array")
+    sp.add_argument("--run-id", dest="run_id", default=None)
+    sp.add_argument("--task-id", dest="task_id", default=None)
+    sp.add_argument("--signature", default=None,
+                    help="failure signature id from `traces digest`")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(fn=cmd_traces)
+
+    s = sub.add_parser(
+        "compile-skill", help="compile a skill into a tested function")
+    s.add_argument("--skill", required=True, help="skill document to compile")
+    s.add_argument("--skill-id", default=None, dest="skill_id",
+                   help="id used in the result (default: the file stem)")
+    s.add_argument("--compiler", required=True,
+                   help="module:attribute returning the compiled source")
+    s.add_argument("--test", action="append", required=True,
+                   help="module:attribute test callable (repeatable)")
+    s.add_argument("--reference", default=None,
+                   help="module:attribute reference callable")
+    s.add_argument("--cases", default=None,
+                   help="JSON array of single-argument cases")
+    s.add_argument("--out", default=None,
+                   help="write the compiled source here when it passes")
+    s.set_defaults(fn=cmd_compile_skill)
+
+
+    s = sub.add_parser("doctor", help="which agents, keys and optional pieces are available")
+    s.add_argument("--home", help="the host's home directory (default: the real one)")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("install", help="wire the skill and MCP server into a host")
+    # Aliases (`claude`, `grok`, `deepseek-harness`, any case) fold to the
+    # canonical name before the choices check; bare `install` lists hosts (#721).
+    s.add_argument("host", nargs="?", type=_host_arg, choices=_HOST_CHOICES,
+                   help="host to wire; omit to list hosts and their state")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run")
+    s.add_argument("--home", help="the host's home directory (default: the real one)")
+    s.set_defaults(fn=cmd_install)
+
+    s = sub.add_parser("uninstall", help="undo `install` for a host")
+    s.add_argument("host", nargs="?", type=_host_arg, choices=_HOST_CHOICES,
+                   help="host to unwire; omit to list hosts and their state")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run")
+    s.add_argument("--home", help="the host's home directory (default: the real one)")
+    s.set_defaults(fn=cmd_uninstall)
+
+    s = sub.add_parser("algorithms", help="the named algorithms a spec can ask for")
+    # A bare `agentdescent algorithms` lists them, like `algorithms list`.
+    s.set_defaults(fn=cmd_algorithms, kind=None)
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable output")
+    # SUPPRESS on both: a subparser default would overwrite the group's value,
+    # so `algorithms --kind text list` must not lose `text` (#549).
+    s.add_argument("--kind", default=argparse.SUPPRESS,
+                   help="only algorithms for this spec kind (as `algorithms list --kind`)")
+    algo_sub = s.add_subparsers(dest="action")
+    s2 = algo_sub.add_parser("list", help="every algorithm, or those that apply to a kind")
+    s2.add_argument("--kind", default=argparse.SUPPRESS,
+                    help="only algorithms for this spec kind")
+    s2.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                    help="machine-readable output")
+    s2.set_defaults(fn=cmd_algorithms)
+    s2 = algo_sub.add_parser("show", help="one algorithm: what it does, its parameters")
+    s2.add_argument("name")
+    s2.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                    help="machine-readable output")
+    s2.set_defaults(fn=cmd_algorithms)
+    s2 = algo_sub.add_parser(
+        "run", help="write a starter spec for NAME on PATH and plan it (does not start a run)")
+    s2.add_argument("name", help="algorithm name from `algorithms list`")
+    s2.add_argument("path", help="target path (prompt, skill dir, …)")
+    s2.add_argument("cases", nargs="?", default=None,
+                    help="cases.jsonl (same as init --data)")
+    s2.add_argument("--agent", default=None,
+                    help="worker agent short name, as init --agent (default: the "
+                         "first worker CLI on PATH)")
+    s2.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                    help="algorithm parameter, repeatable; values are JSON "
+                         "when they parse, otherwise strings")
+    s2.add_argument("--model", default=None,
+                    help="model name for the openai_compatible reflector/agent")
+    s2.add_argument("--base-url", dest="base_url", default=None,
+                    help="endpoint URL for that model (written as default_base_url)")
+    s2.add_argument("--key-env", dest="key_env", default=None,
+                    help="environment variable holding its key")
+    s2.add_argument("--kind", type=fold_kind, choices=KINDS,
+                    default=argparse.SUPPRESS,
+                    help="spec kind (default: guessed from PATH, as init --kind)")
+    s2.add_argument("--out", help="where to write the spec "
+                    "(default: ./agentdescent.<name>.spec.json)")
+    s2.add_argument("--rounds", type=int, default=None,
+                   help="evolve rounds (default: the kind's; --rounds 1 --workers 1 "
+                        "is a quick trial)")
+    s2.add_argument("--workers", type=int, default=None,
+                   help="candidates per round, written as evolve.n_workers "
+                        "(default: the kind's)")
+
+    s2.add_argument("--usd-per-call", type=float, dest="usd_per_call",
+                    help="optional dollar estimate for plan")
+    s2.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                    help="machine-readable output")
+    s2.set_defaults(fn=cmd_algorithms)
+
+    s = sub.add_parser("diagnose", help="why a run learned nothing (or stopped)")
+    s.add_argument("run_id", help="a run id, or `latest` for the newest run")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable output")
+    s.set_defaults(fn=cmd_diagnose)
+
+    s = sub.add_parser("rsi", help="the archive's longitudinal self-improvement trend")
+    s.add_argument("--archive", help="consolidation archive (default: $AGENTDESCENT_HOME/archive)")
+    s.add_argument("--slot", help="only this decision slot")
+    s.add_argument("--stagnation-window", type=int, default=3,
+                   dest="stagnation_window",
+                   help="adoptions without a new best before a slot is stagnant")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable output")
+    s.set_defaults(fn=cmd_rsi)
+    s = sub.add_parser("campaign",
+                       help="iterate a spec, carrying the evolved artifact forward")
+    s.add_argument("spec")
+    s.add_argument("--sessions", type=int, default=3,
+                   help="maximum sessions to run (default 3)")
+    s.add_argument("--rounds", type=int,
+                   help="rounds per session (default: the spec's own budget)")
+    s.add_argument("--algorithm", default=None,
+                   help="algorithm to use for every session (default: the spec's own)")
+    s.add_argument("--patience", type=int, default=1,
+                   help="non-improving sessions before stopping (default 1)")
+    s.add_argument("--workdir", help="workspace for the carried artifact")
+    s.add_argument("--keep-ledgers", action="store_true", dest="keep_ledgers",
+                   help="keep each session's ledger for diagnosis")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="show the total call estimate without running")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable output")
+    s.set_defaults(fn=cmd_campaign)
+    s = sub.add_parser("tournament",
+                       help="run one spec under several named algorithms")
+    s.add_argument("spec")
+    s.add_argument("--algorithm", action="append", required=True,
+                   metavar="NAME",
+                   help="algorithm to run; use 'default' for the spec's own recipe "
+                        "(repeatable)")
+    s.add_argument("--seed", action="append", type=int, default=None,
+                   help="seed to repeat each arm on (repeatable; default 0)")
+    s.add_argument("--rounds", type=int, help="override evolve.rounds for every arm")
+    s.add_argument("--max-seconds", type=float, dest="max_seconds",
+                   help="override evolve.max_seconds for every arm")
+    s.add_argument("--repo-root", dest="repo_root",
+                   help="where the temporary ledgers live")
+    s.add_argument("--keep", action="store_true",
+                   help="keep the per-arm ledgers for diagnosis")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="show the per-arm plan estimate without running")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable output")
+    s.set_defaults(fn=cmd_tournament)
+    s = sub.add_parser("safety", help="is this archive safe to keep seeding from?")
+    s.add_argument("--archive", help="consolidation archive (default: $AGENTDESCENT_HOME/archive)")
+    s.add_argument("--audit", help="MetaAuditStore JSONL to check verifier bias")
+    s.add_argument("--bias-threshold", type=float, default=0.1,
+                   dest="bias_threshold",
+                   help="worst |gain bias| allowed by the audit check")
+    s.add_argument("--min-exam", choices=("passed", "flagged", "none"),
+                   default="passed", dest="min_exam",
+                   help="seeding bar to check (default: passed)")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable output")
+    s.set_defaults(fn=cmd_safety)
+
+    s = sub.add_parser(
+        "release",
+        help="gate paired evidence and sign an accepted release receipt")
+    s.add_argument(
+        "release_cmd", nargs="?", choices=("verify",), default=None,
+        metavar="{verify}",
+        help="verify a signed receipt instead of creating one")
+    s.add_argument("--receipt", metavar="PATH",
+                   help="release receipt JSON to verify (release verify)")
+    s.add_argument("--before", metavar="PATH",
+                   help="JSON object of task -> incumbent score, or '-' for stdin")
+    s.add_argument("--after", metavar="PATH",
+                   help="JSON object of task -> candidate score, or '-' for stdin")
+    s.add_argument("--artifact-id", dest="artifact_id",
+                   help="the released artifact id")
+    s.add_argument("--artifact-hash", dest="artifact_hash",
+                   help="content hash of the artifact (also the manifest identity)")
+    s.add_argument("--key-id", dest="key_id",
+                   help="signing key id written into the manifest")
+    s.add_argument("--secret-env", dest="secret_env", default=None,
+                   help="environment variable holding the HMAC secret "
+                        "(default: AGENTDESCENT_RELEASE_KEY)")
+    s.add_argument("--secret-file", dest="secret_file", default=None,
+                   help="file holding the HMAC secret (never pass it on argv)")
+    s.add_argument("--lineage", help="lineage JSON to load and extend on release")
+    s.add_argument("--out", help="write the JSON report here as well")
+    s.add_argument("--rules", help="PromotionRules JSON object (overrides the flags)")
+    s.add_argument("--min-effect", type=float, default=0.0,
+                   dest="min_effect", help="minimum eval delta (default 0.0)")
+    s.add_argument("--max-risk", type=float, default=1.0,
+                   dest="max_risk", help="highest risk the rules accept (default 1.0)")
+    s.add_argument("--risk", type=float, default=None,
+                   help="this candidate's risk in [0, 1]")
+    s.add_argument("--contamination", choices=("unknown", "clean", "contaminated"),
+                   default="unknown", help="held-out contamination status")
+    s.add_argument("--clean", dest="contamination", action="store_const",
+                   const="clean", help="mark the held-out set clean (shortcut)")
+    s.add_argument("--contaminated", dest="contamination", action="store_const",
+                   const="contaminated", help="mark the held-out set contaminated")
+    s.add_argument("--approval", choices=("unknown", "approved", "rejected"),
+                   default="unknown", help="human approval status")
+    s.add_argument("--approved", dest="approval", action="store_const",
+                   const="approved", help="mark the candidate human-approved")
+    s.add_argument("--rejected", dest="approval", action="store_const",
+                   const="rejected", help="mark the candidate human-rejected")
+    s.add_argument("--alpha", type=float, default=0.05,
+                   help="statistical alpha (default 0.05)")
+    s.add_argument("--seed", type=int, default=0, help="bootstrap seed")
+    s.add_argument("--proxy-gains", dest="proxy_gains", default=None,
+                   help="JSON array of proxy gain observations (Goodhart check)")
+    s.add_argument("--oracle-gains", dest="oracle_gains", default=None,
+                   help="JSON array of oracle gain observations (Goodhart check)")
+    s.add_argument("--parents", default="",
+                   help="comma-separated parent artifact ids")
+    s.add_argument("--run-id", dest="run_id", default="", help="source run id")
+    s.add_argument("--kind", default="skill", help="artifact kind (default skill)")
+    s.add_argument("--issuer", default="agentdescent",
+                   help="manifest issuer (default agentdescent)")
+    s.add_argument("--metadata", default=None,
+                   help="JSON object stored with the manifest")
+    s.set_defaults(fn=cmd_release)
+
+    s = sub.add_parser(
+        "platform",
+        help="run a durable five-layer RSI campaign (loop/compute/foundry/experience)")
+    platform_sub = s.add_subparsers(dest="platform_cmd", required=True)
+    sp = platform_sub.add_parser("init", help="write a platform spec")
+    sp.add_argument("--out", required=True, help="where to write the spec")
+    sp.add_argument("--demo", action="store_true",
+                   help="write the runnable offline example")
+    sp.set_defaults(fn=cmd_platform)
+    sp = platform_sub.add_parser("plan", help="validate a spec and resolve every ref")
+    sp.add_argument("--spec", required=True, help="platform JSON spec")
+    sp.set_defaults(fn=cmd_platform)
+    sp = platform_sub.add_parser("run", help="run the campaign")
+    sp.add_argument("--spec", required=True, help="platform JSON spec")
+    sp.add_argument("--out", help="write the full JSON report here")
+    sp.set_defaults(fn=cmd_platform)
+    sp = platform_sub.add_parser(
+        "status", help="inspect a campaign's runs after it finished")
+    sp.add_argument("--runs-db", required=True, dest="runs_db",
+                    help="SQLite run database written by the campaign")
+    sp.add_argument("--tenant", default=None)
+    sp.add_argument("--workspace", default=None)
+    sp.add_argument("--run-id", dest="run_id", default=None,
+                    help="return this run's full report")
+    sp.add_argument("--limit", type=int, default=20,
+                    help="how many recent runs to list (default 20)")
+    sp.set_defaults(fn=cmd_platform)
+
+    s = sub.add_parser(
+        "capability",
+        help="turn failure traces into an admitted, archived capability")
+    capability_sub = s.add_subparsers(dest="capability_cmd", required=True)
+    sp = capability_sub.add_parser("init", help="write a capability spec")
+    sp.add_argument("--out", required=True, help="where to write the spec")
+    sp.add_argument("--demo", action="store_true",
+                   help="write the runnable offline example and traces")
+    sp.set_defaults(fn=cmd_capability)
+    sp = capability_sub.add_parser("plan", help="validate a spec and load traces")
+    sp.add_argument("--spec", required=True, help="capability JSON spec")
+    sp.set_defaults(fn=cmd_capability)
+    sp = capability_sub.add_parser("run", help="run the capability loop")
+    sp.add_argument("--spec", required=True, help="capability JSON spec")
+    sp.add_argument("--out", help="write the full JSON report here")
+    sp.set_defaults(fn=cmd_capability)
+
+    s = sub.add_parser(
+        "ops", help="publish finished runs to the control room")
+    ops_sub = s.add_subparsers(dest="ops_cmd", required=True)
+    sp = ops_sub.add_parser("plan", help="count what would be published")
+    sp.add_argument("--runs-db", required=True, dest="runs_db",
+                   help="SQLite run database written by platform/loop")
+    sp.add_argument("--tenant", required=True)
+    sp.add_argument("--workspace", required=True)
+    sp.set_defaults(fn=cmd_ops)
+    sp = ops_sub.add_parser("publish", help="record the campaign and return metrics")
+    sp.add_argument("--runs-db", required=True, dest="runs_db")
+    sp.add_argument("--tenant", required=True)
+    sp.add_argument("--workspace", required=True)
+    sp.add_argument("--min-acceptance", type=float, default=0.0,
+                   dest="min_acceptance", help="alert below this acceptance rate")
+    sp.add_argument("--max-cost-per-accepted", type=float, default=None,
+                   dest="max_cost_per_accepted",
+                   help="alert above this calls/accepted value")
+    sp.add_argument("--out", help="write the full JSON report here")
+    sp.add_argument("--prometheus", help="write Prometheus text here")
+    sp.add_argument("--history", help="append this publish to a JSONL history")
+    sp.set_defaults(fn=cmd_ops)
+    sp = ops_sub.add_parser(
+        "history", help="summarise the JSONL history of past publishes")
+    sp.add_argument("--history", required=True, help="JSONL history to read")
+    sp.add_argument("--tenant", default=None)
+    sp.add_argument("--workspace", default=None)
+    sp.set_defaults(fn=cmd_ops)
+
+    s = sub.add_parser(
+        "experience", help="inspect and update cross-run experience memory")
+    experience_sub = s.add_subparsers(dest="experience_cmd", required=True)
+    sp = experience_sub.add_parser("report", help="summarise the experience store")
+    sp.add_argument("--store", dest="experience_store", default=None,
+                   help="experience JSONL (default: $AGENTDESCENT_HOME/experience.jsonl)")
+    sp.set_defaults(fn=cmd_experience)
+    sp = experience_sub.add_parser("ingest", help="append new ExperienceRecords")
+    sp.add_argument("--store", dest="experience_store", default=None)
+    sp.add_argument("--records", required=True,
+                   help="ExperienceRecord JSONL or JSON array")
+    sp.set_defaults(fn=cmd_experience)
+    sp = experience_sub.add_parser("recall", help="nearest experience by features")
+    sp.add_argument("--store", dest="experience_store", default=None)
+    sp.add_argument("--features", required=True,
+                   help="comma-separated feature vector")
+    sp.add_argument("--k", type=int, default=5)
+    sp.set_defaults(fn=cmd_experience)
+    sp = experience_sub.add_parser("update", help="guarded learner update")
+    sp.add_argument("--store", dest="experience_store", default=None)
+    sp.add_argument("--validation", required=True,
+                   help="validation ExperienceRecord JSONL")
+    sp.add_argument("--anchors", default=None,
+                   help="anchor ExperienceRecord JSONL")
+    sp.add_argument("--actions", required=True,
+                   help="comma-separated action names")
+    sp.add_argument("--dim", type=int, required=True,
+                   help="feature dimension")
+    sp.add_argument("--learning-rate", type=float, default=0.2,
+                   dest="learning_rate")
+    sp.add_argument("--l2", type=float, default=1e-3)
+    sp.add_argument("--replay-size", type=int, default=1000, dest="replay_size")
+    sp.add_argument("--min-gain", type=float, default=0.0, dest="min_gain")
+    sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--anchor-tolerance", type=float, default=0.0,
+                   dest="anchor_tolerance")
+    sp.add_argument("--require-anchors", action="store_true", default=True,
+                   dest="require_anchors")
+    sp.add_argument("--no-require-anchors", action="store_false",
+                   dest="require_anchors")
+    sp.set_defaults(fn=cmd_experience)
+    sp = experience_sub.add_parser(
+        "cycle", help="ingest, plan anchors and run one guarded adaptive cycle")
+    sp.add_argument("--store", dest="experience_store", default=None)
+    sp.add_argument("--records", default=None,
+                    help="new ExperienceRecord JSONL/JSON array")
+    sp.add_argument("--validation", default=None,
+                    help="optional validation ExperienceRecord JSONL")
+    sp.add_argument("--anchors", default=None,
+                    help="optional anchor ExperienceRecord JSONL")
+    sp.add_argument("--actions", required=True,
+                    help="comma-separated action names")
+    sp.add_argument("--dim", type=int, required=True,
+                    help="feature dimension")
+    sp.add_argument("--learning-rate", type=float, default=0.2,
+                    dest="learning_rate")
+    sp.add_argument("--l2", type=float, default=1e-3)
+    sp.add_argument("--replay-size", type=int, default=1000, dest="replay_size")
+    sp.add_argument("--min-gain", type=float, default=0.0, dest="min_gain")
+    sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--anchor-tolerance", type=float, default=0.0,
+                    dest="anchor_tolerance")
+    sp.add_argument("--require-anchors", action="store_true", default=True,
+                    dest="require_anchors")
+    sp.add_argument("--no-require-anchors", action="store_false",
+                    dest="require_anchors")
+    sp.add_argument("--features", default=None,
+                    help="optional feature vector for recall anchors")
+    sp.add_argument("--k", type=int, default=5)
+    sp.set_defaults(fn=cmd_experience)
+
+    sp = experience_sub.add_parser("replay", help="preference-ranked replay")
+    sp.add_argument("--source", required=True,
+                   help="source ExperienceRecord JSONL")
+    sp.add_argument("--store", dest="experience_store", default=None,
+                   help="engine replay JSONL (must differ from --source)")
+    sp.add_argument("--pairs", required=True,
+                   help="PreferencePair JSONL/JSON array")
+    sp.add_argument("--actions", required=True)
+    sp.add_argument("--dim", type=int, required=True)
+    sp.add_argument("--k", type=int, default=5)
+    sp.add_argument("--learning-rate", type=float, default=0.2,
+                   dest="learning_rate")
+    sp.add_argument("--l2", type=float, default=1e-3)
+    sp.add_argument("--replay-size", type=int, default=1000, dest="replay_size")
+    sp.add_argument("--min-gain", type=float, default=0.0, dest="min_gain")
+    sp.add_argument("--seed", type=int, default=0)
+    sp.set_defaults(fn=cmd_experience)
+
+    s = sub.add_parser(
+        "governed-harness",
+        help="gate and sign one harness/code self-modification")
+    governed_sub = s.add_subparsers(dest="governed_cmd", required=True)
+    sp = governed_sub.add_parser("init", help="write a governed-harness spec")
+    sp.add_argument("--out", required=True, help="where to write the spec")
+    sp.add_argument("--demo", action="store_true",
+                    help="write the runnable offline example")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser("plan", help="validate a spec without running the gates")
+    sp.add_argument("--spec", required=True, help="governed-harness JSON spec")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser("run", help="run the governed change")
+    sp.add_argument("--spec", required=True, help="governed-harness JSON spec")
+    sp.add_argument("--out", help="write the full JSON report here")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser(
+        "approvals", help="list pending or decided approval requests")
+    sp.add_argument("--store", required=True, help="ApprovalStore JSONL")
+    sp.add_argument("--status", choices=("pending", "approved", "rejected", "all"),
+                    default="pending", help="which requests to list (default pending)")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser(
+        "approve", help="approve one pending request (human-only)")
+    sp.add_argument("--store", required=True, help="ApprovalStore JSONL")
+    sp.add_argument("--key", required=True, help="approval request key")
+    sp.add_argument("--note", default="", help="why the request was approved")
+    sp.set_defaults(fn=cmd_governed_harness)
+    sp = governed_sub.add_parser(
+        "reject", help="reject one pending request (human-only)")
+    sp.add_argument("--store", required=True, help="ApprovalStore JSONL")
+    sp.add_argument("--key", required=True, help="approval request key")
+    sp.add_argument("--note", default="", help="why the request was rejected")
+    sp.set_defaults(fn=cmd_governed_harness)
+
+    s = sub.add_parser(
+        "meta-campaign",
+        help="run continuous meta-learning as a bounded campaign")
+    meta_campaign_sub = s.add_subparsers(dest="meta_campaign_cmd", required=True)
+    sp = meta_campaign_sub.add_parser("init", help="write a meta-campaign spec")
+    sp.add_argument("--out", required=True, help="where to write the spec")
+    sp.add_argument("--demo", action="store_true",
+                    help="write the runnable offline example")
+    sp.set_defaults(fn=cmd_meta_campaign)
+    sp = meta_campaign_sub.add_parser("plan", help="validate a spec without running")
+    sp.add_argument("--spec", required=True, help="meta-campaign JSON spec")
+    sp.set_defaults(fn=cmd_meta_campaign)
+    sp = meta_campaign_sub.add_parser("run", help="run the campaign")
+    sp.add_argument("--spec", required=True, help="meta-campaign JSON spec")
+    sp.add_argument("--out", help="write the full JSON report here")
+    sp.set_defaults(fn=cmd_meta_campaign)
+
+    s = sub.add_parser(
+        "tenant",
+        help="run one platform cycle under workspace roles and quota")
+    tenant_sub = s.add_subparsers(dest="tenant_cmd", required=True)
+    sp = tenant_sub.add_parser("init", help="write a tenant spec")
+    sp.add_argument("--out", required=True, help="where to write the spec")
+    sp.add_argument("--demo", action="store_true",
+                    help="write the runnable offline example")
+    sp.set_defaults(fn=cmd_tenant)
+    sp = tenant_sub.add_parser("plan", help="validate a spec without running")
+    sp.add_argument("--spec", required=True, help="tenant JSON spec")
+    sp.set_defaults(fn=cmd_tenant)
+    sp = tenant_sub.add_parser("run", help="run one quota-checked cycle")
+    sp.add_argument("--spec", required=True, help="tenant JSON spec")
+    sp.add_argument("--out", help="write the full JSON report here")
+    sp.set_defaults(fn=cmd_tenant)
+    sp = tenant_sub.add_parser(
+        "report", help="inspect a persistent workspace registry")
+    sp.add_argument("--registry", required=True,
+                    help="workspace registry JSON written by tenant run")
+    sp.add_argument("--tenant", default=None)
+    sp.add_argument("--workspace", default=None)
+    sp.add_argument("--principal", default=None,
+                    help="actor whose audit:read decides whether audit is shown")
+    sp.add_argument("--audit-limit", type=int, default=20, dest="audit_limit",
+                    help="how many recent audit events to return (default 20)")
+    sp.set_defaults(fn=cmd_tenant)
+
+    s = sub.add_parser("serve", help="serve a read-only run panel on loopback, for a host UI")
+    s.add_argument("--host", default=runstore.DEFAULT_HTTP_HOST)
+    s.add_argument("--port", type=int, default=runstore.DEFAULT_HTTP_PORT)
+    s.add_argument("--allow-remote", action="store_true",
+                   help="allow a non-loopback --host (the panel has no "
+                        "authentication and lists every run in the store)")
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("mcp", help="serve the tools over MCP (stdio by default; needs agentdescent[mcp])")
+    s.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio",
+                   help="stdio for hosts that spawn a subprocess (default); streamable-http "
+                        "for URL-only hosts such as Grok Bot, behind a tunnel (needs mcp>=1.8)")
+    # Host/port literals must match mcp.DEFAULT_HTTP_*; locked by
+    # test_cli_mcp_defaults_match_module. Cannot import mcp.py here (it imports cli).
+    s.add_argument("--host", default="127.0.0.1",
+                   help="streamable-http bind address (default 127.0.0.1)")
+    s.add_argument("--port", type=int, default=8000,
+                   help="streamable-http port (default 8000); exits 4 if it cannot be "
+                        "bound, e.g. already in use")
+    s.add_argument("--allow-remote", action="store_true",
+                   help="allow a non-loopback --host (the tools can start runs and write "
+                        "files); requires --http-token-env")
+    s.add_argument("--http-token-env", default=None, metavar="NAME",
+                   help="streamable-http: require `Authorization: Bearer <token>` on every "
+                        "request, with the token in the environment variable NAME (never on "
+                        "the command line); required with --allow-remote")
+    s.add_argument("--advanced", action="store_true",
+                   help="expose audit/meta/platform/experience/… MCP tools "
+                        "(default: Path A only — doctor/plan/start/status/show/apply/…; "
+                        "also AGENTDESCENT_MCP_ADVANCED=1)")
+    s.set_defaults(fn=cmd_mcp)
+
+    sub.metavar = "{" + ",".join(n for n in sub.choices if n not in _INTERNAL_COMMANDS) + "}"
+    _accept_json_after_verb(sub)
+    return p
+
+
+def _accept_json_after_verb(sub: "argparse._SubParsersAction") -> None:
+    """Let ``--json`` follow the verb as well as precede it (#513).
+
+    The top-level parser owns ``--json``; each leaf subcommand also gets one
+    whose default is SUPPRESS, so a flag written after the verb sets the same
+    ``json`` attribute and a missing one leaves the top-level value alone.
+    Subcommands that already declare ``--json`` keep their own definition.
+    """
+    for parser in dict.fromkeys(sub.choices.values()):
+        nested = [a for a in parser._actions
+                  if isinstance(a, argparse._SubParsersAction)]
+        if nested:
+            for n in nested:
+                _accept_json_after_verb(n)
+            continue
+        if "--json" in parser._option_string_actions:
+            continue
+        parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                            help="machine-readable output")
+
+
+#: Words that stand for "the newest run in the store" wherever a run id goes (#892, #896).
+LATEST_RUN_ALIASES = ("latest", "last")
+
+
+def resolve_run_id(run_id: Optional[str], *, store: Optional[str] = None
+                   ) -> Optional[str]:
+    """Map ``latest`` / ``last`` to the newest run id.
+
+    A real run directory named ``latest`` or ``last`` still wins. An empty
+    store raises :class:`~agentdescent.runstore.RunStoreError` with the same
+    wording the CLI uses (#892), so MCP tools and payload helpers match
+    ``agentdescent show latest`` instead of looking up a folder named
+    ``latest`` (#896). Any other value, including ``None``, is returned
+    unchanged.
+    """
+    if not isinstance(run_id, str) or run_id.lower() not in LATEST_RUN_ALIASES:
+        return run_id
+    if os.path.isdir(os.path.join(runstore.store_path(store), run_id)):
+        return run_id
+    runs = runstore.list_runs(store=store)
+    if not runs:
+        raise runstore.RunStoreError(
+            f"no runs under {runstore.store_path(store)} yet, so {run_id!r} has nothing "
+            "to point at; start one with `agentdescent demo` or `agentdescent evolve`")
+    return runs[0].run_id
+
+
+def _resolve_latest_run(a: argparse.Namespace) -> None:
+    """Swap ``latest`` / ``last`` for the newest run id on run-id commands.
+
+    A real run directory with that name still wins, and an empty store is a
+    clear error rather than ``no run 'latest'``.
+    """
+    if getattr(a, "fn", None) not in (cmd_status, cmd_watch, cmd_show, cmd_apply,
+                                      cmd_cancel, cmd_resume, cmd_diagnose):
+        return
+    rid = getattr(a, "run_id", None)
+    resolved = resolve_run_id(rid, store=getattr(a, "store", None))
+    if resolved is not None:
+        a.run_id = resolved
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    _CliParser.json_errors = _wants_json(args)
+    try:
+        a = build_parser().parse_args(args)
+    finally:
+        _CliParser.json_errors = False
+    try:
+        _resolve_latest_run(a)
+        return a.fn(a)
+    except (SpecError, runstore.RunStoreError) as e:
+        # `--json` callers get the same object `_spec_error` prints (#658).
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

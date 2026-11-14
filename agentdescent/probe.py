@@ -43,6 +43,7 @@ _SKIPPED_REFS = {
 }
 
 #: ``claude`` speaks the Anthropic SDK, which has no endpoint/stream knobs.
+_CLAUDE_REFS = {"claude", "agentdescent.agents:claude"}
 _NOT_FOR_CLAUDE = {"base_url_env", "default_base_url", "stream"}
 
 #: A dead endpoint must not hold ``plan`` for the adapter's full run timeout.
@@ -77,10 +78,10 @@ def _completion(ref: str, block: Mapping[str, Any]) -> Completion:
     """The adapter this spec would run, built exactly as the engine builds it."""
     adapter = _MODEL_ADAPTERS[ref]
     kwargs = {k: v for k, v in block.items() if k != "ref"}
-    if adapter is claude:
-        kwargs = {k: v for k, v in kwargs.items() if k not in _NOT_FOR_CLAUDE}
-        kwargs.pop("model", None)
-        return adapter(**kwargs)
+    if ref in _CLAUDE_REFS:
+        # `claude(model=…)` takes the model as a keyword, so it stays in kwargs:
+        # probing a different model than the run would use answers nothing.
+        return adapter(**{k: v for k, v in kwargs.items() if k not in _NOT_FOR_CLAUDE})
     model = kwargs.pop("model", None)
     if not isinstance(model, str) or not model:
         raise ValueError("the spec names no model for this agent")

@@ -186,3 +186,27 @@ def test_the_json_form_carries_the_probe_only_when_asked(tmp_path, endpoint):
     rows = payload["probe"]["rows"]
     assert [row["state"] for row in rows] == ["ok"]
     assert rows[0]["field"] == "agent"
+
+
+def test_the_probe_asks_the_same_model_the_run_would(tmp_path, monkeypatch, endpoint):
+    """A probe that swaps the model (or drops it) answers a different question."""
+    import agentdescent.probe as probe_module
+
+    seen = {}
+
+    def fake_claude(**kwargs):
+        seen.update(kwargs)
+        return lambda prompt: "ok"
+
+    monkeypatch.setitem(probe_module._MODEL_ADAPTERS, "claude", fake_claude)
+    endpoint(code=200)
+    spec = _write_spec(tmp_path, agent={"ref": "claude", "model": "claude-x",
+                                        "api_key_env": "FAKE_KEY", "max_tokens": 8},
+                       reflect={"ref": "echo"})
+
+    code, out, err = _run(["plan", spec, "--probe"])
+
+    assert code == 0, (out, err)
+    assert seen["model"] == "claude-x", seen
+    assert "api_key_env" not in seen or seen["api_key_env"] == "FAKE_KEY"
+    assert "stream" not in seen and "default_base_url" not in seen

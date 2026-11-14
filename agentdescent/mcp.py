@@ -36,10 +36,11 @@ import secrets
 from typing import Annotated, Any, Dict, Optional, Sequence, Tuple
 
 from . import __version__, runstore
-from .cli import (NESTED_ENV, apply_with_target, demo_payload, doctor_report,
-                 plan_payload, require_cli_on_path, require_resume_host_on_path,
-                 require_resume_not_quota_exhausted, require_resume_not_solved,
-                 resolve_run_id, show_payload, status_payload)
+from .cli import (NESTED_ENV, NESTED_REFUSAL, apply_with_target, demo_payload,
+                 doctor_report, nested_refusal, plan_payload, require_cli_on_path,
+                 require_resume_host_on_path, require_resume_not_quota_exhausted,
+                 require_resume_not_solved, resolve_run_id, show_payload,
+                 status_payload)
 from .evolvespec import (EvolveSpec, SpecError, budget_round_overshoot_warning,
                          compose, estimate)
 
@@ -651,8 +652,9 @@ class Tools:
             # launch, and the grader-visible refused response must not become
             # ok:false just because the proposed CLI is absent here (#351).
             return {"ok": True, "run_id": "nested-stub", "state": "refused", "nested": True,
-                    "note": f"{NESTED_ENV} is set: this session is itself a worker of an "
-                            "evolution run, so no nested run was started."}
+                    # The same named reason and sentence the CLI refuses with, so a
+                    # host branches on one contract instead of two wordings (#963).
+                    "reason": NESTED_REFUSAL, "note": nested_refusal()}
         try:
             # Same gate as plan / CLI evolve: missing CLI must not return ok/running (#346).
             # After the nested stub above so #346 stays fail-closed for real starts.

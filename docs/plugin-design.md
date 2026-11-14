@@ -589,7 +589,9 @@ Two guards keep this from folding in on itself:
   `AGENTDESCENT_NESTED=1`. The MCP server's `start` refuses under it and
   returns a stub run id, so the transcript still shows *that* the host called
   `start` (which the grader wants) without a nested evolution actually
-  running; `doctor` reports nested mode explicitly.
+  running; the CLI refuses too — `evolve` exits 2 with `reason: nested-run`
+  before it reads the spec or creates a run — and `doctor` reports nested mode
+  plus the guard (`nested`, `nested_guard`).
 * **The controller never hot-swaps itself.** A self-evolved plugin reaches the
   user's real installation only through `apply`, which is a human decision on
   a diff, after an L1 oracle gate, with a backup. The loop can improve its own

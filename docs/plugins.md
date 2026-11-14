@@ -779,11 +779,13 @@ Three things are stricter than for the other kinds:
 * **Recursion.** Every worker runs with `AGENTDESCENT_NESTED=1`. When the
   plugin being evolved is the one that hosts this MCP server, the worker's
   `start` returns a stub — the transcript still shows the host *called* it,
-  which is what a grader looks for, and no nested run starts. A self-evolved
-  plugin reaches your real installation only through `apply`, a human decision
-  on a diff after the L1 oracle, with a backup: the loop can improve its own
-  skill text and tool descriptions, and it cannot change what is running while
-  it runs.
+  which is what a grader looks for, and no nested run starts. The CLI refuses
+  the same way: `agentdescent evolve` inside a worker exits 2 with
+  `reason: nested-run` before it reads the spec or creates a run, and `doctor`
+  reports `nested` and `nested_guard: nested-run`. A self-evolved plugin reaches
+  your real installation only through `apply`, a human decision on a diff after
+  the L1 oracle, with a backup: the loop can improve its own skill text and tool
+  descriptions, and it cannot change what is running while it runs.
 
 What "a better plugin" means is up to the dataset. Three task shapes are worth
 having: **capability tasks** (what the plugin adds — gold is the answer),

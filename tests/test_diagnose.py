@@ -205,3 +205,21 @@ def test_next_steps_name_the_resolved_run_id(monkeypatch, payload, verdict,
     for command in commands:
         assert command in text
     assert "latest" not in text
+
+
+def test_noise_floor_is_surfaced_and_a_gain_inside_it_stays_noise(monkeypatch):
+    def flat(value):
+        return {f"t{i}": value for i in range(8)}
+
+    _patch(monkeypatch, {
+        "final_reward": 0.55, "initial_reward": 0.5,
+        "outcomes": {"committed": 1},
+        "baseline_runs": [flat(0.45), flat(0.5), flat(0.55)],
+        "candidate_runs": [flat(0.55)],
+        "samples": [{"output": "x", "gold": "y", "reward": 0.0}]})
+    report = diagnose_payload("r")
+    noise = report.evidence["noise"]
+    assert noise["distinguishable"] is False
+    assert noise["verdict"] == "not distinguishable from noise"
+    assert noise["noise_floor"][0] < noise["noise_floor"][1]
+    assert "variance" in noise and "gain_over_noise" in noise

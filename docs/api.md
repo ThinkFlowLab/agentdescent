@@ -3666,7 +3666,10 @@ build_trust_evidence(
     artifact_changed: Optional[bool] = None,
     alpha: float = 0.05,
     seed: int = 0,
-    min_effect: float = 0.0
+    min_effect: float = 0.0,
+    baseline_runs: Optional[Sequence[Mapping[str, float]]] = None,
+    candidate_runs: Optional[Sequence[Mapping[str, float]]] = None,
+    noise_repeats: int = 3
 ) -> TrustEvidence
 ```
 

@@ -52,11 +52,13 @@ reject or rollback exits 1.
     "before": {"guardrails": {"policy": 10, "tool_mediation": 20},
                "permissions": {"plugin:demo": ["tool:run"]},
                "actions": ["tool:run"],
-               "decision_records": {"policy->tool_mediation": "record-1"}},
+               "decision_records": {"policy->tool_mediation": "record-1",
+                                    "permission:plugin:demo": "record-2"}},
     "after": {"guardrails": {"policy": 10, "tool_mediation": 20},
               "permissions": {"plugin:demo": ["tool:run"]},
               "actions": ["tool:run"],
-              "decision_records": {"policy->tool_mediation": "record-1"}}
+              "decision_records": {"policy->tool_mediation": "record-1",
+                                   "permission:plugin:demo": "record-2"}}
   }
 }
 ```
@@ -79,7 +81,10 @@ reject or rollback exits 1.
   object to introspect; when present the pair reaches `govern_harness_change`,
   so a reordered guardrail path or a dropped allow rule rejects before proof
   and promotion. Omit it and the check is skipped, which `plan` shows as
-  `"integrity": null`.
+  `"integrity": null`. Every enforced relationship needs an entry in
+  `decision_records` — one per ordered guardrail pair (`policy->tool_mediation`)
+  and one per permission (`permission:<plugin>`) — because a missing record is
+  itself a violation; the example above is the minimum that passes.
 
 ## Fail-closed semantics
 

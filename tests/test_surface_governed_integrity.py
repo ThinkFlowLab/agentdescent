@@ -8,6 +8,8 @@ dataclasses, and a spec that cannot carry the pair is refused rather than
 silently skipping the check.
 """
 import json
+import re
+from pathlib import Path
 
 import pytest
 
@@ -115,3 +117,37 @@ def test_a_malformed_pair_is_a_surface_error_not_a_skipped_check(tmp_path, capsy
     payload = _json_out(capsys)
     assert payload["ok"] is False
     assert "integrity" in payload["error"]
+
+
+def _documented_pair():
+    """The `integrity` example the docs ship, so the page cannot drift (#1062 review)."""
+    page = Path(__file__).resolve().parents[1] / "docs" / "governed-harness.md"
+    for block in re.findall(r"```json\n(.*?)```", page.read_text(encoding="utf-8"), re.S):
+        data = json.loads(block)
+        if "integrity" in data:
+            return data["integrity"]
+    raise AssertionError("docs/governed-harness.md no longer shows an integrity example")
+
+
+def test_the_documented_integrity_example_passes_its_own_check():
+    from agentdescent.harness_integrity import HarnessSnapshot, check_harness_integrity
+
+    pair = _documented_pair()
+    report = check_harness_integrity(HarnessSnapshot(**pair["before"]),
+                                     HarnessSnapshot(**pair["after"]))
+
+    assert report.ok, report.reason
+
+
+def test_a_missing_decision_record_is_what_the_docs_example_rules_out():
+    from agentdescent.harness_integrity import HarnessSnapshot, check_harness_integrity
+
+    pair = _documented_pair()
+    after = json.loads(json.dumps(pair["after"]))
+    del after["decision_records"]["permission:plugin:demo"]
+
+    report = check_harness_integrity(HarnessSnapshot(**pair["before"]),
+                                     HarnessSnapshot(**after))
+
+    assert report.ok is False
+    assert "decision_path:permission:plugin:demo" in report.reason

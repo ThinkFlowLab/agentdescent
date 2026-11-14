@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .conformal import ConformalReport
+from .cost import Cost
 from .evalops import EvalResult
 from .goodhart import GoodhartReport
 from .metamorphic import MetamorphicReport
@@ -144,6 +145,11 @@ class PromotionRules:
     require_verifier: bool = False
     require_verifier_admission: bool = False
     require_calibration: bool = False
+    #: Cost evidence (#945). ``False`` is the pre-existing decision: a caller
+    #: that supplies no cost keeps the same hash and verdict. With ``True``, a
+    #: request without a measured cost defers -- it never prices an unknown diff
+    #: at zero.
+    require_cost: bool = False
     allow_contaminated: bool = False
     min_effect: float = 0.0
     min_tasks: int = 2
@@ -160,7 +166,7 @@ class PromotionRules:
                      "require_approval", "require_goodhart",
                      "require_metamorphic", "require_verifier",
                      "require_verifier_admission", "require_calibration",
-                     "allow_contaminated"):
+                     "require_cost", "allow_contaminated"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
         if _finite(self.min_effect, "min_effect") < 0:
@@ -185,7 +191,7 @@ def _policy_payload(policy: "PromotionRules") -> Dict[str, Any]:
     """
     payload = asdict(policy)
     for name in ("max_review_cost", "max_review_minutes",
-                 "require_verifier_admission"):
+                 "require_verifier_admission", "require_cost"):
         if not getattr(policy, name):
             payload.pop(name, None)
     return payload
@@ -293,6 +299,10 @@ class PromotionRequest:
     verifier: Optional[EnsembleReport] = None
     calibration: Optional[CalibrationReport] = None
     review_cost: Optional[ReviewCost] = None
+    #: What producing this candidate's diff cost (#945). ``None`` is "not
+    #: measured"; an all-``None`` :class:`~agentdescent.cost.Cost` is "measured,
+    #: but nothing usable" -- both defer under ``require_cost``.
+    cost: Optional[Cost] = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -313,6 +323,8 @@ class PromotionRequest:
         if self.review_cost is not None and not isinstance(
                 self.review_cost, ReviewCost):
             raise TypeError("review_cost must be a ReviewCost or None")
+        if self.cost is not None and not isinstance(self.cost, Cost):
+            raise TypeError("cost must be a Cost or None")
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
 
@@ -381,6 +393,8 @@ def _evidence(request: PromotionRequest) -> Dict[str, Any]:
         evidence["verifier"] = request.verifier.to_dict()
     if request.calibration is not None:
         evidence["calibration"] = asdict(request.calibration)
+    if request.cost is not None:
+        evidence["cost"] = request.cost.to_dict()
     if request.review_cost is not None:
         # Only when a caller measured it: the default decision, its evidence
         # hash and its decision hash stay exactly what they were before #950.
@@ -582,6 +596,15 @@ def promote(request: PromotionRequest,
                 f"review cost {cost.cost:.1f} > max_review_cost "
                 f"{policy.max_review_cost:.1f}: defer and batch it with other "
                 f"promotions")
+
+    if request.cost is None:
+        if policy.require_cost:
+            missing.append("cost")
+    elif not request.cost.known and policy.require_cost:
+        # Present but unpriced (no calls/tokens/seconds/USD). A requirement for
+        # cost data is not satisfied by an empty block, and it is not a
+        # rejection: the caller can measure it and re-ask (#945).
+        missing.append("cost (present but unknown)")
 
     if policy.require_risk and request.risk is None:
         missing.append("risk")

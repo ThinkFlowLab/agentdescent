@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-617 public names across 122 modules.
+622 public names across 123 modules.
 
 ---
 
@@ -3436,6 +3436,7 @@ PromotionRequest(
     verifier: Optional[EnsembleReport] = None,
     calibration: Optional[CalibrationReport] = None,
     review_cost: Optional[ReviewCost] = None,
+    cost: Optional[Cost] = None,
     metadata: Mapping[str, Any] = <factory>
 ) -> None
 ```
@@ -3460,6 +3461,7 @@ PromotionRules(
     require_verifier: bool = False,
     require_verifier_admission: bool = False,
     require_calibration: bool = False,
+    require_cost: bool = False,
     allow_contaminated: bool = False,
     min_effect: float = 0.0,
     min_tasks: int = 2,
@@ -5335,6 +5337,14 @@ Bounds and hooks for the multi-session loop.
 
 The sessions run, the best reward and why the loop stopped.
 
+### `CostPolicy`
+
+Acceptance wrapper that prices the candidate before committing it.
+
+### `CostReport`
+
+Cost per accepted diff and per point of gain, from decision records.
+
 ### `CuriousReplayReport`
 
 What `curious_replay_evolve` did: the weights, the gains on the still-curious vs mastered past, and the value produced.
@@ -5914,6 +5924,18 @@ Fraction of validation n-grams that also occur in the training text.
 ### `cost_adjusted_reward`
 
 `quality - lam * (cost / baseline)`, clipped to `[0, 1]`.
+
+### `cost_efficiency`
+
+`quality_per_cost`: held-out delta per 1k tokens or per USD.
+
+### `cost_report`
+
+Aggregate per-decision records into the report the issue asks for.
+
+### `cost_status`
+
+Classify `value` against `reference`: improved/neutral/regressed/unknown.
 
 ### `curiosity_weight`
 

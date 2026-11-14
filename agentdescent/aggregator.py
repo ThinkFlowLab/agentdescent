@@ -1513,6 +1513,9 @@ class Aggregator:
         # names which card failed and why -- and a batch that is only rejected
         # cards reports ``critic-rejected`` with the reasons.
         if self.screen_policy is not None:
+            begin_batch = getattr(self.screen_policy, "begin_batch", None)
+            if callable(begin_batch):
+                begin_batch(artifact)
             kept: List[EvidenceCard] = []
             rejected_screen: List[Tuple[EvidenceCard, str]] = []
             for card in cards:

@@ -55,7 +55,7 @@ from .governance import FROZEN_IDS, GovernanceError, assert_mutable
 from .ledger import Ledger, LedgerFailure
 from .metrics import Meter, measured
 from .pipeline import EarlyStop, FirstError, WorkerHealth, describe as _describe
-from .policies import FusionTrial, Policies, policy_digest
+from .policies import FusionTrial, Policies, Proposal, policy_digest
 from .sampling import RoundRobin, TaskSampler
 from .selection import SingleHead
 from .scheduler import AuditScheduler
@@ -284,28 +284,37 @@ class RewardContractError(ContractError, ValueError):
     is meaningless) from a *backend* failure (stop, keep partial results)."""
 
 
-def _checked_proposal(value, task: "Task"):
-    """Normalise ``propose`` output to a list of proposal strings (#808).
+def _proposal_text(value):
+    """Keep attribution metadata out of the strategy's proposal parser."""
+    if isinstance(value, Proposal):
+        if not isinstance(value.text, str) or not isinstance(value.proposal_id, str):
+            raise ProposalContractError("Proposal.text and proposal_id must be strings")
+        return value.text
+    return value
 
-    A callable may return ``None``, one string, or a sequence of strings. A
-    ``ProposalPolicy`` that samples k variants returns a sequence; each entry
-    becomes its own evidence card. Non-text values are still a contract error.
+
+def _checked_proposal(value, task: "Task"):
+    """Normalise ``propose`` output without discarding proposal identities.
+
+    A callable may return ``None``, one string or Proposal, or a sequence of
+    either. Each entry becomes its own evidence card. Other values are still
+    a contract error.
     """
     if value is None:
         return []
-    if isinstance(value, str):
-        return [value] if value else []
+    if isinstance(value, (str, Proposal)):
+        return [value] if _proposal_text(value) else []
     if isinstance(value, (list, tuple)):
         out = []
         for i, item in enumerate(value):
             if item is None:
                 continue
-            if not isinstance(item, str):
+            if not isinstance(item, (str, Proposal)):
                 raise ProposalContractError(
                     f"propose(task={task.id!r}, ...) returned a sequence whose "
                     f"item {i} is {type(item).__name__} ({item!r:.40}); each "
                     "proposal must be a string")
-            if item:
+            if _proposal_text(item):
                 out.append(item)
         return out
     raise ProposalContractError(
@@ -977,10 +986,10 @@ def _call_aggregator_factory(factory, ledger, verifier, audit, config, staleness
 def _propose_via_policy(policy, settled_reader=None):
     """Adapt a `ProposalPolicy` to the engine's propose callable (#808).
 
-    The Protocol returns ``Sequence[str]`` and ``ProposalContext.k`` says how
+    The Protocol returns strings or Proposals and ``ProposalContext.k`` says how
     many variants the caller wants. The adapter passes ``k`` (from
-    ``getattr(policy, "k", 1)``) and returns every non-empty string the policy
-    produced — one string for the single-proposal case, a list when ``k > 1`` —
+    ``getattr(policy, "k", 1)``) and returns every non-empty proposal the policy
+    produced — one item for the single-proposal case, a list when ``k > 1`` —
     so the worker can ingest one evidence card per proposal. Truncating would
     make a k-sampling algorithm look like it ran when only a fraction did.
 
@@ -1009,11 +1018,11 @@ def _propose_via_policy(policy, settled_reader=None):
         for i, item in enumerate(out):
             if item is None:
                 continue
-            if not isinstance(item, str):
+            if not isinstance(item, (str, Proposal)):
                 raise ProposalContractError(
                     f"ProposalPolicy.propose returned a non-string at index {i} "
                     f"({type(item).__name__})")
-            if item:
+            if _proposal_text(item):
                 cleaned.append(item)
         if not cleaned:
             return None
@@ -4300,7 +4309,8 @@ def evolve(
             for p_i, proposal in enumerate(proposals):
                 author = (f"w{unit.worker}" if len(proposals) == 1
                           else f"w{unit.worker}/p{p_i}")
-                diff = strat.to_diff(mine.state, proposal, author, mine_v, aid)
+                text = _proposal_text(proposal)
+                diff = strat.to_diff(mine.state, text, author, mine_v, aid)
                 if diff is None:
                     continue
                 # Tensor parallelism means each worker owns a disjoint *section* of the
@@ -4363,6 +4373,8 @@ def evolve(
                     diff=diff, base_version={aid: mine_v}, touched=[aid],
                     before_after_delta=delta, trajectory_refs=[task],
                     branch=mine_branch,
+                    proposal_id=(proposal.proposal_id
+                                 if isinstance(proposal, Proposal) else ""),
                     # The records that justify this card, when recording is on: the
                     # rollout that produced the diff and the self-verify re-run.
                     # Each entry is None-safe -- None means "recording off / dedupe /

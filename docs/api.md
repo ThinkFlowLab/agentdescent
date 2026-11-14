@@ -1304,7 +1304,8 @@ EvidenceCard(
     advantage: Optional[float] = None,
     cost_tokens: int = 0,
     cost_wallclock: float = 0.0,
-    branch: Optional[str] = None
+    branch: Optional[str] = None,
+    proposal_id: str = ''
 ) -> None
 ```
 

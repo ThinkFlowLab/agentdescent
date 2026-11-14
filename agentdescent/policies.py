@@ -40,7 +40,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from typing import (
-    TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence, Tuple,
+    TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union,
     runtime_checkable,
 )
 
@@ -66,6 +66,7 @@ __all__ = [
     "Policies",
     "Promotion",
     "PromotionPolicy",
+    "Proposal",
     "ProposalContext",
     "ProposalPolicy",
     "Sandbox",
@@ -264,6 +265,19 @@ class Promotion:
 
 
 @dataclass(frozen=True)
+class Proposal:
+    """Proposal text with an identity carried to its evidence card.
+
+    The identity is metadata, not part of the artifact or its content hash.
+    Distinct model calls may propose identical text and still need separate
+    attribution when the candidate is evaluated.
+    """
+
+    text: str
+    proposal_id: str
+
+
+@dataclass(frozen=True)
 class ProposalContext:
     """What a :class:`ProposalPolicy` is given for one rollout.
 
@@ -283,8 +297,8 @@ class ProposalContext:
     base_version: int = 0
     #: How many proposals the caller would like. Under ``evolve()`` the
     #: adapter sets this from ``getattr(policy, "k", 1)`` and ingests every
-    #: returned string as its own evidence card (#808). A policy that samples
-    #: k variants should set ``.k`` and return up to that many strings.
+    #: returned string or Proposal as its own evidence card (#808). A policy
+    #: that samples k variants should set ``.k`` and return up to that many.
     k: int = 1
     #: Proposals this worker already made, newest last. Empty unless the policy
     #: asked to be given them.
@@ -306,7 +320,7 @@ class ProposalContext:
 class ProposalPolicy(Protocol):
     """How a rollout becomes candidate changes."""
 
-    def propose(self, ctx: ProposalContext) -> Sequence[str]: ...
+    def propose(self, ctx: ProposalContext) -> Sequence[Union[str, Proposal]]: ...
 
 
 @runtime_checkable
@@ -323,6 +337,10 @@ class ScreenPolicy(Protocol):
     screening, see ``agentdescent/algorithms/rrsi/``), and it is deliberately a *card* gate:
     screening after a candidate is built is too late, and screening the whole
     batch loses which card failed and why.
+
+    An optional ``begin_batch(artifact)`` hook receives the current branch's
+    artifact before the cards are screened, on the merger thread. It may reset
+    batch-local state or render candidates; it is not a required protocol method.
     """
 
     def screen(self, card: "EvidenceCard") -> Optional[str]: ...

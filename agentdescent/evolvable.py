@@ -239,6 +239,9 @@ class EvidenceCard:
     #: The ledger branch this diff was proposed against. ``None`` means ``dev``.
     #: A multi-head run sets this so the aggregator commits back to the same branch.
     branch: Optional[str] = None
+    #: Optional proposal identity for routing feedback; empty for legacy strings.
+    #: Kept separate from the diff identity, which only describes its content.
+    proposal_id: str = ""
 
     def rebased_onto(self, head: VersionVector) -> "EvidenceCard":
         """Return a copy whose base is advanced to ``head`` for touched keys.

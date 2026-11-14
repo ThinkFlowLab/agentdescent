@@ -47,7 +47,17 @@ reject or rollback exits 1.
   "contaminated": false,
   "risk": 0.05,
   "rollback_current": {"harness/f.py": "new"},
-  "rollback_previous": {"harness/f.py": "old"}
+  "rollback_previous": {"harness/f.py": "old"},
+  "integrity": {
+    "before": {"guardrails": {"policy": 10, "tool_mediation": 20},
+               "permissions": {"plugin:demo": ["tool:run"]},
+               "actions": ["tool:run"],
+               "decision_records": {"policy->tool_mediation": "record-1"}},
+    "after": {"guardrails": {"policy": 10, "tool_mediation": 20},
+              "permissions": {"plugin:demo": ["tool:run"]},
+              "actions": ["tool:run"],
+              "decision_records": {"policy->tool_mediation": "record-1"}}
+  }
 }
 ```
 
@@ -63,10 +73,21 @@ reject or rollback exits 1.
 - `before`/`after` are task -> score objects or JSON paths.
 - `rollback_current`/`rollback_previous` are mappings or JSON paths; the report
   carries the non-destructive `rollback_plan`.
+- `integrity` is the composition pair — `before`/`after` `HarnessSnapshot`
+  objects, plus optional `declared` action changes and `required_order`. The
+  caller supplies it because the package holds no live guardrail or permission
+  object to introspect; when present the pair reaches `govern_harness_change`,
+  so a reordered guardrail path or a dropped allow rule rejects before proof
+  and promotion. Omit it and the check is skipped, which `plan` shows as
+  `"integrity": null`.
 
 ## Fail-closed semantics
 
 - A denied capability/syntax check rejects before proof or approval.
+- A broken composition (`integrity` supplied) rejects before proof: a dropped
+  enforcement point, a reordered guardrail path, a dropped allow rule, a
+  missing decision record or an undeclared action-set change is named in the
+  report's `detail` and `integrity.violations`.
 - A failed proof rejects and never reaches promotion.
 - A pending or rejected human approval never reaches promotion.
 - A canary rollback wins over a failed eval and is reported as rollback.

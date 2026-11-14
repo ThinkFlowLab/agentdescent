@@ -3,12 +3,15 @@
 `_commit` wrote `<name>.json` with `Path.write_text`, which follows a link at
 that leaf, and `promote` read and `rmtree`d `<to>` before the sidecar was
 written -- so at live main a link under the store overwrote bytes outside
-`root`. Each shape is refused before the write, the operator's link survives,
-the target keeps its bytes, and no staging directory is left behind.
+`root`; a hardlink shares the inode, so the outside bytes were truncated even
+when the store refused to follow anything. Each symlink shape is refused before
+the write, a hardlink is replaced rather than written through, the operator's
+link survives, the target keeps its bytes, and no staging file is left behind.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -31,7 +34,7 @@ def _staging(artifact: Path) -> list[Path]:
 
 
 class TestALinkAtAWrittenLeafIsRefused:
-    """The four link shapes from #1041: one refusal each, no outside write."""
+    """The six link shapes from #1041: symlinks refused, hardlinks replaced."""
 
     def test_promote_refuses_a_link_at_the_sidecar(self, tmp_path: Path) -> None:
         store, _, keep = _store(tmp_path)
@@ -117,3 +120,35 @@ class TestALinkAtAWrittenLeafIsRefused:
 
         assert store.read_tree("img", revision) == {"a.txt": b"A\n"}
         assert (real / "img" / f"{revision}.json").is_file()
+
+    def test_promote_leaves_a_hardlinked_sidecar_alone(self, tmp_path: Path) -> None:
+        """A hardlink shares the inode, so a followed write cannot be undone."""
+        store, _, keep = _store(tmp_path)
+        revision = store.write_tree("img", {"a.txt": b"A\n"}, parent=None)
+        artifact = tmp_path / "store" / "img"
+        os.link(keep, artifact / "prod.json")
+        assert keep.stat().st_nlink == 2
+
+        store.promote("img", revision, to="prod")
+
+        assert keep.read_bytes() == OUTSIDE
+        assert keep.stat().st_nlink == 1
+        assert store.read_tree("img", "prod") == {"a.txt": b"A\n"}
+        assert _staging(artifact) == []
+
+    def test_write_tree_leaves_a_hardlinked_sidecar_alone(self, tmp_path: Path) -> None:
+        store, _, keep = _store(tmp_path)
+        # The revision name is derived from the content, so a scratch store
+        # gives the same one this call would write.
+        revision = FileArtifactStore(tmp_path / "scratch").write_tree("img", {"a.txt": b"A\n"})
+        artifact = tmp_path / "store" / "img"
+        artifact.mkdir(parents=True)
+        os.link(keep, artifact / f"{revision}.json")
+        assert keep.stat().st_nlink == 2
+
+        assert store.write_tree("img", {"a.txt": b"A\n"}) == revision
+
+        assert keep.read_bytes() == OUTSIDE
+        assert keep.stat().st_nlink == 1
+        assert store.read_tree("img", revision) == {"a.txt": b"A\n"}
+        assert _staging(artifact) == []

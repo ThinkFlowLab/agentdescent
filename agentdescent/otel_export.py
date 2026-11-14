@@ -12,13 +12,13 @@ piece between them and a collector:
   dashboard reads one set of names whichever export it consumes;
 - :func:`exporter_from_env` is the switch, and it is **off by default**: with no
   ``OTEL_EXPORTER_OTLP_ENDPOINT`` it returns ``None`` and nothing is exported;
-- :class:`OtlpExporter` is the only place the ``[otel]`` extra is imported, on
-  the first export: importing this module and constructing the exporter both
-  work without the extra, and a missing extra raises the install line on the
-  first span rather than at configuration time. Each instance owns its tracer
-  and meter providers, because the SDK keeps the first provider installed
-  process-wide: a second exporter must not export through the first one's
-  endpoint and headers;
+- :class:`OtlpExporter` is the only place the ``[otel]`` extra is imported, and
+  it imports it at construction: importing this module stays standard-library
+  only, constructing the exporter raises the install line when the extra is
+  missing, and the endpoint is checked before a single provider is built. Each
+  instance owns its tracer and meter providers, because the SDK keeps the first
+  provider installed process-wide: a second exporter must not export through the
+  first one's endpoint and headers;
 - :meth:`OtlpExporter.force_flush` and :meth:`OtlpExporter.shutdown` touch only
   this instance. The SDK batches spans (5 s) and exports metrics on an interval
   (60 s), so without a flush a short process loses what it handed over.
@@ -33,9 +33,11 @@ response cannot be exported by accident.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, runtime_checkable
+from urllib.parse import urlsplit
 
 from .rsi_metrics import RSIMetrics
 
@@ -241,7 +243,7 @@ def exporter_from_env(environ: Optional[Mapping[str, str]] = None
             headers[key.strip()] = value.strip()
     service = str(env.get("OTEL_SERVICE_NAME") or "").strip()
     return OtlpExporter(endpoint, headers=headers,
-                        service_name=service or DEFAULT_SERVICE_NAME)
+                        service_name=service or DEFAULT_SERVICE_NAME, env=env)
 
 
 _OTEL_INSTALL_HINT = (
@@ -281,12 +283,64 @@ def _load_otel() -> Dict[str, Any]:
     }
 
 
-class OtlpExporter:
-    """OTLP/HTTP through the OpenTelemetry SDK, imported on the first export.
 
-    Importing this module and constructing this class need nothing extra; the
-    SDK is imported on the first :meth:`export_span`/:meth:`export_metric`, and
-    a missing extra raises the install line there.
+
+_INSECURE_ENV = "AGENTDESCENT_OTEL_ALLOW_INSECURE"
+
+
+def _is_loopback(host: str) -> bool:
+    """True for a literal loopback host, without resolving anything."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _endpoint_problem(endpoint: str, env: Optional[Mapping[str, str]] = None
+                      ) -> Optional[str]:
+    """Why *endpoint* is unusable, or ``None``. The value is never echoed."""
+    raw = str(endpoint).strip()
+    if not raw:
+        return "OTEL_EXPORTER_OTLP_ENDPOINT must not be empty"
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) URL"
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        return "OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) URL"
+    if "@" in parts.netloc:
+        return ("OTEL_EXPORTER_OTLP_ENDPOINT must not embed credentials; pass "
+                "them in OTEL_EXPORTER_OTLP_HEADERS instead")
+    if not parts.hostname:
+        return "OTEL_EXPORTER_OTLP_ENDPOINT must name a host"
+    if scheme == "http":
+        source = os.environ if env is None else env
+        allowed = str(source.get(_INSECURE_ENV) or "").strip() == "1"
+        if not allowed and not _is_loopback(parts.hostname):
+            return ("plain http is refused for a non-loopback collector: use "
+                    "https, or set " + _INSECURE_ENV + "=1 for a trusted "
+                    "private-network collector")
+    return None
+
+
+class OtlpExporter:
+    """OTLP/HTTP through the OpenTelemetry SDK, imported at construction.
+
+    Importing this module needs nothing extra; constructing this class imports
+    the SDK and raises the install line when it is missing, so a misconfigured
+    host learns at configuration time rather than after it has already handed
+    records over. The endpoint is validated first, and its value is never echoed
+    in the error.
+
+    Plain ``http://`` is accepted only for a literal loopback collector
+    (``localhost``, ``127.0.0.0/8``, ``::1``); anything else needs ``https`` or
+    the single named escape hatch ``AGENTDESCENT_OTEL_ALLOW_INSECURE=1`` for a
+    private-network collector. Credentials in the URL are refused outright --
+    they belong in ``OTEL_EXPORTER_OTLP_HEADERS``, and a userinfo URL would be
+    quoted by an HTTP client's error text.
 
     Each instance owns its tracer and meter providers. The SDK keeps the *first*
     provider installed process-wide, so a bridge that installed a global
@@ -299,14 +353,18 @@ class OtlpExporter:
     """
 
     def __init__(self, endpoint: str, *, headers: Optional[Mapping[str, str]] = None,
-                 service_name: str = DEFAULT_SERVICE_NAME) -> None:
-        endpoint = str(endpoint).strip()
-        if not endpoint.startswith(("http://", "https://")):
-            raise ValueError("OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) URL")
-        self.endpoint = endpoint.rstrip("/")
+                 service_name: str = DEFAULT_SERVICE_NAME,
+                 env: Optional[Mapping[str, str]] = None) -> None:
+        problem = _endpoint_problem(endpoint, env)
+        if problem is not None:
+            raise ValueError(problem)
+        self.endpoint = str(endpoint).strip().rstrip("/")
         self.headers = dict(headers or {})
         self.service_name = service_name
-        self._otel: Optional[Dict[str, Any]] = None
+        # Imported here, not on the first export: the docs promise an install
+        # error at configuration time, and a host that reaches the first span
+        # has already counted records it cannot deliver.
+        self._otel: Optional[Dict[str, Any]] = _load_otel()
         self._tracer_provider: Any = None
         self._meter_provider: Any = None
         self._tracer: Any = None
@@ -321,7 +379,7 @@ class OtlpExporter:
         """Build *this* instance's providers, once, on the first export."""
         if self._tracer_provider is not None:
             return
-        otel = _load_otel()          # raises the install line before any span
+        otel = self._otel if self._otel is not None else _load_otel()
         resource = otel["Resource"].create({"service.name": self.service_name})
         tracer_provider = otel["TracerProvider"](resource=resource)
         tracer_provider.add_span_processor(otel["BatchSpanProcessor"](

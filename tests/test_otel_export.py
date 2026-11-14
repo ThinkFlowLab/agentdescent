@@ -151,27 +151,64 @@ def test_the_exporter_is_off_unless_an_endpoint_is_configured() -> None:
     assert exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": ""}) is None
 
 
-def test_a_configured_endpoint_needs_the_extra_at_the_first_export() -> None:
-    """Construction succeeds without the extra; the install line arrives on the
-    first export, which is what `docs/metrics.md` says.
+def test_constructing_needs_the_extra_and_says_so(monkeypatch) -> None:
+    """The install line lands at construction, which is what `docs/metrics.md`
+    promises.
 
-    It fails here if the import moves back into construction, so this row pins
-    one branch instead of accepting whichever one the code happens to take.
+    A host that only learns at the first span has already counted records it
+    cannot deliver, so this row pins the fail-fast branch rather than accepting
+    whichever branch the code happens to take.
     """
-    try:                              # the same probe the exporter uses
-        otel_export._load_otel()
-    except ImportError:
-        pass
-    else:
-        pytest.skip("the [otel] extra is installed here")
+    def _missing() -> dict:
+        raise ImportError(
+            "OTLP export needs the optional extra: pip install 'agentdescent[otel]'")
 
-    exporter = exporter_from_env(
-        {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318"})
-    assert exporter is not None      # constructing needs no SDK import
+    monkeypatch.setattr(otel_export, "_load_otel", _missing)
     with pytest.raises(ImportError) as excinfo:
-        exporter.export_span(
-            ExportedSpan("agentdescent.round", {"run.id": "run-1"}, 1.0, 2.0))
+        otel_export.OtlpExporter("http://localhost:4318")
     assert "agentdescent[otel]" in str(excinfo.value)
+    with pytest.raises(ImportError):
+        exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example:4318"})
+
+
+def test_an_endpoint_with_credentials_is_refused_and_never_echoed() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        otel_export.OtlpExporter("https://user:s3cret@collector.example:4318")
+    message = str(excinfo.value)
+    assert "credentials" in message
+    assert "s3cret" not in message and "user:" not in message
+
+
+def test_plain_http_is_allowed_only_for_a_literal_loopback_host() -> None:
+    for allowed in ("http://localhost:4318", "http://127.0.0.1:4318",
+                    "http://[::1]:4318", "http://127.9.9.9:4318"):
+        assert otel_export._endpoint_problem(allowed) is None, allowed
+    for refused in ("http://collector.example:4318", "http://10.1.2.3:4318",
+                    "http://127.0.0.1.nip.io:4318"):
+        assert otel_export._endpoint_problem(refused) is not None, refused
+
+
+def test_the_one_named_escape_hatch_lets_a_private_collector_through(monkeypatch) -> None:
+    assert otel_export._endpoint_problem("http://10.1.2.3:4318") is not None
+    monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
+    exporter = otel_export.OtlpExporter(
+        "http://10.1.2.3:4318", env={"AGENTDESCENT_OTEL_ALLOW_INSECURE": "1"})
+    assert exporter.endpoint == "http://10.1.2.3:4318"
+    # The hatch is opt-in by name, not by a bare "not 0".
+    assert otel_export._endpoint_problem(
+        "http://10.1.2.3:4318", {"AGENTDESCENT_OTEL_ALLOW_INSECURE": "yes"}) is not None
+
+
+def test_exporter_from_env_applies_the_same_endpoint_rules(monkeypatch) -> None:
+    monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
+    with pytest.raises(ValueError):
+        exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example:4318"})
+    with pytest.raises(ValueError):
+        exporter_from_env({"OTEL_EXPORTER_OTLP_ENDPOINT": "https://u:p@collector.example:4318"})
+    assert exporter_from_env({
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example:4318"}) is not None
+    assert exporter_from_env({
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318"}) is not None
 
 
 def test_importing_the_bridge_does_not_pull_the_extra() -> None:
@@ -338,9 +375,9 @@ def test_two_exporters_do_not_share_a_provider(monkeypatch) -> None:
     providers, so a span written through one reaches only that one's tracer.
     """
     monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
-    first = otel_export.OtlpExporter("http://a.example:4318",
+    first = otel_export.OtlpExporter("https://a.example:4318",
                                      headers={"x-tenant": "a"})
-    second = otel_export.OtlpExporter("http://b.example:4318",
+    second = otel_export.OtlpExporter("https://b.example:4318",
                                       headers={"x-tenant": "b"})
 
     first.export_span(ExportedSpan("agentdescent.round", {"run.id": "a"},
@@ -354,13 +391,13 @@ def test_two_exporters_do_not_share_a_provider(monkeypatch) -> None:
     assert second._tracer.provider is second._tracer_provider
 
     assert first._tracer_provider.processors[0].exporter.endpoint == (
-        "http://a.example:4318/v1/traces")
+        "https://a.example:4318/v1/traces")
     assert second._tracer_provider.processors[0].exporter.endpoint == (
-        "http://b.example:4318/v1/traces")
+        "https://b.example:4318/v1/traces")
     assert first._meter_provider.readers[0].exporter.endpoint == (
-        "http://a.example:4318/v1/metrics")
+        "https://a.example:4318/v1/metrics")
     assert second._meter_provider.readers[0].exporter.endpoint == (
-        "http://b.example:4318/v1/metrics")
+        "https://b.example:4318/v1/metrics")
     assert second._tracer_provider.processors[0].exporter.headers == {
         "x-tenant": "b"}
 
@@ -372,8 +409,8 @@ def test_force_flush_and_shutdown_close_only_this_exporter(monkeypatch) -> None:
     """A short process loses the batch queue unless it flushes; one exporter
     shutting down must not close another host's providers."""
     monkeypatch.setattr(otel_export, "_load_otel", _fake_otel)
-    first = otel_export.OtlpExporter("http://a.example:4318")
-    second = otel_export.OtlpExporter("http://b.example:4318")
+    first = otel_export.OtlpExporter("https://a.example:4318")
+    second = otel_export.OtlpExporter("https://b.example:4318")
     span = ExportedSpan("agentdescent.round", {"run.id": "run-1"}, 1.0, 2.0)
     first.export_span(span)
     second.export_span(span)

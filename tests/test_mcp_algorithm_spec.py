@@ -4,11 +4,20 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agentdescent import cli
 from agentdescent.mcp import TOOL_DESCRIPTIONS, Tools
 
 _FLAGS = dict(model="deepseek-v4-flash",
               base_url="https://ark.cn-beijing.volces.com/api/coding/v3")
+
+
+@pytest.fixture(autouse=True)
+def _allow_tmp_writes(tmp_path, monkeypatch):
+    """Every spec in this module is written under ``tmp_path``; the default
+    allowlist is the checkout plus ``$AGENTDESCENT_HOME`` (#1018)."""
+    monkeypatch.setenv("AGENTDESCENT_SURFACE_WRITE_DIRS", str(tmp_path))
 
 
 def _prompt_and_cases(tmp_path: Path, n: int = 8):
@@ -123,3 +132,50 @@ def test_params_object_is_passed_through_not_re_split(tmp_path):
     r = t.algorithm_spec("gepa", str(prompt), str(cases),
                          params={" seed ": 4}, rounds=1, workers=1, **_FLAGS)
     assert r["ok"] is True and r["spec"]["algorithm"]["params"] == {"seed": 4}, r
+
+
+# --- the write allowlist applies here too (#1018) -------------------------
+#
+# Every other write tool preflights its destination through
+# ``Tools._check_write``; ``algorithm_spec`` wrote its spec wherever the caller
+# named, so a host that started the server with ``surface_write_dirs`` set could
+# still be made to write a spec outside those directories.
+
+def test_out_outside_the_allowlist_is_refused_and_writes_nothing(tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    prompt, cases = _prompt_and_cases(tmp_path)
+    out = tmp_path / "outside" / "spec.json"
+    tools = Tools(None, surface_write_dirs=(str(allowed),))
+    result = tools.algorithm_spec("gepa", str(prompt), str(cases),
+                                  out=str(out), **_FLAGS)
+    assert result["ok"] is False, result
+    assert "write allowlist" in result["error"]
+    assert not out.exists()
+    assert not out.parent.exists()
+
+
+def test_out_inside_the_allowlist_still_writes_and_plans(tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    prompt, cases = _prompt_and_cases(tmp_path)
+    out = allowed / "spec.json"
+    tools = Tools(None, surface_write_dirs=(str(allowed),))
+    result = tools.algorithm_spec("gepa", str(prompt), str(cases),
+                                  out=str(out), **_FLAGS)
+    assert result["ok"] is True, result
+    assert result["spec_path"] == str(out)
+    assert out.exists()
+    assert result["spec"]["algorithm"] == "gepa"
+    assert Tools(None).plan(result["spec"])["ok"] is True
+
+
+def test_default_out_beside_a_target_outside_the_allowlist_is_refused(tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    prompt, cases = _prompt_and_cases(tmp_path)
+    tools = Tools(None, surface_write_dirs=(str(allowed),))
+    result = tools.algorithm_spec("gepa", str(prompt), str(cases), **_FLAGS)
+    assert result["ok"] is False, result
+    assert "write allowlist" in result["error"]
+    assert not (tmp_path / "agentdescent.gepa.spec.json").exists()

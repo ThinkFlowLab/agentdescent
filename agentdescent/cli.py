@@ -2344,7 +2344,8 @@ def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
 
 def _print_plan(payload: Dict[str, Any], *, spec_path: str,
                 next_line: Optional[str] = None,
-                printed: Optional[set] = None) -> None:
+                printed: Optional[set] = None,
+                probe_lines: Optional[Sequence[str]] = None) -> None:
     """Print the human `plan` summary; warnings and the held-out note go to stderr.
 
     `payload` is exactly the object `--json` prints, so both surfaces carry the
@@ -2387,6 +2388,9 @@ def _print_plan(payload: Dict[str, Any], *, spec_path: str,
         lines.append(f"note: {line}")
     if len(other_notes) > 3:
         lines.append(f"note: (+{len(other_notes) - 3} more; --json lists every note)")
+    # The preflight (#1048) sits between the plan and the step it qualifies:
+    # `next:` stays the last line, so a reader who stops early still sees it.
+    lines.extend(probe_lines or ())
     lines.append(f"next: {next_line or f'agentdescent evolve {spec_path}'}")
     print("\n".join(lines))
 
@@ -2416,6 +2420,21 @@ def _apply_algorithm_flag(spec: EvolveSpec, a: argparse.Namespace) -> None:
                                         target=str(spec.target))
 
 
+def _probe_if_asked(a: argparse.Namespace,
+                    spec: EvolveSpec) -> Optional[Dict[str, Any]]:
+    """One minimal model call per agent/reflector, when ``--probe`` was passed (#1048).
+
+    ``plan`` promises to run nothing and spend nothing; the flag trades that for
+    one cheap call per model-backed agent, so an expired subscription or a
+    wrong model name is answered *before* ``evolve`` writes a run store entry.
+    """
+    if not getattr(a, "probe", False):
+        return None
+    from .probe import probe_payload
+
+    return probe_payload(spec)
+
+
 def cmd_plan(a: argparse.Namespace) -> int:
     try:
         # Loading sits inside the guard so an unreadable or malformed spec file
@@ -2438,6 +2457,9 @@ def cmd_plan(a: argparse.Namespace) -> int:
         # human `error: ...` line on stderr as a spec that does not compile (#553).
         print(f"error: {payload.get('error', 'plan failed')}", file=sys.stderr)
         return 2
+    probe = _probe_if_asked(a, spec) if payload.get("ok", True) else None
+    if probe is not None:
+        payload["probe"] = probe
     if a.json:
         _out(payload, as_json=True)
     else:
@@ -2450,8 +2472,16 @@ def cmd_plan(a: argparse.Namespace) -> int:
             next_line += f" --algorithm {a.algorithm}"
             for param in getattr(a, "param", None) or []:
                 next_line += f" --param {param}"
-        _print_plan(payload, spec_path=a.spec, next_line=next_line)
-    return 0 if payload.get("ok", True) else 2
+        from .probe import probe_lines as _probe_lines
+
+        _print_plan(payload, spec_path=a.spec, next_line=next_line,
+                    probe_lines=(_probe_lines(probe) if probe is not None else None))
+    if not payload.get("ok", True):
+        return 2
+    # A refused probe is a config answer, not a spec error: the same non-zero
+    # exit `evolve` would have taken on its first call, taken before the run
+    # store gained an entry (#1048).
+    return 0 if probe is None or probe.get("ok", True) else 1
 
 
 def _warn_unusable(spec: EvolveSpec) -> None:
@@ -4426,10 +4456,20 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
     stage = obj["_stage"]
     report = obj.get("_report") or []
     ok = bool(obj.get("ok", True))
+    probe = None
+    if getattr(a, "probe", False) and stage == "done" and ok:
+        # The same preflight `plan --probe` runs, on the spec this verb just
+        # wrote: one call, before the `evolve` it recommends (#1048).
+        probe = _probe_if_asked(a, load_spec(obj["spec_path"]))
+        obj["probe"] = probe
     if as_json:
         # Exactly one JSON object on stdout for success and error (#674).
         _out(_public(obj), as_json=True)
-        return 0 if ok else 2
+        if not ok:
+            return 2
+        # A host gates on this exit code before it starts the run, so a refused
+        # probe must not report success here either (#1048 review).
+        return 0 if probe is None or probe.get("ok", True) else 1
     if stage == "pre":
         print(f"error: {obj['error']}", file=sys.stderr)
         return 2
@@ -4459,13 +4499,17 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
         return 2
     # Same human form as `plan`: init's `wrote ...` lines above, then the plan
     # summary with `next:` last -- never the JSON document (#919).
-    _print_plan(payload, spec_path=out, next_line=obj["next"], printed=printed)
+    from .probe import probe_lines as _probe_lines
+
+    _print_plan(payload, spec_path=out, next_line=obj["next"], printed=printed,
+                probe_lines=(_probe_lines(probe) if probe is not None else None))
     calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
     if (getattr(a, "rounds", None) is None and getattr(a, "workers", None) is None
             and isinstance(calls, (int, float)) and calls > QUICK_TRIAL_CALLS):
         # The kind defaults plan a full run; name the one-command cheap trial (#707).
         print("      (for a quick trial: re-run with --rounds 1 --workers 1)")
-    return 0
+    # Same contract as `plan`: a refused probe exits non-zero before a run (#1048).
+    return 0 if probe is None or probe.get("ok", True) else 1
 
 
 #: Above this many planned agent calls, a flagless ``algorithms run`` names
@@ -5679,6 +5723,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="dollar budget you intend to pass to evolve (needs "
                         "--usd-per-call); warns when one round can overshoot it")
     s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.add_argument("--probe", action="store_true",
+                   help="send one minimal model call per agent/reflector, so a "
+                        "refused key/endpoint/model/subscription is answered "
+                        "before any run starts (default: runs nothing, spends "
+                        "nothing)")
     s.set_defaults(fn=cmd_plan)
 
     s = sub.add_parser("evolve", help="run a spec")
@@ -6011,6 +6060,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s2.add_argument("--usd-per-call", type=float, dest="usd_per_call",
                     help="optional dollar estimate for plan")
+    s2.add_argument("--probe", action="store_true",
+                    help="also send one minimal model call per agent/reflector "
+                         "before recommending `evolve` (default: no network)")
     s2.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                     help="machine-readable output")
     s2.set_defaults(fn=cmd_algorithms)

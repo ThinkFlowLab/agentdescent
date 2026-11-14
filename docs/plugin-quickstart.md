@@ -210,6 +210,9 @@ instead of the offline one.
 ```bash
 agentdescent init ./my-skill --data cases.jsonl --out spec.json
 agentdescent plan spec.json          # validates and prices it; runs nothing
+agentdescent plan spec.json --probe  # + one minimal call per model, so a dead
+                                     #   key/endpoint/model/subscription is
+                                     #   refused here, before any run exists
 agentdescent evolve spec.json --detach
 agentdescent status
 ```
@@ -264,6 +267,11 @@ Two habits worth keeping from the first run:
 
 * `agentdescent plan` before `evolve`, every time. It is free, and the call
   count it prints is the upper bound you are agreeing to.
+* `--probe` when the run is remote and the answer has to be known now: it sends
+  one minimal call per model-backed agent and reflector, so an expired plan, a
+  wrong model name or a dead endpoint is refused before a run store entry is
+  written. CLI agents are reported as `probe: … skipped (cli agent)` because one
+  call would cost a whole session.
 * `--budget 5 --usd-per-call 0.02` on the first real run. A dollar budget
   needs a per-call price (the engine counts calls; a tool-using agent's price
   is not known in advance). The run stops **between rounds** once

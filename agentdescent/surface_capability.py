@@ -189,11 +189,31 @@ def capability_run(path: Any, *, out: Optional[str] = None,
     return payload
 
 
+def _refuse_linked_leaves(directory: str, *paths: str) -> None:
+    """Refuse a link planted at a fixture leaf, before the first byte (#1043).
+
+    ``demo.py`` follows the same rule (#1017/#1021): the leaf's own link is
+    checked with ``filetree.dest_problem``, so a symlinked *directory* above it
+    stays legal and only the destination is refused. Every leaf is checked
+    because a partial fixture is worse than no fixture.
+    """
+    from .filetree import dest_problem
+
+    for path in paths:
+        problem = dest_problem(directory, path)
+        if problem is not None:
+            raise SurfaceError(
+                f"cannot write {os.path.abspath(path)}: {problem}")
+
+
 def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
+    """Write the spec, and with ``--demo`` its traces, after refusing a linked leaf."""
     target = os.path.abspath(os.path.expanduser(require_text(out, "out")))
     directory = os.path.dirname(target)
-    os.makedirs(directory, exist_ok=True)
     traces_path = os.path.join(directory, "capability-traces.jsonl")
+    _refuse_linked_leaves(directory,
+                          *((target, traces_path) if demo else (target,)))
+    os.makedirs(directory, exist_ok=True)
     if demo:
         with open(traces_path, "w", encoding="utf-8") as handle:
             for index in range(4):

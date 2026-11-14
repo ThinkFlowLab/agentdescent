@@ -79,3 +79,29 @@ def test_every_kind_cleans_up(tmp_path, monkeypatch, kind):
     code, out, tmpdir = _run(tmp_path, monkeypatch, "--kind", kind)
     assert code == 0, out
     assert _demo_roots(tmpdir) == [], _demo_roots(tmpdir)
+
+
+@pytest.mark.parametrize("kind", ["skill_dir", "text", "skill_library"])
+def test_a_bare_demo_does_not_recommend_show_or_apply(tmp_path, monkeypatch, kind):
+    """#1047: the footer named `show`/`apply` for a directory that is gone.
+
+    A bare run deletes its root at exit (#906), so `show` rendered the whole
+    artifact as new and `apply` would rebuild a directory that no longer
+    existed. Point the reader at `--dir` instead, and never print a command
+    against a path this run just removed.
+    """
+    code, out, _ = _run(tmp_path, monkeypatch, "--kind", kind)
+    assert code == 0, out
+    assert "agentdescent show" not in out, out
+    assert "agentdescent apply" not in out, out
+    assert "agentdescent demo --dir" in out, out
+
+
+def test_a_kept_demo_still_prints_show_and_apply(tmp_path, monkeypatch):
+    """The control: `--dir` keeps the root, so those two steps are real."""
+    work = tmp_path / "work"
+    code, out, _ = _run(tmp_path, monkeypatch, "--dir", str(work))
+    assert code == 0, out
+    assert "agentdescent show" in out, out
+    assert "agentdescent apply" in out, out
+    assert "agentdescent demo --dir" not in out, out

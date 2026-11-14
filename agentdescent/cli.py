@@ -903,22 +903,39 @@ def _print_demo_human(payload: Dict[str, Any], *, store: Optional[str] = None,
                                      else "")
                      for step in own_steps)
     run_id = payload["run_id"]
+    if keep:
+        headline = {
+            "text": "The prompt on disk is untouched -- an evolved artifact only "
+                    "lands when you say so:",
+            "skill_library": "The library on disk is untouched -- an evolved "
+                             "artifact only lands when you say so:",
+        }.get(kind, "The skill on disk is untouched -- an evolved artifact only "
+                    "lands when you say so:")
+        steps = (f"  agentdescent show  {run_id}          the diff\n"
+                 f"  agentdescent apply {run_id} --dry-run  what it would write")
+    else:
+        # #1047: a bare run removes its root at exit (#906), so `show` would
+        # render every file as new and `apply` would rebuild the directory that
+        # was just deleted. Point at `--dir`, which keeps the root and prints
+        # these two steps for the run it keeps.
+        headline = ("This demo's directory is removed at exit, so there is nothing "
+                    "left to show or\napply. Keep it, and that run prints the same "
+                    "two steps:")
+        steps = "  agentdescent demo --dir ./demo        # keeps the files, then shows the diff"
     if kind == "text":
         print(f"""
-The prompt on disk is untouched -- an evolved artifact only lands when you say so:
+{headline}
 
-  agentdescent show  {run_id}          the diff
-  agentdescent apply {run_id} --dry-run  what it would write
+{steps}
 
 Your own run is the same shape with a real model instead of the offline pair:
 
 {own}""")
     elif kind == "skill_library":
         print(f"""
-The library on disk is untouched -- an evolved artifact only lands when you say so:
+{headline}
 
-  agentdescent show  {run_id}          the diff
-  agentdescent apply {run_id} --dry-run  what it would write
+{steps}
 
 Your own run is the same spec with three things changed -- your library, your
 cases.jsonl, and a real agent instead of the offline one:
@@ -926,10 +943,9 @@ cases.jsonl, and a real agent instead of the offline one:
 {own}""")
     else:
         print(f"""
-The skill on disk is untouched -- an evolved artifact only lands when you say so:
+{headline}
 
-  agentdescent show  {run_id}          the diff
-  agentdescent apply {run_id} --dry-run  what it would write
+{steps}
 
 Your own run is the same spec with three things changed -- your directory, your
 cases.jsonl, and a real agent instead of the offline one:

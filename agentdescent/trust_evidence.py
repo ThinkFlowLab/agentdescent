@@ -42,7 +42,8 @@ from .promotion import PromotionRequest
 from .safety_controller import CanaryResult, canary
 from .self_model import CalibrationReport, SelfModel
 from .sequential import SequentialReport, sequential_test
-from .stats_eval import bootstrap_ci, is_significant, paired_gain
+from .stats_eval import (bootstrap_ci, calibrate_noise, is_significant,
+                         paired_gain)
 from .verifier_ensemble import EnsembleReport, VerifierEnsemble
 
 __all__ = ["RunHealth", "TrustEvidence", "build_trust_evidence"]
@@ -274,6 +275,11 @@ class TrustEvidence:
         """The effect this bundle may report; zero when nothing changed on disk."""
         return 0.0 if self.noise_only else self.eval_result.delta
 
+    @property
+    def noise(self) -> Optional[Mapping[str, Any]]:
+        """The baseline noise calibration, when the caller supplied repeats."""
+        return self.metadata.get("noise")
+
     def to_promotion_request(self, artifact_id: str, *,
                              artifact_hash: Optional[str] = None,
                              proof: Optional[Any] = None,
@@ -321,6 +327,8 @@ class TrustEvidence:
             body["noise_only"] = self.noise_only
         if self.run_health is not None:
             body["run_health"] = self.run_health.to_dict()
+        if self.noise is not None:
+            body["noise"] = dict(self.noise)
         return body
 
 
@@ -344,6 +352,9 @@ def build_trust_evidence(
         alpha: float = 0.05,
         seed: int = 0,
         min_effect: float = 0.0,
+        baseline_runs: Optional[Sequence[Mapping[str, float]]] = None,
+        candidate_runs: Optional[Sequence[Mapping[str, float]]] = None,
+        noise_repeats: int = 3,
 ) -> TrustEvidence:
     """Compute every report from paired task scores and optional side data."""
     if not isinstance(before, Mapping) or not isinstance(after, Mapping):
@@ -363,6 +374,17 @@ def build_trust_evidence(
         raise ValueError("verifier needs a candidate")
     if artifact_changed is not None and not isinstance(artifact_changed, bool):
         raise TypeError("artifact_changed must be a bool or None")
+    if baseline_runs is None and candidate_runs is not None:
+        raise ValueError("candidate_runs needs baseline_runs")
+    if baseline_runs is not None:
+        if (not isinstance(baseline_runs, Sequence)
+                or isinstance(baseline_runs, (str, bytes)) or not baseline_runs):
+            raise ValueError("baseline_runs must be a non-empty sequence")
+        if candidate_runs is not None and (
+                not isinstance(candidate_runs, Sequence)
+                or isinstance(candidate_runs, (str, bytes))
+                or not candidate_runs):
+            raise ValueError("candidate_runs must be a non-empty sequence")
 
     deltas = paired_gain(before, after)
     if not deltas:
@@ -383,6 +405,22 @@ def build_trust_evidence(
         cost=0.0, per_task=per_task,
         detail=(f"bootstrap n={bootstrap.n}, "
                 f"prob_positive={bootstrap.prob_positive:.3f}"))
+
+    noise = None
+    if baseline_runs is not None:
+        groups = {"baseline": [dict(run) for run in baseline_runs],
+                  "candidate": [dict(run) for run in (
+                      candidate_runs if candidate_runs is not None else [after])]}
+        noise = calibrate_noise(
+            groups, expected_repeats=noise_repeats, alpha=alpha, seed=seed,
+            min_effect=min_effect)
+        if not noise.distinguishable:
+            lo, hi = noise.noise_floor
+            note = (f"gain {noise.gain:+.3f} is not distinguishable from noise "
+                    f"(noise floor [{lo:+.3f}, {hi:+.3f}])")
+            detail = (f"{eval_result.detail}; {note}"
+                      if eval_result.detail else note)
+            eval_result = replace(eval_result, passed=False, detail=detail)
 
     canary_result = canary(before, after, min_effect=min_effect, alpha=alpha)
     conformal = ConformalGate(alpha=alpha).fit(deltas).decide()
@@ -408,13 +446,15 @@ def build_trust_evidence(
         confidences, outcomes = calibration
         calibration_report = SelfModel().fit(confidences, outcomes)
 
+    metadata = _artifact_metadata(
+        artifact_changed,
+        {"before_tasks": len(before), "after_tasks": len(after),
+         "common_tasks": len(deltas)})
+    if noise is not None:
+        metadata["noise"] = noise.to_dict()
     return TrustEvidence(
         eval_result=eval_result, canary=canary_result, conformal=conformal,
         sequential=stream, goodhart=goodhart, metamorphic=metamorphic_report,
         verifier=verifier_report, calibration=calibration_report,
         contaminated=contaminated, risk=risk, approved=approved,
-        artifact_changed=artifact_changed,
-        metadata=_artifact_metadata(
-            artifact_changed,
-            {"before_tasks": len(before), "after_tasks": len(after),
-             "common_tasks": len(deltas)}))
+        artifact_changed=artifact_changed, metadata=metadata)

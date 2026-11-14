@@ -9,8 +9,8 @@ It reads the same `show_payload`, so the CLI and MCP surfaces see one answer.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 __all__ = ["DiagnosisReport", "SEED_SOLVED_HINT", "adopted_count",
            "diagnose_payload", "seed_already_solved"]
@@ -48,6 +48,34 @@ def seed_already_solved(initial: Any, final: Any,
     if fin > init + 1e-9:
         return False
     return stop_reason == "target_reward" or init >= 0.999
+
+
+def _noise_evidence(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The baseline noise block a run recorded, or one from its repeats.
+
+    A run that does not carry calibration data adds nothing: diagnose cannot
+    invent a noise floor from a single point estimate.
+    """
+    raw = payload.get("noise") or payload.get("noise_calibration")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    baseline_runs = payload.get("baseline_runs") or payload.get(
+        "baseline_repeats")
+    if not baseline_runs:
+        return None
+    groups: Dict[str, Any] = {"baseline": list(baseline_runs)}
+    candidate_runs = payload.get("candidate_runs")
+    if not candidate_runs and isinstance(payload.get("after_scores"), Mapping):
+        candidate_runs = [payload["after_scores"]]
+    if candidate_runs:
+        groups["candidate"] = list(candidate_runs)
+    from .stats_eval import calibrate_noise
+
+    try:
+        repeats = int(payload.get("noise_repeats", 3))
+        return calibrate_noise(groups, expected_repeats=repeats).to_dict()
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -191,9 +219,19 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
     payload = show_payload(run_id, store=store, diff=False)
     # show_payload maps latest/last (#896); report the resolved id.
     run_id = str(payload.get("run_id") or run_id)
+    noise = _noise_evidence(payload)
+
+    def _report(*args: Any, **kwargs: Any) -> DiagnosisReport:
+        report = DiagnosisReport(*args, **kwargs)
+        if noise is not None:
+            evidence = dict(report.evidence)
+            evidence.setdefault("noise", noise)
+            report = replace(report, evidence=evidence)
+        return report
+
     state = str(payload.get("state") or "")
     if state == "cancelled":
-        return DiagnosisReport(
+        return _report(
             run_id, "cancelled", "the run was cancelled before it finished",
             evidence={"stop_reason": payload.get("stop_reason"),
                       "outcomes": payload.get("outcomes") or {}},
@@ -203,12 +241,12 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
         evidence = {"error": payload["error"]}
         if payload.get("propose_error"):
             evidence["propose_error"] = payload["propose_error"]
-        return DiagnosisReport(
+        return _report(
             run_id, "run-failed", f"the run reported an error: {payload['error']}",
             evidence=evidence,
             recommendations=_run_failed_next(run_id, str(payload["error"]), store))
     if state == "running":
-        return DiagnosisReport(
+        return _report(
             run_id, "running", "the run is still running; there is no verdict yet",
             evidence={"stop_reason": payload.get("stop_reason"),
                       "history": payload.get("history") or []},
@@ -223,7 +261,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
     target_hit = payload.get("stop_reason") == "target_reward"
     initial = payload.get("initial_reward")
     if seed_already_solved(initial, final_value, payload.get("stop_reason")):
-        return DiagnosisReport(
+        return _report(
             run_id, "seed-already-solved",
             f"the seed already scored {float(initial):.3f} on held-out before "
             "any round; nothing was learned and these cases cannot tell a "
@@ -232,19 +270,18 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
                       "final_reward": final_value, "outcomes": outcomes},
             recommendations=_SEED_SOLVED_NEXT)
     if final_value is not None and (target_hit or final_value >= 0.999):
-        return DiagnosisReport(run_id, "solved",
-                               f"held-out reward is {final_value:.3f}",
-                               evidence={"final_reward": final_value,
-                                         "outcomes": outcomes},
-                               recommendations=(
-                                   f"review the diff: `agentdescent show {run_id}`",
-                                   f"preview the write: `agentdescent apply {run_id} "
-                                   "--dry-run`, then rerun it without --dry-run"))
+        return _report(
+            run_id, "solved", f"held-out reward is {final_value:.3f}",
+            evidence={"final_reward": final_value, "outcomes": outcomes},
+            recommendations=(
+                f"review the diff: `agentdescent show {run_id}`",
+                f"preview the write: `agentdescent apply {run_id} "
+                "--dry-run`, then rerun it without --dry-run"))
 
     perr = payload.get("propose_errors") or 0
     if perr and not committed:
         detail = payload.get("propose_error") or "no first error recorded"
-        return DiagnosisReport(
+        return _report(
             run_id, "reflector-error",
             f"{perr} reflector call(s) failed; the loop was not learning",
             evidence={"propose_errors": perr, "propose_error": detail,
@@ -259,7 +296,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
     all_match = bool(low) and all(_matches_gold(sample) for sample in low)
     if all_match:
         worst = low[0]
-        return DiagnosisReport(
+        return _report(
             run_id, "scoring-mismatch",
             "the agent's answers match gold but the run scored them below 1",
             evidence={"sample": worst, "outcomes": outcomes},
@@ -276,7 +313,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
     if committed and gained:
         moved = (f"{initial_value:.3f} -> {final_value:.3f}"
                  if initial_value is not None else f"{final_value:.3f}")
-        return DiagnosisReport(
+        return _report(
             run_id, "partial-improvement",
             f"committed {committed} candidate(s); held-out reward "
             f"{moved} is below the target",
@@ -289,7 +326,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
 
     if rejected:
         top = rejected[-1]
-        return DiagnosisReport(
+        return _report(
             run_id, "gate-rejected",
             "candidates were proposed but the held-out gate refused them",
             evidence={"rejected": len(rejected), "last": top,
@@ -301,7 +338,7 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
     failing = [sample for sample in low if not _matches_gold(sample)]
     if failing and len(low) >= max(1, (len(samples) + 1) // 2):
         worst = low[0]
-        return DiagnosisReport(
+        return _report(
             run_id, "agent-failures",
             "the agent is answering wrongly; the reflector has failures to learn from",
             evidence={"sample": worst, "samples": len(samples),
@@ -315,13 +352,13 @@ def diagnose_payload(run_id: str, *, store: Optional[str] = None) -> DiagnosisRe
                    f"held-out reward stayed at {final_value:.3f} (the seed scored "
                    f"{initial_value:.3f}); {committed} committed candidate(s) did "
                    "not raise it")
-        return DiagnosisReport(
+        return _report(
             run_id, "no-improvement", summary,
             evidence={"initial_reward": initial_value,
                       "final_reward": final_value, "outcomes": outcomes,
                       "committed": committed},
             recommendations=("raise rounds or n_workers", "inspect the outcome histogram",))
-    return DiagnosisReport(
+    return _report(
         run_id, "unknown",
         "not enough evidence to classify the run",
         evidence={"outcomes": outcomes, "final_reward": final_value},

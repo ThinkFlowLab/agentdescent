@@ -16,6 +16,8 @@ import hashlib
 import os
 from pathlib import Path
 
+import pytest
+
 from agentdescent import cli
 
 ORIGINAL = "ORIGINAL-OUTSIDE-BYTES"
@@ -125,6 +127,7 @@ class TestCapabilityInitLeafGuard:
         assert leaf.is_file() and not leaf.is_symlink()
         assert leaf.stat().st_nlink == 1
         assert len(leaf.read_text(encoding="utf-8").splitlines()) == 4
+        assert not list(out_dir.glob(".staging-*"))
 
     def test_a_directory_at_the_traces_leaf_is_refused_before_any_byte(self, tmp_path, capsys):
         out_dir = tmp_path / "out"
@@ -141,3 +144,68 @@ class TestCapabilityInitLeafGuard:
         assert leaf.is_dir()
         assert not (out_dir / "spec.json").exists()
         assert [p.name for p in out_dir.iterdir()] == ["capability-traces.jsonl"]
+
+    def test_an_interrupt_while_staging_leaves_no_staging_file(self, tmp_path, monkeypatch):
+        from agentdescent import surface_capability
+
+        calls = {"n": 0}
+
+        def interrupting(payload):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise KeyboardInterrupt
+            return '{"trace_id": "demo"}\n'
+
+        monkeypatch.setattr(surface_capability, "json_line", interrupting)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        with pytest.raises(KeyboardInterrupt):
+            surface_capability.capability_init(str(out_dir / "spec.json"), demo=True)
+
+        assert not list(out_dir.glob(".staging-*"))
+
+    def test_the_staged_traces_are_fsynced_before_the_rename(self, tmp_path, monkeypatch):
+        from agentdescent import surface_capability
+
+        events = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def recording_fsync(fd):
+            events.append(("fsync", fd))
+            return real_fsync(fd)
+
+        def recording_replace(src, dst):
+            events.append(("replace", str(src), str(dst)))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(surface_capability.os, "fsync", recording_fsync)
+        monkeypatch.setattr(surface_capability.os, "replace", recording_replace)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        payload = surface_capability.capability_init(str(out_dir / "spec.json"), demo=True)
+
+        assert payload["ok"] is True
+        last_fsync = -1
+        for index, event in enumerate(events):
+            if event[0] == "fsync":
+                last_fsync = index
+                continue
+            if event[0] == "replace" and ".staging-" in os.path.basename(event[1]):
+                assert last_fsync != -1 and last_fsync < index
+
+    def test_an_existing_directory_at_out_writes_no_traces_fixture(self, tmp_path, capsys):
+        parent = tmp_path / "fixture"
+        parent.mkdir()
+        target = parent / "out"
+        target.mkdir()
+
+        code = cli.main(["capability", "init", "--demo", "--out", str(target)])
+
+        captured = capsys.readouterr()
+        assert code == 2
+        assert captured.err.strip().startswith("error: ")
+        assert sorted(p.name for p in parent.iterdir()) == ["out"]
+        assert list(target.iterdir()) == []

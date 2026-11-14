@@ -177,7 +177,10 @@ class MemoryOperation:
             "memory.rolled_back": self.rolled_back,
             "memory.regressions": list(self.regressions),
         })
-        return attributes
+        # The fields above are immutable, so __post_init__ never saw them and
+        # _SECRET_VALUE never ran: a lesson id, precondition or verifier could
+        # carry a credential straight out of the process (#1063).
+        return _safe_mapping(attributes)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -492,6 +495,9 @@ class TelemetrySpan:
             raise ValueError("TelemetrySpan.kind must be non-empty")
         if not math.isfinite(float(self.start)):
             raise ValueError("TelemetrySpan.start must be finite")
+        # The constructor is an entry point: a caller can build a span directly
+        # and a span leaves the process (#1063).
+        self.attributes = _safe_mapping(self.attributes)
 
     @property
     def duration(self) -> Optional[float]:
@@ -504,13 +510,16 @@ class TelemetrySpan:
         return self.end is not None
 
     def set_attribute(self, key: str, value: Any) -> "TelemetrySpan":
-        self.attributes[str(key)] = value
+        key = str(key)
+        # Drop by key and redact by value here, as the span export does (#1063).
+        if not _is_secret_key(key):
+            self.attributes[key] = _safe_value(value)
         return self
 
     def add_event(self, name: str, attributes: Optional[Mapping[str, Any]] = None,
                   *, timestamp: Optional[float] = None) -> TelemetryEvent:
         event = TelemetryEvent(name, time.time() if timestamp is None else timestamp,
-                               dict(attributes or {}))
+                               _safe_mapping(attributes))
         self.events.append(event)
         return event
 
@@ -576,7 +585,7 @@ class RSITelemetry:
             trace_id=trace_id, span_id=self.id_factory("span"),
             name=name, kind=kind, start=float(self.clock()),
             parent_id=parent.span_id if parent is not None else None,
-            attributes=dict(attributes or {}))
+            attributes=_safe_mapping(attributes))
         self._spans.append(span)
         return span
 
@@ -692,5 +701,6 @@ class _SpanContext:
             self.telemetry.end_span(self.span, "cancelled" if cancelled else "error")
             if not cancelled:
                 self.telemetry.event(self.span, "exception",
-                                     {"type": exc_type.__name__, "message": str(exc)})
+                                     {"type": exc_type.__name__,
+                                      "message": _safe_value(str(exc))})
         return False

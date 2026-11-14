@@ -214,7 +214,7 @@ def test_noise_floor_is_surfaced_and_a_gain_inside_it_stays_noise(monkeypatch):
     _patch(monkeypatch, {
         "final_reward": 0.55, "initial_reward": 0.5,
         "outcomes": {"committed": 1},
-        "baseline_runs": [flat(0.45), flat(0.5), flat(0.55)],
+        "baseline_runs": [flat(0.3), flat(0.5), flat(0.7)],
         "candidate_runs": [flat(0.55)],
         "samples": [{"output": "x", "gold": "y", "reward": 0.0}]})
     report = diagnose_payload("r")

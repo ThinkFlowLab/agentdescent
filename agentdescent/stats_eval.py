@@ -355,8 +355,11 @@ def calibrate_noise(
     gain = 0.0 if candidate_mean is None else candidate_mean - baseline_mean
     gain_over_noise = (0.0 if gain <= 0.0 else
                        gain / max(half_width, 1e-9))
+    # A gain exactly at the floor edge is still noise; the epsilon keeps a
+    # floating-point representation of the edge from flipping the verdict.
+    bar = max(half_width, float(min_effect))
     distinguishable = (len(baseline_runs) >= 2 and gain > 0.0
-                       and gain > max(half_width, float(min_effect)))
+                       and gain > bar + 1e-12)
 
     decomposition = decompose_variance(groups)
     warnings = []

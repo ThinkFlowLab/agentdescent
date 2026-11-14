@@ -35,7 +35,7 @@ def test_flat_repeats_are_reported_as_not_distinguishable_and_rejected():
 
 
 def test_a_gain_inside_the_noise_floor_is_not_evidence():
-    evidence = _evidence(0.5, 0.55, [0.45, 0.5, 0.55], [0.55, 0.55, 0.55])
+    evidence = _evidence(0.5, 0.55, [0.3, 0.5, 0.7], [0.55, 0.55, 0.55])
     noise = evidence.metadata["noise"]
     assert noise["gain"] == pytest.approx(0.05)
     assert noise["distinguishable"] is False

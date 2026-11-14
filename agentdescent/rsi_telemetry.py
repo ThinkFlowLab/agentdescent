@@ -55,8 +55,25 @@ _PROVENANCE_OPERATIONS = frozenset(("write", "update", "forget"))
 
 # A span is telemetry, so it leaves the process. Drop credential-shaped keys and
 # values at the boundary rather than trusting every caller to remember (#947).
-_SECRET_KEY_MARKERS = ("api_key", "apikey", "access_key", "secret", "password",
-                       "token", "credential", "authorization", "private_key")
+#
+# A key is a credential when a **whole component** of it names one, not when a
+# substring does: matching `token` and `secret` as substrings also matched
+# `tokens`, `max_tokens`, `token_count` and `secret_free`, deleting the counters
+# a cost or budget span exists to record (#1070). The credential word is the
+# head noun, so it drops in the last position; a word that is only ever a
+# credential name drops in any position.
+_CREDENTIAL_COMPONENTS = frozenset((
+    "apikey", "accesskey", "privatekey", "secretkey", "clientsecret",
+    "apitoken", "accesstoken", "authtoken", "refreshtoken", "bearertoken",
+    "password", "passwd", "pwd", "credential", "credentials", "authorization",
+))
+_CREDENTIAL_NOUNS = frozenset(("token", "secret"))
+#: Two components of one credential spelling (`api` + `key`).
+_CREDENTIAL_PAIRS = frozenset((
+    "apikey", "accesskey", "privatekey", "secretkey", "clientsecret",
+    "apitoken", "accesstoken", "authtoken", "refreshtoken", "bearertoken",
+))
+_KEY_PARTS = re.compile(r"[_\-.\s]+")
 _SECRET_VALUE = re.compile(
     r"(?:^|[\s\"'])(?:sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{10,}|"
     r"gho_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|"
@@ -65,8 +82,21 @@ _SECRET_VALUE = re.compile(
 
 
 def _is_secret_key(key: Any) -> bool:
-    name = str(key).lower()
-    return any(marker in name for marker in _SECRET_KEY_MARKERS)
+    """True when a whole component of ``key`` names a credential (#1070).
+
+    ``token_count`` and ``secret_free`` measure credentials, they are not one;
+    ``client_secret`` and ``api_key`` are, in any spelling. Values are still
+    filtered by :data:`_SECRET_VALUE` wherever they appear.
+    """
+    parts = [part for part in _KEY_PARTS.split(str(key).lower()) if part]
+    if not parts:
+        return False
+    if any(part in _CREDENTIAL_COMPONENTS for part in parts):
+        return True
+    if parts[-1] in _CREDENTIAL_NOUNS:
+        return True
+    return any(first + second in _CREDENTIAL_PAIRS
+               for first, second in zip(parts, parts[1:]))
 
 
 def _safe_value(value: Any) -> Any:

@@ -100,8 +100,23 @@ def test_a_run_outlives_the_turn_that_started_it_and_leaves_no_orphan(tmp_path):
     assert status["round"] == 3
 
     if report["driver"] == "tmux" and shutil.which("tmux"):
-        # `=` asks for that exact name: a bare target also prefix-matches a
-        # longer one, so `-t ad-runs` can answer about an unrelated ad-runs-2.
-        left = subprocess.run(["tmux", "has-session", "-t", "=" + report["session"]],
-                              capture_output=True, text=True)
-        assert left.returncode != 0, f"orphan tmux session {report['session']}"
+        # The run writes `finished` before its own process exits, and tmux
+        # destroys the session after the pane's command ends, so the session is
+        # still listed for a moment -- measured ~1.7s on a loaded host. Poll for
+        # it to go; only a session that stays is an orphan. `=` asks for that
+        # exact name: a bare target also prefix-matches a longer one, so
+        # `-t ad-runs` can answer about an unrelated ad-runs-2.
+        poll_started = time.monotonic()
+        deadline = poll_started + 15
+        left = 0
+        while time.monotonic() < deadline:
+            left = subprocess.run(
+                ["tmux", "has-session", "-t", "=" + report["session"]],
+                capture_output=True, text=True).returncode
+            if left != 0:
+                break
+            time.sleep(0.1)
+        waited = time.monotonic() - poll_started
+        assert left != 0, (
+            f"orphan tmux session {report['session']!r} still listed after "
+            f"{waited:.1f}s (last `tmux has-session` rc={left})")

@@ -12,11 +12,19 @@ piece between them and a collector:
   dashboard reads one set of names whichever export it consumes;
 - :func:`exporter_from_env` is the switch, and it is **off by default**: with no
   ``OTEL_EXPORTER_OTLP_ENDPOINT`` it returns ``None`` and nothing is exported;
-- :class:`OtlpExporter` is the only place the ``[otel]`` extra is imported.
+- :class:`OtlpExporter` is the only place the ``[otel]`` extra is imported, on
+  the first export: importing this module and constructing the exporter both
+  work without the extra, and a missing extra raises the install line on the
+  first span rather than at configuration time. Each instance owns its tracer
+  and meter providers, because the SDK keeps the first provider installed
+  process-wide: a second exporter must not export through the first one's
+  endpoint and headers;
+- :meth:`OtlpExporter.force_flush` and :meth:`OtlpExporter.shutdown` touch only
+  this instance. The SDK batches spans (5 s) and exports metrics on an interval
+  (60 s), so without a flush a short process loses what it handed over.
 
 Importing this module is standard-library only. An install without the extra
-keeps importing the package and running normally, and the SDK import happens
-inside :class:`OtlpExporter`, never at module import.
+keeps importing the package and running normally.
 
 Nothing free-form rides along: the sample types carry numbers and a category
 name, and :func:`export_run` writes a fixed attribute set, so a prompt or a model
@@ -236,11 +244,58 @@ def exporter_from_env(environ: Optional[Mapping[str, str]] = None
                         service_name=service or DEFAULT_SERVICE_NAME)
 
 
-class OtlpExporter:
-    """OTLP/HTTP through the OpenTelemetry SDK, imported on first use.
+_OTEL_INSTALL_HINT = (
+    "OTLP export needs the optional extra: pip install 'agentdescent[otel]'")
 
-    Only constructing this class needs the extra; importing
-    :mod:`agentdescent.otel_export` does not.
+
+def _load_otel() -> Dict[str, Any]:
+    """The SDK classes the exporter needs, imported on the first export.
+
+    Behind a function so a test can stand a fake SDK in: the ``[otel]`` extra is
+    not installed in CI, and the per-instance provider wiring is the part that
+    has to be right.
+    """
+    try:
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+            OTLPMetricExporter)
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter)
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.trace import Status, StatusCode
+    except ImportError as exc:
+        raise ImportError(_OTEL_INSTALL_HINT) from exc
+    return {
+        "TracerProvider": TracerProvider,
+        "MeterProvider": MeterProvider,
+        "Resource": Resource,
+        "BatchSpanProcessor": BatchSpanProcessor,
+        "PeriodicExportingMetricReader": PeriodicExportingMetricReader,
+        "OTLPSpanExporter": OTLPSpanExporter,
+        "OTLPMetricExporter": OTLPMetricExporter,
+        "Status": Status,
+        "StatusCode": StatusCode,
+    }
+
+
+class OtlpExporter:
+    """OTLP/HTTP through the OpenTelemetry SDK, imported on the first export.
+
+    Importing this module and constructing this class need nothing extra; the
+    SDK is imported on the first :meth:`export_span`/:meth:`export_metric`, and
+    a missing extra raises the install line there.
+
+    Each instance owns its tracer and meter providers. The SDK keeps the *first*
+    provider installed process-wide, so a bridge that installed a global
+    provider and then asked the global for a tracer would export a second
+    tenant's identifiers through the first tenant's endpoint and headers.
+
+    Call :meth:`force_flush` (or :meth:`shutdown`) before a short process exits:
+    the SDK batches spans for 5 s and exports metrics on a 60 s interval, so the
+    records :func:`export_run` counts have been handed over, not delivered.
     """
 
     def __init__(self, endpoint: str, *, headers: Optional[Mapping[str, str]] = None,
@@ -251,60 +306,73 @@ class OtlpExporter:
         self.endpoint = endpoint.rstrip("/")
         self.headers = dict(headers or {})
         self.service_name = service_name
-        self._tracer = None
-        self._meter = None
+        self._otel: Optional[Dict[str, Any]] = None
+        self._tracer_provider: Any = None
+        self._meter_provider: Any = None
+        self._tracer: Any = None
+        self._meter: Any = None
         self._instruments: Dict[str, Any] = {}
+        self._stopped = False
 
     def _url(self, signal: str) -> str:
         return f"{self.endpoint}/v1/{signal}"
 
     def _open(self) -> None:
-        if self._tracer is not None:
+        """Build *this* instance's providers, once, on the first export."""
+        if self._tracer_provider is not None:
             return
-        try:
-            from opentelemetry import metrics as otel_metrics
-            from opentelemetry import trace as otel_trace
-            from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
-                OTLPMetricExporter)
-            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-                OTLPSpanExporter)
-            from opentelemetry.sdk.metrics import MeterProvider
-            from opentelemetry.sdk.metrics.export import (
-                PeriodicExportingMetricReader)
-            from opentelemetry.sdk.resources import Resource
-            from opentelemetry.sdk.trace import TracerProvider
-            from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        except ImportError as exc:   # pragma: no cover - needs the extra
-            raise ImportError(
-                "OTLP export needs the optional extra: "
-                "pip install 'agentdescent[otel]'") from exc
-        resource = Resource.create({"service.name": self.service_name})
-        tracer_provider = TracerProvider(resource=resource)
-        tracer_provider.add_span_processor(BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=self._url("traces"),
-                             headers=self.headers or None)))
-        otel_trace.set_tracer_provider(tracer_provider)
-        reader = PeriodicExportingMetricReader(OTLPMetricExporter(
-            endpoint=self._url("metrics"), headers=self.headers or None))
-        meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
-        otel_metrics.set_meter_provider(meter_provider)
-        self._tracer = otel_trace.get_tracer("agentdescent")
-        self._meter = otel_metrics.get_meter("agentdescent")
+        otel = _load_otel()          # raises the install line before any span
+        resource = otel["Resource"].create({"service.name": self.service_name})
+        tracer_provider = otel["TracerProvider"](resource=resource)
+        tracer_provider.add_span_processor(otel["BatchSpanProcessor"](
+            otel["OTLPSpanExporter"](endpoint=self._url("traces"),
+                                     headers=self.headers or None)))
+        meter_provider = otel["MeterProvider"](
+            resource=resource,
+            metric_readers=[otel["PeriodicExportingMetricReader"](
+                otel["OTLPMetricExporter"](endpoint=self._url("metrics"),
+                                           headers=self.headers or None))])
+        self._otel = otel
+        self._tracer_provider = tracer_provider
+        self._meter_provider = meter_provider
+        self._tracer = tracer_provider.get_tracer("agentdescent")
+        self._meter = meter_provider.get_meter("agentdescent")
+
+    def force_flush(self, timeout_millis: int = 3000) -> bool:
+        """Flush this instance's batched spans and pending metrics now."""
+        results = []
+        for provider in (self._tracer_provider, self._meter_provider):
+            if provider is not None:
+                results.append(bool(provider.force_flush(timeout_millis)))
+        return all(results) if results else True
+
+    def shutdown(self) -> None:
+        """Flush, then close this instance's providers; other exporters keep theirs."""
+        if self._stopped:
+            return
+        self.force_flush()
+        self._stopped = True
+        for provider in (self._tracer_provider, self._meter_provider):
+            if provider is not None:
+                provider.shutdown()
 
     def export_span(self, span: ExportedSpan) -> None:   # pragma: no cover - extra
         self._open()
-        from opentelemetry.trace import Status, StatusCode
+        status, status_code = self._otel["Status"], self._otel["StatusCode"]
         current = self._tracer.start_span(
             span.name, start_time=int(float(span.start) * 1_000_000_000),
             attributes=dict(span.attributes))
         if span.status not in ("ok", "unset"):
-            current.set_status(Status(StatusCode.ERROR, span.status))
+            current.set_status(status(status_code.ERROR, span.status))
         current.end(end_time=int(float(span.end) * 1_000_000_000))
 
     def export_metric(self, metric: ExportedMetric) -> None:   # pragma: no cover
         self._open()
         instrument = self._instruments.get(metric.name)
         if instrument is None:
+            # ``create_gauge`` exists at the pinned floor: present in the SDK
+            # source at v1.23.0, v1.24.0 and v1.25.0 (re-checked when the floor
+            # moves), so >=1.24 needs no fallback here.
             instrument = {
                 "counter": self._meter.create_counter,
                 "gauge": self._meter.create_gauge,

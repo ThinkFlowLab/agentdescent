@@ -552,6 +552,16 @@ class Tools:
                                f"agentdescent.{registered}.spec.json")
         else:
             out = os.path.abspath(os.path.expanduser(out))
+        # The same boundary as every other write tool (`apply`, `tenant`, …): the
+        # spec is written for the caller, so it may not land outside the
+        # operator's write allowlist. `algorithm_spec` used to skip the check and
+        # write wherever the model named (#1018).
+        from .surface_common import SurfaceError
+
+        try:
+            self._check_write(out, "out")
+        except SurfaceError as e:
+            return {"ok": False, "error": str(e)}
         try:
             obj = algorithms_run_payload(
                 name, abs_path, kind=kind, cases=abs_cases, agent=agent,

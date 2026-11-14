@@ -3461,13 +3461,13 @@ PromotionRules(
     require_verifier: bool = False,
     require_verifier_admission: bool = False,
     require_calibration: bool = False,
-    require_cost: bool = False,
     allow_contaminated: bool = False,
     min_effect: float = 0.0,
     min_tasks: int = 2,
     max_risk: float = 1.0,
     max_review_cost: float = 0.0,
-    max_review_minutes: float = 0.0
+    max_review_minutes: float = 0.0,
+    require_cost: bool = False
 ) -> None
 ```
 

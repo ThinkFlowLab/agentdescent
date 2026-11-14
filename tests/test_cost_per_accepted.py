@@ -290,3 +290,35 @@ def test_require_cost_promotes_when_a_cost_was_measured():
                        PromotionRules(require_cost=True))
     assert decision.action == PromotionAction.PROMOTE
     assert decision.evidence["cost"]["tokens"] == 1_500
+
+
+def test_a_partly_priced_report_never_understates_the_cost():
+    """An unpriced accepted row must not read as a free gain (#945 review)."""
+    report = cost_report([
+        {"accepted": True, "gain": 0.2, "cost": {"tokens": 1000}},
+        {"accepted": True, "gain": 0.1},
+    ])
+
+    # The partial totals stay visible, and the gap is counted.
+    assert report.tokens == 1000
+    assert report.accepted == 2
+    assert report.missing_cost == 1
+    # Every derived read is None: a partial numerator over the full denominator
+    # is exactly the "looks cheaper than the evidence" failure this card exists
+    # to prevent.
+    assert report.tokens_per_accepted is None
+    assert report.tokens_per_point is None
+    assert report.cost_status == "unknown"
+
+
+def test_an_unpriced_rejected_row_also_leaves_the_per_accepted_unknown():
+    """Amortized spend covers every decision, so a silent rejected row counts."""
+    report = cost_report([
+        {"accepted": True, "gain": 0.2, "cost": {"tokens": 1000}},
+        {"accepted": False},
+    ])
+
+    assert report.tokens == 1000
+    assert report.missing_cost == 0, "only accepted rows carry missing_cost"
+    assert report.tokens_per_accepted is None
+    assert report.tokens_per_point is None

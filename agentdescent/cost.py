@@ -31,11 +31,14 @@ This module is the second ledger, at transaction grain:
     What the issue asks a report to show: calls/tokens/USD per accepted diff and
     per point of gain, with ``missing_cost`` counted rather than zeroed.
 
-Placement of the price is caller-supplied by design. The aggregator's
-:class:`~agentdescent.policies.MergeContext` now carries ``diff_cost`` (the
-measured cost of producing the diff) and falls back to the cost the contributing
+Placement of the price is caller-supplied by design.
+:class:`~agentdescent.policies.MergeContext` carries ``diff_cost`` when a
+caller supplies one, and the policy falls back to the cost the
+contributing
 :class:`~agentdescent.evolvable.EvidenceCard`\\ s recorded, which is what the
-loop already collects. ``agentdescent.promotion.PromotionRules.require_cost``
+loop already collects. ``aggregator._decide`` does not fill ``diff_cost`` yet,
+so the card fallback is what every in-tree caller takes today.
+``agentdescent.promotion.PromotionRules.require_cost``
 is the matching fail-closed bar on the promotion side.
 
 Not here: provider billing, a price table, or a claim that tokens are the only
@@ -248,6 +251,15 @@ def cost_status(value: Optional[float], reference: Optional[float], *,
     return NEUTRAL
 
 
+def _spend_text(cost: Cost) -> str:
+    """What the diff spent, in the unit it actually measured (#945 review)."""
+    if cost.tokens is not None:
+        return f"{int(cost.tokens)} tokens"
+    if cost.usd is not None:
+        return f"${cost.usd:.4f}"
+    return "an unmeasured amount of cost"
+
+
 class CostPolicy:
     """Acceptance wrapper that prices the candidate before committing it.
 
@@ -259,7 +271,8 @@ class CostPolicy:
     * ``reference_quality_per_cost``: refuse when the measured efficiency
       regressed against it, even though raw quality rose;
     * ``min_gain_per_1k_tokens``: refuse when efficiency is below an absolute
-      floor;
+      floor, measured per 1000 of ``unit`` -- so with ``unit="usd"`` the
+      tokens-named floor is a dollars-efficiency floor;
     * ``require_cost``: defer when the cost is not measured, instead of pricing
       an unknown diff at zero.
 
@@ -359,7 +372,7 @@ class CostPolicy:
         if status == REGRESSED:
             return AcceptDecision(
                 False, "cost-regression",
-                f"quality {gain:+.3f} on {cost.tokens or 0} tokens is "
+                f"quality {gain:+.3f} on {_spend_text(cost)} is "
                 f"{measured:.4g} per {self.unit}, below the reference "
                 f"{self.reference_quality_per_cost:.4g} (tolerance "
                 f"{self.tolerance:.0%}); the quality gain is not worth its cost",
@@ -506,6 +519,7 @@ def cost_report(records: Iterable[Any], *,
     rows = list(records)
     accepted = 0
     missing = 0
+    unpriced = 0
     totals = {name: 0 for name in (
         "calls", "prompt_tokens", "completion_tokens", "tokens")}
     wallclock = 0.0
@@ -527,6 +541,7 @@ def cost_report(records: Iterable[Any], *,
             if cost is None:
                 missing += 1
         if cost is None:
+            unpriced += 1
             continue
         for name in totals:
             value = getattr(cost, name)
@@ -548,12 +563,21 @@ def cost_report(records: Iterable[Any], *,
     wall = wallclock if "wallclock" in seen else None
     dollars = usd if "usd" in seen else None
 
-    def _per(value: Optional[float]) -> Optional[float]:
-        return None if value is None or accepted <= 0 else value / accepted
+    # A partial numerator over a full denominator reads as a cheaper diff: an
+    # unpriced *accepted* row would be a free gain, and an unpriced rejected row
+    # hides spend the amortized numbers are meant to cover. So any unpriced
+    # decision leaves every derived read None; the totals stay partial and
+    # `missing_cost` says by how much (#945 review).
+    complete = unpriced == 0
 
-    tokens_per_point = (None if tokens is None or gain_sum <= 0.0
+    def _per(value: Optional[float]) -> Optional[float]:
+        if not complete or value is None or accepted <= 0:
+            return None
+        return value / accepted
+
+    tokens_per_point = (None if not complete or tokens is None or gain_sum <= 0.0
                         else tokens / gain_sum)
-    usd_per_point = (None if dollars is None or gain_sum <= 0.0
+    usd_per_point = (None if not complete or dollars is None or gain_sum <= 0.0
                      else dollars / gain_sum)
     status = UNKNOWN
     if reference_tokens_per_point is not None and tokens_per_point is not None:

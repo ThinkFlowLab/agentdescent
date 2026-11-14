@@ -145,11 +145,6 @@ class PromotionRules:
     require_verifier: bool = False
     require_verifier_admission: bool = False
     require_calibration: bool = False
-    #: Cost evidence (#945). ``False`` is the pre-existing decision: a caller
-    #: that supplies no cost keeps the same hash and verdict. With ``True``, a
-    #: request without a measured cost defers -- it never prices an unknown diff
-    #: at zero.
-    require_cost: bool = False
     allow_contaminated: bool = False
     min_effect: float = 0.0
     min_tasks: int = 2
@@ -158,6 +153,12 @@ class PromotionRules:
     #: one this policy produced before the field existed.
     max_review_cost: float = 0.0
     max_review_minutes: float = 0.0
+    #: Cost evidence (#945). Appended rather than inserted: a later positional
+    #: caller cannot be shifted by it (``#950`` added its own field the same
+    #: way). ``False`` is the pre-existing decision -- a caller that supplies no
+    #: cost keeps the same hash and verdict; with ``True`` a request without a
+    #: measured cost defers, and an unknown diff is never priced at zero.
+    require_cost: bool = False
 
     def __post_init__(self) -> None:
         for name in ("require_eval", "require_contamination", "require_risk",

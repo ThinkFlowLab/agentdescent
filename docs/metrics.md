@@ -42,8 +42,8 @@ source of truth.
 ## Opt-in OTLP export
 
 `agentdescent.otel_export` bridges a run's rounds, decisions and cost to an
-OpenTelemetry collector. It is off by default and needs no dependency to import:
-the SDK is imported only when an `OtlpExporter` is constructed.
+OpenTelemetry collector. It is off by default and needs no dependency to import
+or to construct: the SDK is imported on the exporter's first export.
 
 ```python
 from agentdescent import metrics_from_log
@@ -56,6 +56,7 @@ if exporter is not None:
                rounds=[RoundSample(1, reward=0.4, tokens=120, wallclock=2.0)],
                decisions=[DecisionSample("skill", True, calls=2,
                                          prompt_tokens=300, wallclock=1.1)])
+    exporter.force_flush()              # or exporter.shutdown() when it is the last run
 ```
 
 - One span per round (`agentdescent.round`) and one per decision
@@ -65,8 +66,22 @@ if exporter is not None:
 - A host can pass any object with `export_span`/`export_metric` (the
   `TelemetryExporter` protocol), so tests need no collector.
 - Off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set; `OTEL_EXPORTER_OTLP_HEADERS`
-  and `OTEL_SERVICE_NAME` are read too. Constructing `OtlpExporter` without
-  `pip install "agentdescent[otel]"` raises an `ImportError` naming that line.
+  and `OTEL_SERVICE_NAME` are read too. Without
+  `pip install "agentdescent[otel]"`, constructing `OtlpExporter` still works and
+  the first `export_span`/`export_metric` raises an `ImportError` naming that
+  line — the failure lands at the start of the first export, not at
+  configuration time.
+- Delivery is per exporter and explicit. Each `OtlpExporter` owns its tracer and
+  meter providers, so a second exporter in the same process does not export
+  through the first one's endpoint or headers. The SDK batches spans for 5 s and
+  exports metrics on a 60 s interval, and `export_run` counts records handed
+  over, not delivered: call `force_flush()` before a short process exits, or
+  `shutdown()` when the exporter is done, otherwise the queue and the pending
+  interval are lost.
 - Nothing free-form is exported: samples carry numbers and a category, and the
   writer copies a fixed attribute set, so prompts and model responses cannot
-  ride along by default.
+  ride along by default. The three string attributes (`run.id`, `run.tenant`,
+  `decision.category`) are caller-supplied identifiers, not content; that
+  guarantee belongs to `export_run`, while an `ExportedSpan` handed straight to
+  `export_span` has its `attributes` copied verbatim, so a caller building one
+  by hand owns what goes in it.

@@ -41,6 +41,7 @@ UNSUPPORTED_MODEL = {
 
 
 class _Handler(BaseHTTPRequestHandler):
+    url: str = ""
     body: bytes = b"{}"
     code: int = 400
     hits = 0
@@ -69,8 +70,9 @@ def endpoint(monkeypatch):
     _Handler.body = b"{}"
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    _Handler.url = f"http://127.0.0.1:{server.server_address[1]}"
     monkeypatch.setenv("FAKE_KEY", "sk-not-real")
-    monkeypatch.setenv("FAKE_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+    monkeypatch.setenv("FAKE_BASE_URL", _Handler.url)
 
     def use(*, code=400, body=None):
         _Handler.code = code
@@ -210,3 +212,70 @@ def test_the_probe_asks_the_same_model_the_run_would(tmp_path, monkeypatch, endp
     assert seen["model"] == "claude-x", seen
     assert "api_key_env" not in seen or seen["api_key_env"] == "FAKE_KEY"
     assert "stream" not in seen and "default_base_url" not in seen
+
+
+def _cases(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    path.write_text("\n".join(json.dumps({"prompt": f"q{i}", "gold": "zzz"})
+                               for i in range(8)), encoding="utf-8")
+    return str(path)
+
+
+def _prompt(tmp_path):
+    path = tmp_path / "prompt.txt"
+    path.write_text("You are a helpful assistant.", encoding="utf-8")
+    return str(path)
+
+
+def _algorithms_run_args(tmp_path, *, extra=()):
+    return ["algorithms", "run", "gepa", _prompt(tmp_path), _cases(tmp_path),
+            "--agent", "openai_compatible", "--model", "m",
+            "--key-env", "FAKE_KEY", "--base-url", "http://127.0.0.1:1",
+            "--rounds", "1", "--workers", "1",
+            "--out", str(tmp_path / "algo.spec.json"), *extra]
+
+
+def test_algorithms_run_json_exits_nonzero_on_a_refused_probe(tmp_path, monkeypatch,
+                                                              endpoint):
+    """A host gates on this exit code before it starts the run (#1048 review)."""
+    endpoint(body=ARK_SUBSCRIPTION)
+    monkeypatch.setenv("FAKE_BASE_URL", _Handler.url)
+
+    code, out, err = _run(_algorithms_run_args(tmp_path, extra=["--json", "--probe"]))
+
+    payload = json.loads(out)
+    assert payload["probe"]["ok"] is False
+    assert payload["ok"] is True, "the plan itself is fine; only the probe refused"
+    assert code == 1, (code, err)
+
+
+def test_algorithms_run_human_form_exits_nonzero_too(tmp_path, monkeypatch, endpoint):
+    endpoint(body=ARK_SUBSCRIPTION)
+    monkeypatch.setenv("FAKE_BASE_URL", _Handler.url)
+
+    code, out, err = _run(_algorithms_run_args(tmp_path, extra=["--probe"]))
+
+    assert code == 1, (code, out, err)
+    assert "probe: agent failed" in out + err
+
+
+def test_the_probe_caps_the_reply_budget_and_the_wait(tmp_path, monkeypatch, endpoint):
+    """One word is bought, not 4096 tokens (#1048 review)."""
+    import agentdescent.probe as probe_module
+
+    seen = {}
+
+    def fake_claude(**kwargs):
+        seen.update(kwargs)
+        return lambda prompt: "ok"
+
+    monkeypatch.setitem(probe_module._MODEL_ADAPTERS, "claude", fake_claude)
+    endpoint(code=200)
+    spec = _write_spec(tmp_path, agent={"ref": "claude", "model": "claude-x"},
+                       reflect={"ref": "echo"})
+
+    code, out, err = _run(["plan", spec, "--probe"])
+
+    assert code == 0, (out, err)
+    assert seen["max_tokens"] == probe_module.PROBE_MAX_TOKENS
+    assert seen["timeout"] == probe_module.DEFAULT_PROBE_TIMEOUT

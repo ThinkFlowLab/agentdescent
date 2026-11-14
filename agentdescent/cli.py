@@ -4465,7 +4465,11 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
     if as_json:
         # Exactly one JSON object on stdout for success and error (#674).
         _out(_public(obj), as_json=True)
-        return 0 if ok else 2
+        if not ok:
+            return 2
+        # A host gates on this exit code before it starts the run, so a refused
+        # probe must not report success here either (#1048 review).
+        return 0 if probe is None or probe.get("ok", True) else 1
     if stage == "pre":
         print(f"error: {obj['error']}", file=sys.stderr)
         return 2

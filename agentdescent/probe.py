@@ -16,6 +16,7 @@ so they report ``skipped``.
 from __future__ import annotations
 
 import time
+from functools import partial
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from .agents import (Completion, ProviderConfigError, QuotaExhausted,
@@ -49,6 +50,10 @@ _NOT_FOR_CLAUDE = {"base_url_env", "default_base_url", "stream"}
 #: A dead endpoint must not hold ``plan`` for the adapter's full run timeout.
 DEFAULT_PROBE_TIMEOUT = 20.0
 
+#: One word is all the probe asks for; the adapter default (4096) buys nothing
+#: and a reasoning model can spend it on hidden thinking (#1048 review).
+PROBE_MAX_TOKENS = 16
+
 
 def _block(spec: Any, field: str) -> Optional[Dict[str, Any]]:
     """The spec's agent block as a dict; a bare string ref becomes ``{"ref": …}``."""
@@ -81,16 +86,23 @@ def _completion(ref: str, block: Mapping[str, Any]) -> Completion:
     if ref in _CLAUDE_REFS:
         # `claude(model=…)` takes the model as a keyword, so it stays in kwargs:
         # probing a different model than the run would use answers nothing.
-        return adapter(**{k: v for k, v in kwargs.items() if k not in _NOT_FOR_CLAUDE})
-    model = kwargs.pop("model", None)
-    if not isinstance(model, str) or not model:
-        raise ValueError("the spec names no model for this agent")
-    # A probe is a preflight, not the run: cap the wait, keep a caller's own
-    # (shorter) timeout when it set one.
+        kwargs = {k: v for k, v in kwargs.items() if k not in _NOT_FOR_CLAUDE}
+        build = adapter
+    else:
+        model = kwargs.pop("model", None)
+        if not isinstance(model, str) or not model:
+            raise ValueError("the spec names no model for this agent")
+        build = partial(adapter, model)
+    # A probe is a preflight, not the run: cap the wait and the reply budget,
+    # keeping a caller's own smaller number when it set one.
     timeout = kwargs.get("timeout")
     kwargs["timeout"] = min(float(timeout), DEFAULT_PROBE_TIMEOUT) \
         if isinstance(timeout, (int, float)) and timeout > 0 else DEFAULT_PROBE_TIMEOUT
-    return adapter(model, **kwargs)
+    tokens = kwargs.get("max_tokens")
+    kwargs["max_tokens"] = min(int(tokens), PROBE_MAX_TOKENS) \
+        if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0 \
+        else PROBE_MAX_TOKENS
+    return build(**kwargs)
 
 
 def _one(field: str, block: Mapping[str, Any]) -> Dict[str, Any]:

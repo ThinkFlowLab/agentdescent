@@ -188,10 +188,20 @@ class FileArtifactStore:
 
     def _commit(self, artifact: Path, name: str, files: Mapping[str, bytes],
                 parent: Optional[str], message: str) -> None:
+        target = artifact / name
+        # Before mkdir and staging: a regular file at the tree's leaf reached
+        # os.replace as a raw NotADirectoryError (#1045).
+        if target.exists() and not target.is_dir():
+            raise ValueError(f"cannot write {target}: not a directory")
         sidecar = artifact / (name + ".json")
         # Before mkdir and staging: a symlink here would be followed into the
         # outside tree, and the sidecar would land outside the store (#1041).
         _refuse_linked_leaf(sidecar)
+        # A directory here reached the sidecar rename as a raw IsADirectoryError
+        # only after the tree had landed, so the revision was listed without a
+        # sidecar (#1045).
+        if sidecar.exists() and not sidecar.is_file():
+            raise ValueError(f"cannot write {sidecar}: not a file")
         artifact.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(artifact)))
         try:

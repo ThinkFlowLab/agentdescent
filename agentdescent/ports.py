@@ -141,6 +141,11 @@ class FileArtifactStore:
             _relpath(path)
         payload = {path: bytes(data) for path, data in dict(files).items()}
         revision = _revision_name(parent, payload)
+        # Before is_dir(): both branches below follow a link planted here, so a
+        # dangling one reached the rename as a raw NotADirectoryError and one to
+        # a directory outside the store skipped the write and served the outside
+        # tree as this revision (#1050).
+        _refuse_linked_leaf(artifact / revision)
         if not (artifact / revision).is_dir():
             self._commit(artifact, revision, payload, parent, message)
         return revision
@@ -196,6 +201,9 @@ class FileArtifactStore:
         sidecar = artifact / (name + ".json")
         # Before mkdir and staging: a symlink here would be followed into the
         # outside tree, and the sidecar would land outside the store (#1041).
+        # The revision leaf is guarded too, so a caller that skipped the check in
+        # ``write_tree`` (or a future one) cannot reach the rename either (#1050).
+        _refuse_linked_leaf(artifact / name)
         _refuse_linked_leaf(sidecar)
         # A directory here reached the sidecar rename as a raw IsADirectoryError
         # only after the tree had landed, so the revision was listed without a

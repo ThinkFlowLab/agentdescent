@@ -43,7 +43,7 @@ source of truth.
 
 `agentdescent.otel_export` bridges a run's rounds, decisions and cost to an
 OpenTelemetry collector. It is off by default and needs no dependency to import
-or to construct: the SDK is imported on the exporter's first export.
+or to construct: the SDK is imported when an `OtlpExporter` is constructed.
 
 ```python
 from agentdescent import metrics_from_log

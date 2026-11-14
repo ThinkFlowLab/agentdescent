@@ -7,7 +7,10 @@ can back it without the loop copying files around.
 
 ``FileArtifactStore`` keeps ``<root>/<artifact_id>/<revision>/`` plus
 ``<revision>.json`` (parent, message); a name or path that could leave ``root``
-raises ``ValueError`` before a write. Stdlib only, no network.
+raises ``ValueError`` before a write. A symlink planted at a leaf it writes is
+refused the same way, and a hardlink at a leaf is replaced rather than written
+through; a symlinked *directory* above a leaf stays legal (a store on another
+disk is a configuration, not an escape). Stdlib only, no network.
 """
 
 from __future__ import annotations
@@ -66,6 +69,49 @@ def _relpath(path: str) -> str:
     return path
 
 
+def _write_sidecar(path: Path, parent: Optional[str], message: str) -> None:
+    """Write the revision sidecar by rename, never through the leaf (#1041).
+
+    ``write_text`` truncated the inode of a hardlink planted at
+    ``<revision>.json``, whose bytes live outside ``root``; it also left a
+    check-then-use window between the leaf guard and the write. A staged file
+    renamed over the leaf replaces the directory entry instead, so the bytes
+    behind any link survive and no link is followed.
+    """
+    payload = json.dumps({"parent": parent, "message": message}, sort_keys=True) + "\n"
+    handle, staged = tempfile.mkstemp(
+        prefix=".staging-", suffix=".json", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+        os.replace(staged, path)
+    except BaseException:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
+
+
+def _refuse_linked_leaf(path: Path) -> None:
+    """Refuse a link planted at ``path`` itself (#1041).
+
+    ``Path.write_text`` follows a link at the leaf, and ``shutil.rmtree``
+    refuses one with a raw ``OSError``: either way the documented ``ValueError``
+    was not what a caller got, and the sidecar write landed outside ``root``.
+    The rule is ``filetree.leaf_problem``: only the leaf is tested, so a
+    symlinked *directory* above the store stays legal. A hardlink is not
+    refused here -- it shares the inode, so :func:`_write_sidecar` replaces the
+    entry instead of writing through it.
+    """
+    from .filetree import leaf_problem
+
+    problem = leaf_problem(str(path))
+    if problem is not None:
+        raise ValueError(f"cannot write {path}: {problem}")
+
+
 def _revision_name(parent: Optional[str], files: Mapping[str, bytes]) -> str:
     digest = hashlib.sha256(b"agentdescent.ports.v1\0")
     digest.update((parent or "").encode("utf-8") + b"\0")
@@ -122,6 +168,9 @@ class FileArtifactStore:
         artifact = self._dir(artifact_id)
         files = self._read(self._dir(artifact_id, revision))
         target = artifact / _name(to, "promotion target")
+        # Before is_dir/read/rmtree: a link here would be followed into the
+        # outside tree and then refused by rmtree as a raw OSError (#1041).
+        _refuse_linked_leaf(target)
         if target.is_dir():
             if self._read(target) == files:
                 return
@@ -139,6 +188,10 @@ class FileArtifactStore:
 
     def _commit(self, artifact: Path, name: str, files: Mapping[str, bytes],
                 parent: Optional[str], message: str) -> None:
+        sidecar = artifact / (name + ".json")
+        # Before mkdir and staging: a symlink here would be followed into the
+        # outside tree, and the sidecar would land outside the store (#1041).
+        _refuse_linked_leaf(sidecar)
         artifact.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(artifact)))
         try:
@@ -150,10 +203,7 @@ class FileArtifactStore:
         finally:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
-        (artifact / (name + ".json")).write_text(
-            json.dumps({"parent": parent, "message": message}, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        _write_sidecar(sidecar, parent, message)
 
     @staticmethod
     def _read(directory: Path) -> Dict[str, bytes]:

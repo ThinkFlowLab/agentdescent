@@ -2887,7 +2887,9 @@ def _partial_show(rd: "runstore.RunDir", st: Any) -> Dict[str, Any]:
 
 
 def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
-                 max_chars: int = 40_000) -> Dict[str, Any]:
+                 max_chars: int = 40_000,
+                 check_write: Optional[Callable[[str, str], Any]] = None
+                 ) -> Dict[str, Any]:
     run_id = resolve_run_id(run_id, store=store) or run_id
     rd = runstore.get(run_id, store=store)
     st = rd.status()
@@ -2957,8 +2959,14 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
             "chars": len(result.rendered)}
         return payload
     if spec.kind == "text":
+        target = os.path.expanduser(spec.target)
         payload["rendered"] = result.rendered[:max_chars]
-        payload["apply_plan"] = _text_plan(os.path.expanduser(spec.target), result.rendered)
+        try:
+            if check_write is not None:
+                check_write(target, "to")
+            payload["apply_plan"] = _text_plan(target, result.rendered)
+        except Exception as e:  # noqa: BLE001 - the plan carries its own refusal
+            payload["apply_plan"] = {"error": str(e)}
         return payload
     payload["files"] = sorted(result.state)
     if diff:
@@ -2969,14 +2977,17 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
             before, payload["diff_note"] = {}, f"could not read original {spec.target}: {e}"
         payload["diff"] = _tree_diff(before, result.state)[:max_chars]
         try:
-            payload["apply_plan"] = result.write_to(os.path.expanduser(spec.target), dry_run=True)
+            payload["apply_plan"] = result._write_to(
+                os.path.expanduser(spec.target), dry_run=True,
+                check_write=check_write)
         except Exception as e:  # noqa: BLE001
             payload["apply_plan"] = {"error": str(e)}
     return payload
 
 
 def cmd_show(a: argparse.Namespace) -> int:
-    payload = show_payload(a.run_id, store=a.store, diff=a.diff)
+    payload = show_payload(a.run_id, store=a.store, diff=a.diff,
+                           check_write=_surface_write_check)
     if a.json:
         _out(payload, as_json=True)
         return 0
@@ -3235,6 +3246,25 @@ def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
     return (apply_payload(run_id, to=dest, store=store, dry_run=dry_run, backup=backup,
                           check_write=check_write),
             notes, f"run {run_id}")
+
+
+def _surface_write_check(path: str, name: str) -> None:
+    """Enforce the operator's write allowlist on a CLI write path (#1082).
+
+    Opt-in like the rest of ``AGENTDESCENT_SURFACE_WRITE_DIRS``: unset leaves the
+    CLI exactly as it was, and an empty value refuses every write -- the reading
+    the MCP surface gives it. Raising the store's error keeps ``main``'s exit-2
+    envelope, so a worker sees the refusal rather than a traceback.
+    """
+    if "AGENTDESCENT_SURFACE_WRITE_DIRS" not in os.environ:
+        return
+    from .surface_common import (SurfaceError, ensure_write_path,
+                                 surface_write_dirs_from_env)
+
+    try:
+        ensure_write_path(path, name=name, allow=surface_write_dirs_from_env())
+    except SurfaceError as e:
+        raise runstore.RunStoreError(str(e)) from None
 
 
 def _refuse_dest_link(top: str, path: str) -> None:
@@ -3529,6 +3559,7 @@ def cmd_apply(a: argparse.Namespace) -> int:
             home=getattr(a, "home", None),
             dry_run=a.dry_run,
             backup=not a.no_backup,
+            check_write=_surface_write_check,
         )
     except runstore.RunStoreError as e:
         if getattr(a, "json", False):

@@ -96,6 +96,12 @@ your tree, under the operator's write allowlist).
   default is the server's cwd plus `$AGENTDESCENT_HOME`
   (`agentdescent/surface_common.py:178-190`); an empty value refuses every MCP
   write path, which is the safest setting for a worker that should only plan.
+  `agentdescent apply` and `show --diff` obey the same variable from the
+  release that carries
+  [`#1082`](https://github.com/ThinkFlowLab/agentdescent/issues/1082): a
+  destination outside the allowlist is refused before the first byte, and
+  `show --diff` advertises the refusal instead of a plan the worker cannot
+  apply. Unset means unchanged CLI behaviour.
   `algorithm_spec` obeys this allowlist from the release that carries
   [`#1018`](https://github.com/ThinkFlowLab/agentdescent/issues/1018) (fix in
   [`#1022`](https://github.com/ThinkFlowLab/agentdescent/pull/1022)). On an older
@@ -106,6 +112,10 @@ your tree, under the operator's write allowlist).
   the Ticket.
 - `plan` is the budget line: it estimates cost without executing. Read it before
   `start`, and put the number in the Ticket.
+- A detached run no longer inherits the worker session: `launch` drops the
+  `DSH_*`, `CLAUDE*`, `CODEX*` and `MCP_*` variables before it starts the
+  grandchild, so the worker's session identity and MCP config stay with the
+  host while the API keys the run needs are passed through (`#1082`).
 
 ## 6. Long runs, Reports and Attention
 

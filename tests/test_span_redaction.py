@@ -96,3 +96,84 @@ def test_exception_event_redacts_the_message() -> None:
     assert event.attributes["type"] == "RuntimeError"
     assert event.attributes["message"] == REDACTED
     assert SECRET not in str(span.events)
+
+
+# --- a credential key is matched by component (#1070) ---------------------
+#
+# `_is_secret_key` used substring matching, so `token` and `secret` also
+# matched `tokens`, `max_tokens`, `token_count` and `secret_free`: every
+# counter a cost or budget span exists to record was dropped on the way out.
+# The filter must still drop every credential name, so both lists are pinned.
+
+MEASUREMENT_KEYS = {
+    "tokens": 120,
+    "max_tokens": 16,
+    "input_tokens": 5,
+    "output_tokens": 11,
+    "token_count": 3,
+    "tokens_in": 7,
+    "budget_tokens": 500,
+    "secret_free": False,
+    "secrets_scanned": 12,
+}
+
+CREDENTIAL_KEYS = (
+    "api_key", "apikey", "access_key", "secret", "client_secret", "password",
+    "authorization", "private_key", "credential", "token", "api_token",
+    "access_token", "auth_token", "refresh_token", "bearer_token",
+)
+
+
+def test_measurement_keys_survive_the_filter() -> None:
+    telemetry = _telemetry()
+    span = telemetry.start_span("cost", attributes=MEASUREMENT_KEYS)
+
+    for key, value in MEASUREMENT_KEYS.items():
+        assert span.attributes.get(key) == value, key
+
+    (exported,) = telemetry.to_otel()
+    for key, value in MEASUREMENT_KEYS.items():
+        assert exported["attributes"].get(key) == value, key
+
+
+def test_credential_keys_are_still_dropped() -> None:
+    span = _telemetry().start_span(
+        "cost", attributes={key: SECRET for key in CREDENTIAL_KEYS})
+
+    assert span.attributes == {}
+
+    for key in CREDENTIAL_KEYS:
+        span.set_attribute(key, SECRET)
+        assert key not in span.attributes, key
+
+    event = span.add_event("adopt", {key: SECRET for key in CREDENTIAL_KEYS})
+    assert event.attributes == {}
+
+
+def test_span_round_trip_keeps_the_token_counters() -> None:
+    telemetry = _telemetry()
+    telemetry.start_span("x", attributes={"max_tokens": 16, "input_tokens": 5})
+
+    (exported,) = telemetry.to_otel()
+    attributes = exported["attributes"]
+    assert attributes["max_tokens"] == 16
+    assert attributes["input_tokens"] == 5
+
+
+def test_a_credential_value_in_a_kept_key_is_still_redacted() -> None:
+    span = _telemetry().start_span("cost", attributes={"max_tokens": SECRET,
+                                                       "tokens": SECRET})
+
+    assert span.attributes["max_tokens"] == REDACTED
+    assert span.attributes["tokens"] == REDACTED
+
+
+def test_a_memory_block_keeps_its_counters_too() -> None:
+    operation = MemoryOperation("write", "lesson-1",
+                                attributes={"budget_tokens": 500,
+                                            "token_count": 3})
+
+    attributes = operation.to_span_attributes()
+
+    assert attributes["budget_tokens"] == 500
+    assert attributes["token_count"] == 3

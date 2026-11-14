@@ -22,9 +22,19 @@ A spec carries the modification, the paired scores, and the gates:
       "rules": {"min_effect": 0.01},
       "contaminated": false,
       "risk": 0.05,
+      "integrity": {"before": {...}, "after": {...}},
       "rollback_current": {"harness/f.py": "new"},
       "rollback_previous": {"harness/f.py": "old"}
     }
+
+`integrity` is the observable composition of the harness, supplied by the
+caller: nothing in the package holds a live guardrail or permission object to
+introspect, so the spec carries both `HarnessSnapshot`s (and, optionally, the
+diff's `declared` action changes) rather than this module inventing a runtime
+(#1053). When the field is present the pair reaches `govern_harness_change` as
+`integrity=`, so a broken composition is refused before proof and promotion;
+when it is absent the check is skipped, which is why the surface reports the
+difference in `plan`.
 
 `agentdescent governed-harness init --demo --out governed.json` writes a
 runnable offline example. `plan` validates every ref and loads the scores without
@@ -39,6 +49,9 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .approval import ApprovalRequest, ApprovalStore
 from .governed_harness import GovernedHarnessReport, govern_harness_change
+from .harness_integrity import (
+    DeclaredChanges, HarnessIntegrity, HarnessSnapshot,
+)
 from .promotion import PromotionRules
 from .proofs import ProofRunner
 from .release_surface import load_rules, load_scores
@@ -221,6 +234,42 @@ def _rollback(value: Any, name: str) -> Optional[Mapping[str, str]]:
     return rows
 
 
+def _integrity(value: Any) -> Optional[HarnessIntegrity]:
+    """The caller-supplied composition pair, or None (#1053).
+
+    The observable is caller-supplied on purpose: the package has no runtime
+    object whose guardrail order, allow rules and action set could be captured,
+    and inventing one would be the new policy engine #949 rules out. A pair that
+    is present but malformed is a refusal, never a silently skipped check.
+    """
+    if value is None:
+        return None
+    data = require_mapping(value, "integrity")
+    allowed = {"before", "after", "declared", "required_order"}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise SurfaceError(
+            "unknown integrity key(s): " + ", ".join(unknown)
+            + "; allowed: " + ", ".join(sorted(allowed)))
+    missing = [key for key in ("before", "after") if key not in data]
+    if missing:
+        raise SurfaceError(
+            "integrity needs before and after; missing: " + ", ".join(missing))
+    pair = {}
+    try:
+        for side in ("before", "after"):
+            pair[side] = HarnessSnapshot(
+                **require_mapping(data[side], f"integrity.{side}"))
+        if data.get("declared") is not None:
+            pair["declared"] = DeclaredChanges(
+                **require_mapping(data["declared"], "integrity.declared"))
+        if data.get("required_order") is not None:
+            pair["required_order"] = data["required_order"]
+        return HarnessIntegrity(**pair)
+    except (TypeError, ValueError) as error:
+        raise SurfaceError(f"invalid integrity: {error}") from None
+
+
 def _rules(value: Any) -> Optional[PromotionRules]:
     if value is None:
         return None
@@ -269,6 +318,7 @@ def _build(spec: Mapping[str, Any], *, allow: Optional[Sequence[str]] = None
         "approval_reason": spec.get("approval_reason") or "high-risk harness change",
         "rollback_current": _rollback(spec.get("rollback_current"), "rollback_current"),
         "rollback_previous": _rollback(spec.get("rollback_previous"), "rollback_previous"),
+        "integrity": _integrity(spec.get("integrity")),
     }
 
 
@@ -288,6 +338,7 @@ def governed_plan(path: Any, *, allow: Optional[Sequence[str]] = None
                            else built["approval"].path),
         "rules": (None if built["rules"] is None
                   else asdict(built["rules"])),
+        "integrity": None if built["integrity"] is None else "configured",
         "next": ["agentdescent governed-harness run --spec <spec.json>"],
     }
 
@@ -305,7 +356,7 @@ def governed_run(path: Any, *, out: Optional[str] = None,
         rollback_current=built["rollback_current"],
         rollback_previous=built["rollback_previous"],
         kind=built["kind"], contaminated=built["contaminated"],
-        risk=built["risk"])
+        integrity=built["integrity"], risk=built["risk"])
     payload: Dict[str, Any] = {
         "schema_version": SURFACE_SCHEMA_VERSION,
         "ok": True,

@@ -12,12 +12,19 @@ The default recipe for a `kind` is used when no algorithm is named, and
 agentdescent algorithms [--kind K] [--json]      # same as `algorithms list`
 agentdescent algorithms list [--kind K] [--json]
 agentdescent algorithms show NAME
-agentdescent algorithms run NAME PATH [cases.jsonl] [--param k=v...] [--rounds N] [--workers N]
+agentdescent algorithms run NAME PATH [cases.jsonl] [--param k=v...] [--rounds N] [--workers N] [--probe]
 agentdescent init PATH --algorithm NAME --param KEY=VALUE [--rounds N] [--workers N]
 ```
 
 `--rounds 1 --workers 1` turns the kind's default plan (for a text prompt,
 8 rounds x 8 workers) into a quick trial without editing the spec.
+
+`--probe` (also on `plan`) sends one minimal model call per agent and
+reflector before the run it recommends, so a key, endpoint, model or
+subscription that cannot work is refused there instead of inside
+`evolve` -- with the same `SubscriptionInactive` / `QuotaExhausted` /
+`ProviderConfigError` answer and no run store entry. It is off by default:
+plain `plan` still runs and spends nothing.
 
 Include cases the seed gets wrong: if the seed already scores
 the target on held-out, the run stops at once with

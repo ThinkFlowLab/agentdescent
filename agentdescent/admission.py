@@ -8,6 +8,11 @@ policy, then the verifier's sample). The audit does not move a commit from one
 stratum to the other: it labels the decision. Otherwise a verifier whose accepted
 commits the oracle denies could raise its own precision by denying them at audit
 time, which is the bias this module exists to remove.
+
+Means hide a second failure: a verifier can agree on the average while being
+wrong *the same way* under every prompt. ``repeat_overlap`` measures that -- the
+share of prompts on which an audited accepted error recurs -- and a high one
+blocks an admit the averages alone would allow (#940).
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ __all__ = ["AdmissionReport", "admission_report"]
 CONFIRM_BAR = 0.8   # admit only from here, and only on the pessimistic bound
 DEMOTE_BAR = 0.5    # every reject needs a bound already under this
 MIN_AUDITED = 3     # below this a stratum is "not enough evidence", not a verdict
+UNIVERSALITY_BAR = 0.5   # mean share of prompts a recurring accepted error hits
+MIN_PROMPTS = 2          # one prompt cannot overlap with itself
 
 
 @dataclass(frozen=True)
@@ -38,6 +45,15 @@ class AdmissionReport:
     is "not enough evidence yet", and only a bound already on the wrong side of a
     bar demotes a verifier, so one or two audited rejections can never fail a
     promotion closed.
+
+    ``repeat_overlap``: mean share of prompts on which an audited accepted error
+    recurs -- the verifier claiming a gain the oracle denies for the same commit
+    under different prompts. ``high_universality`` is that share at or above
+    :data:`UNIVERSALITY_BAR` with at least :data:`MIN_AUDITED` audited accepts,
+    and it blocks an admit: shared errors are one systemic failure, not the noise
+    precision already averages away. ``repeat_overlap is None`` means
+    unmeasurable (fewer than two prompts, or fewer than three audited accepts) and
+    is never read as "no shared error"; it does not move the verdict either way.
     """
 
     n_accepted: int
@@ -49,6 +65,8 @@ class AdmissionReport:
     rejection_accuracy_upper: Optional[float]
     recommendation: str = "defer"
     reason: str = ""
+    repeat_overlap: Optional[float] = None
+    high_universality: bool = False
 
 
 def _interval(values: Sequence[float], probabilities: Sequence[float], seed: int):
@@ -68,7 +86,9 @@ def _show(lower: Optional[float], upper: Optional[float]) -> str:
 def admission_report(*, n_accepted: int, n_rejected: int,
                      accepted_confirmed: Sequence[float],
                      rejected_good: Sequence[float],
-                     rejected_sample_rate: float, seed: int = 0
+                     rejected_sample_rate: float, seed: int = 0,
+                     accepted_error_overlap: Sequence[float] = (),
+                     prompts: int = 0
                      ) -> AdmissionReport:
     """Label both strata; one ``1.0``/``0.0`` per audited decision.
 
@@ -76,10 +96,16 @@ def admission_report(*, n_accepted: int, n_rejected: int,
     the oracle confirms the gain.
     ``rejected_good``: one entry per audited rejected commit, ``1.0`` when the
     commit was in fact good -- i.e. the verifier threw good work away.
+    ``accepted_error_overlap``: one entry per audited accepted commit, the share
+    of the ``prompts`` audit tasks on which the verifier claimed a gain the
+    oracle denies. ``prompts`` is how many prompts the audit set has; below
+    :data:`MIN_PROMPTS` the overlap cannot be measured and stays ``None``.
 
     Bars: demote only on a bound already under 0.5, admit only with both
-    pessimistic bounds at 0.8, defer otherwise -- including when an interval is
-    still too wide to say either.
+    pessimistic bounds at 0.8, and defer otherwise -- including when an interval
+    is still too wide to say either. A high cross-prompt error overlap also
+    defers: it is the same failure recurring, so the averages are not the whole
+    story (#940).
     """
     confirmed = [float(value) for value in accepted_confirmed]
     precision = (sum(confirmed) / len(confirmed)) if confirmed else None
@@ -96,10 +122,21 @@ def admission_report(*, n_accepted: int, n_rejected: int,
     r_lower = None if g_upper is None else max(0.0, 1.0 - g_upper)
     r_upper = None if g_lower is None else min(1.0, 1.0 - g_lower)
 
+    # Cross-prompt overlap (#940): a mean gain hides an error that recurs on
+    # every prompt, so the accepted stratum also reports the share of prompts
+    # each audited error hits. Unmeasurable is None, never 0.0.
+    overlaps = [float(value) for value in accepted_error_overlap]
+    repeat_overlap = None
+    if prompts >= MIN_PROMPTS and len(overlaps) >= MIN_AUDITED:
+        repeat_overlap = sum(overlaps) / len(overlaps)
+    high_universality = (repeat_overlap is not None
+                         and repeat_overlap >= UNIVERSALITY_BAR)
+
     def report(verdict: str, reason: str) -> AdmissionReport:
         return AdmissionReport(n_accepted, n_rejected, precision,
                                p_lower, p_upper, r_lower, r_upper,
-                               verdict, reason)
+                               verdict, reason, repeat_overlap,
+                               high_universality)
 
     enough_accepted = len(confirmed) >= MIN_AUDITED
     enough_rejected = len(good) >= MIN_AUDITED
@@ -121,6 +158,15 @@ def admission_report(*, n_accepted: int, n_rejected: int,
         return report("defer", "admission is incomplete: no accepted commit was audited")
     if not good:
         return report("defer", "admission is incomplete: no rejection was audited")
+
+    # A recurring error is a systemic failure the averages hide, so it blocks an
+    # admit but never demotes on its own: it says what kind of error this is, not
+    # how often -- frequency is what the precision bar already measures.
+    if high_universality:
+        return report("defer",
+                      f"cross-prompt error overlap {repeat_overlap:.3f} over "
+                      f"{len(overlaps)} audited accepts on {prompts} prompts: "
+                      f"wrong the same way under different prompts")
 
     if (enough_accepted and enough_rejected
             and p_lower is not None and r_lower is not None

@@ -233,8 +233,14 @@ def _write_traces(traces_path: str, directory: str) -> None:
                     "output": "unknown",
                     "reward": 0.0,
                 }))
+            # The rename is the commit point, so the bytes must be on disk
+            # before it, the same order ``atomic_write_text`` uses (#1046).
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(staged, traces_path)
-    except Exception:
+    except BaseException:
+        # A ``KeyboardInterrupt`` is not an ``Exception``; the staging file is
+        # ours either way and must not outlive the call (#1046).
         try:
             os.unlink(staged)
         except OSError:
@@ -253,7 +259,6 @@ def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
         _refuse_non_file(traces_path)
     os.makedirs(directory, exist_ok=True)
     if demo:
-        _write_traces(traces_path, directory)
         spec = {
             "schema_version": SURFACE_SCHEMA_VERSION,
             "traces": traces_path,
@@ -279,7 +284,13 @@ def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
             "kind": "tool",
             "tags": [],
         }
+    # The spec goes first: when ``--out`` names an existing directory the write
+    # refuses before the traces exist, so no half fixture is left in the parent
+    # (#1046). It also keeps a spec that points at missing traces out of reach,
+    # because a failure here means the command did nothing.
     atomic_write_json(target, spec)
+    if demo:
+        _write_traces(traces_path, directory)
     return {
         "schema_version": SURFACE_SCHEMA_VERSION,
         "ok": True,

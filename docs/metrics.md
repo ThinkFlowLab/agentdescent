@@ -38,3 +38,35 @@ for line in alerts(metrics, min_acceptance=0.2, max_cost_per_accepted=50):
 
 All metrics are derived from decision records; no model call and no second
 source of truth.
+
+## Opt-in OTLP export
+
+`agentdescent.otel_export` bridges a run's rounds, decisions and cost to an
+OpenTelemetry collector. It is off by default and needs no dependency to import:
+the SDK is imported only when an `OtlpExporter` is constructed.
+
+```python
+from agentdescent import metrics_from_log
+from agentdescent.otel_export import (DecisionSample, RoundSample, export_run,
+                                      exporter_from_env)
+
+exporter = exporter_from_env()          # None unless OTEL_EXPORTER_OTLP_ENDPOINT is set
+if exporter is not None:
+    export_run(exporter, run_id="run-1", metrics=metrics_from_log(records),
+               rounds=[RoundSample(1, reward=0.4, tokens=120, wallclock=2.0)],
+               decisions=[DecisionSample("skill", True, calls=2,
+                                         prompt_tokens=300, wallclock=1.1)])
+```
+
+- One span per round (`agentdescent.round`) and one per decision
+  (`agentdescent.decision`); the aggregate counters/gauge reuse the
+  `agentdescent_rsi_*` names above, and a `agentdescent_rsi_round_reward`
+  histogram carries each measured reward.
+- A host can pass any object with `export_span`/`export_metric` (the
+  `TelemetryExporter` protocol), so tests need no collector.
+- Off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set; `OTEL_EXPORTER_OTLP_HEADERS`
+  and `OTEL_SERVICE_NAME` are read too. Constructing `OtlpExporter` without
+  `pip install "agentdescent[otel]"` raises an `ImportError` naming that line.
+- Nothing free-form is exported: samples carry numbers and a category, and the
+  writer copies a fixed attribute set, so prompts and model responses cannot
+  ride along by default.

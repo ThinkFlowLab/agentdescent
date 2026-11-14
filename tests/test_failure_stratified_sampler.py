@@ -212,11 +212,14 @@ def test_transfer_status_ignores_float_noise_at_zero_tolerance():
     assert (len(split.select), len(split.final)) == (3, 3)
     for task_id, score in zip(split.select, (0.1, 0.2, 0.3)):
         sampler.record(task_id, score)
-    for task_id, score in zip(split.final, (0.3, 0.2, 0.1)):
+    # Python 3.12+ compensates float summation, so the old 0.3/0.2/0.1 reversal
+    # collapses to a 0.0 gap and stops exercising the floor. A 1e-13 difference
+    # in one score keeps a deterministic ~3e-14 gap on every supported Python.
+    for task_id, score in zip(split.final, (0.1, 0.2, 0.3 - 1e-13)):
         sampler.record(task_id, score)
 
     transfer = sampler.report().transfer
-    assert transfer.gap != 0.0, "the fixture must carry the float difference"
+    assert 0.0 < transfer.gap < 1e-12, "the fixture must carry a sub-floor gap"
     assert transfer.status == "holds"
 
 

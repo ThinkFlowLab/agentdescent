@@ -6,7 +6,7 @@ families plus a round-reward histogram. It is off unless
 `export_span`/`export_metric` (so tests need no collector), and the new optional
 `agentdescent[otel]` extra is imported only when an `OtlpExporter` is
 constructed — importing the package and running normally needs nothing new. No
-prompts or responses are exported by default. Credentials embedded in the endpoint
-are refused (they belong in `OTEL_EXPORTER_OTLP_HEADERS`), and plain `http://`
-is accepted only for a literal loopback collector unless
-`AGENTDESCENT_OTEL_ALLOW_INSECURE=1` is set (#923).
+prompts or responses are exported by default. An endpoint carrying
+credentials is refused without the value being echoed, and plain
+`http://` is accepted only for a literal loopback collector; a remote
+collector needs TLS terminated in front of it (#923).

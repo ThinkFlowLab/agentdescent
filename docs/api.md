@@ -3883,7 +3883,8 @@ ExperienceEngine(
     store: ExperienceStore,
     *,
     require_anchors: bool = True,
-    anchor_tolerance: float = 0.0
+    anchor_tolerance: float = 0.0,
+    telemetry: Optional[RSITelemetry] = None
 ) -> None
 ```
 
@@ -3919,7 +3920,8 @@ ExperienceReport(
     rows: int,
     learner: ContinualReport,
     skipped: int = 0,
-    detail: str = ''
+    detail: str = '',
+    memory: Optional[MemoryAudit] = None
 ) -> None
 ```
 

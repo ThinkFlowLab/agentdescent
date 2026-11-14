@@ -141,6 +141,14 @@ from .policies import (
     VerifierProtocol,
     policy_digest,
 )
+from .cost import (
+    Cost,
+    CostPolicy,
+    CostReport,
+    cost_efficiency,
+    cost_report,
+    cost_status,
+)
 from .evalcache import CacheProtocol, FileCache, MemoryCache
 from .trajectory import (
     PURPOSE_EVAL,
@@ -940,6 +948,12 @@ __all__ = [
     "PromotionDecision",
     "ReviewCost",
     "promote",
+    "Cost",
+    "CostPolicy",
+    "CostReport",
+    "cost_efficiency",
+    "cost_report",
+    "cost_status",
     "PromotionLedger",
     "ReleaseRecord",
     "RunHealth",

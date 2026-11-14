@@ -152,6 +152,10 @@ SECTIONS: List[Tuple[str, str, str, str]] = [
      "One fail-closed promotion decision over eval, statistics, proof, canary "
      "and admission.",
      "trusted-promotion.md"),
+    ("agentdescent.cost", "Cost per accepted diff",
+     "What a diff cost, what it bought, and the acceptance option that prices "
+     "it.",
+     "cost.md"),
     ("agentdescent.compute_policy", "Adaptive compute",
      "Which strategy deserves this task's compute: direct, PRM, search or "
      "ensemble.",
@@ -650,12 +654,23 @@ def render() -> str:
     import importlib
 
     comments = _source_comments()
-    exported = {name: getattr(agentdescent, name) for name in agentdescent.__all__}
+    # Keyed by ``(module, name)``, not by the short name. Two public symbols can
+    # share a short name -- ``agentdescent.Cost`` is the per-diff cost block and
+    # ``agentdescent.audit.scorecard.Cost`` is verifier/oracle seconds -- and a
+    # flat ``{name: obj}`` kept only the second one, so the page documented a
+    # signature the top-level import does not return (#945).
+    exported: Dict[Tuple[str, str], Any] = {}
+    for name in agentdescent.__all__:
+        obj = getattr(agentdescent, name)
+        exported.setdefault(
+            (getattr(obj, "__module__", "") or "agentdescent", name), obj)
     for module_name, _, _, _ in SUBMODULES:
-        exported.update(_public_names(importlib.import_module(module_name)))
+        for name, obj in _public_names(importlib.import_module(module_name)).items():
+            exported.setdefault(
+                (getattr(obj, "__module__", "") or module_name, name), obj)
     by_module: Dict[str, List[str]] = {}
-    for name, obj in exported.items():
-        by_module.setdefault(getattr(obj, "__module__", "") or "", []).append(name)
+    for module, name in exported:
+        by_module.setdefault(module, []).append(name)
 
     lines: List[str] = [
         "# API reference",
@@ -685,11 +700,11 @@ def render() -> str:
         names = sorted(by_module.get(module, []))
         if not names:
             continue
-        covered.update(names)
+        covered.update((module, name) for name in names)
         lines += [f"## {title}", "",
                   f"{role} &nbsp;·&nbsp; `{module}` &nbsp;·&nbsp; [guide]({page})", ""]
         for name in names:
-            obj = exported[name]
+            obj = exported[(module, name)]
             kind = _kind(obj)
             if kind == "value":
                 lines += [f"### `{name}`", "",
@@ -713,13 +728,17 @@ def render() -> str:
                     lines += [""]
         lines += ["---", ""]
 
-    leftovers = sorted(set(exported) - covered)
+    leftovers = sorted(set(exported) - covered, key=lambda key: (key[1], key[0]))
     if leftovers:
         lines += ["## Type aliases and constants", "",
                   "Values rather than classes or functions.", ""]
-        for name in leftovers:
-            lines += [f"### `{name}`", "",
-                      _value_doc(name, exported[name], comments), ""]
+        shared = {name for name, count in
+                  ((n, sum(1 for _, other in leftovers if other == n))
+                   for _, n in leftovers) if count > 1}
+        for module, name in leftovers:
+            heading = f"{name} ({module})" if name in shared else name
+            lines += [f"### `{heading}`", "",
+                      _value_doc(name, exported[(module, name)], comments), ""]
     return "\n".join(lines).rstrip() + "\n"
 
 

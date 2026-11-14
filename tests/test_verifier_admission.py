@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
+
+import pytest
 
 from agentdescent.admission import AdmissionReport
 from agentdescent.policies import AcceptDecision, MergeContext
@@ -22,9 +24,9 @@ def _ctx(base, cand):
                         cards=[], base_counts=(0.5, 0.5), cand_counts=(0.9, 0.1))
 
 
-def _gate(verifier, oracle, inner):
+def _gate(verifier, oracle, inner, tasks=(0,)):
     score = lambda table: lambda artifact, task: table[artifact.name][task]
-    return VerifierAgreement((0,), score(verifier), score(oracle),
+    return VerifierAgreement(tuple(tasks), score(verifier), score(oracle),
                              sample_rate=1.0, rejected_sample_rate=1.0,
                              inner=inner)
 
@@ -152,3 +154,78 @@ def test_promotion_defers_on_a_half_report_and_fails_closed_on_a_demote():
     assert decision.action == PromotionAction.REJECT   # a demote is not a deferral
     assert "oracle denies" in " ".join(decision.reasons)
     assert _promote(_DEMOTE, require=False).action == PromotionAction.PROMOTE
+
+
+# --- cross-prompt error overlap (#940) -------------------------------------
+# A prompt is one audit task. The same wrong answer accepted under several
+# prompts is one systemic failure, not sampling noise, so the report carries
+# the share of prompts on which each accepted error recurs.
+
+TASKS = (0, 1, 2)
+
+
+def _overlap_gate(err_prompts, *, tasks=TASKS, accepted=4, rejected=4):
+    """A gate whose accepted commit ``i`` errs on exactly ``err_prompts[i]``."""
+    verifier, oracle, pairs = {}, {}, []
+    for i in range(accepted):
+        base, cand = f"ok-base-{i}", f"ok-cand-{i}"
+        pairs.append((base, cand))
+        verifier[base] = {t: 0.1 for t in tasks}
+        verifier[cand] = {t: 0.9 for t in tasks}          # claims a gain everywhere
+        oracle[base] = {t: 0.1 for t in tasks}
+        # The mean gain stays positive, so precision alone cannot see the error.
+        oracle[cand] = {t: (-0.1 if t in err_prompts[i] else 1.0) for t in tasks}
+    for i in range(rejected):
+        base, cand = f"bad-base-{i}", f"bad-cand-{i}"
+        pairs.append((base, cand))
+        verifier[base] = oracle[base] = {t: 0.9 for t in tasks}
+        verifier[cand] = oracle[cand] = {t: 0.2 for t in tasks}
+    return _gate(verifier, oracle, _refuse_bad, tasks=tasks), pairs
+
+
+def _admits(gate, pairs):
+    for base, cand in pairs:
+        gate.accept(_ctx(base, cand))
+    return gate.admission_report()
+
+
+def test_a_verifier_wrong_the_same_way_under_every_prompt_is_flagged():
+    """Errors that recur across prompts block an admit the means would allow."""
+    repeating, pairs = _overlap_gate([{0, 1}] * 4)
+    report = _admits(repeating, pairs)
+    assert report.precision == 1.0                       # the mean still looks right
+    assert report.repeat_overlap == pytest.approx(2 / 3)
+    assert report.high_universality is True
+    assert report.recommendation == "defer"              # an admit on the means alone
+    assert "same way" in report.reason and "0.667" in report.reason
+
+    # Same evidence with the errors no longer shared: the means carry the gate.
+    spread, spread_pairs = _overlap_gate([{0}, {1}, {2}, set()])
+    spread_report = _admits(spread, spread_pairs)
+    assert spread_report.repeat_overlap == pytest.approx(0.25)
+    assert spread_report.high_universality is False
+    assert spread_report.recommendation == "admit"
+
+    # Offline and deterministic: the same draws produce the same report.
+    assert asdict(report) == asdict(_admits(*_overlap_gate([{0, 1}] * 4)))
+
+
+def test_one_prompt_cannot_overlap_with_itself():
+    """A single probe task cannot show sharing: unknown, never 0.0."""
+    gate, pairs = _overlap_gate([set()] * 4, tasks=(0,))
+    report = _admits(gate, pairs)
+    assert report.precision == 1.0
+    assert report.repeat_overlap is None
+    assert report.high_universality is False
+    assert "overlap" not in report.reason
+    assert report.recommendation == "admit"              # no evidence, so no bar
+
+
+def test_a_thin_overlap_sample_is_not_evidence():
+    """Two audited accepts are not a universality verdict (#940 bars)."""
+    gate, pairs = _overlap_gate([{0, 1}] * 2, accepted=2)
+    report = _admits(gate, pairs)
+    assert report.repeat_overlap is None
+    assert report.high_universality is False
+    assert "overlap" not in report.reason
+    assert "insufficient evidence" in report.reason

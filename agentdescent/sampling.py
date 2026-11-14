@@ -339,6 +339,12 @@ class SamplingReport:
     picks: int
 
 
+_FLOAT_EPS = 1e-12
+# Two means of identical scores differ by ~1e-16 depending on the summation
+# order, so a tolerance of 0.0 must still read "holds" instead of flipping the
+# status on that noise.
+
+
 class FailureStratifiedSampler:
     """Sample across base-failure strata, not from whichever mode is largest.
 
@@ -550,8 +556,10 @@ class FailureStratifiedSampler:
                           if self._assignment.get(str(k)) == "search"]
             if not candidates:
                 raise ValueError(
-                    "FailureStratifiedSampler.pick() got no search task; "
-                    "select/final tasks are hidden from the proposer")
+                    "FailureStratifiedSampler.pick() got no search task in this "
+                    "key list; select/final tasks are hidden from the proposer. "
+                    "Pass sampler.split()['search'] (not the whole task list) as "
+                    "tasks to evolve(), so every worker shard holds search ids")
             by_stratum: Dict[str, List[str]] = defaultdict(list)
             for task_id in candidates:
                 by_stratum[self._stratum(task_id)].append(task_id)
@@ -592,13 +600,16 @@ class FailureStratifiedSampler:
         gap = select_mean - final_mean
         # A final mean at least as high as select (within tolerance) means the
         # selection gain survived the hidden set. Anything below is the HDA
-        # failure this sampler exists to make visible.
-        if gap > self.transfer_tolerance:
-            status = "degrades"
-        elif gap < -self.transfer_tolerance:
-            status = "improves"
-        else:
+        # failure this sampler exists to make visible. The comparison keeps a
+        # float floor: equal means must report "holds" even at tolerance 0.0,
+        # otherwise the last bits of the summation decide the status.
+        tolerance = max(self.transfer_tolerance, _FLOAT_EPS)
+        if math.isclose(gap, 0.0, abs_tol=tolerance):
             status = "holds"
+        elif gap > 0.0:
+            status = "degrades"
+        else:
+            status = "improves"
         return TransferStatus(
             select_n=len(select), final_n=len(final),
             select_mean=select_mean, final_mean=final_mean,
@@ -640,7 +651,10 @@ class FailureStratifiedSampler:
                     starved.append(stratum)
                 if total_picks > 0 and picks == 0:
                     ignored.append(stratum)
-                if max(share, pick_share) >= self.dominant_share:
+                # One stratum is 100% of the tasks by construction; calling
+                # that "dominant" is noise, not a finding.
+                if len(strata) > 1 \
+                        and max(share, pick_share) >= self.dominant_share:
                     dominant.append(stratum)
                 coverage[stratum] = StratumCoverage(
                     stratum=stratum, total=len(ids),
@@ -659,7 +673,8 @@ class FailureStratifiedSampler:
                     warnings.append(
                         f"stratum '{stratum}' was ignored: 0 of "
                         f"{total_picks} picks")
-                if max(share, pick_share) >= self.dominant_share:
+                if len(strata) > 1 \
+                        and max(share, pick_share) >= self.dominant_share:
                     warnings.append(
                         f"stratum '{stratum}' is dominant: {share:.0%} of tasks, "
                         f"{pick_share:.0%} of picks; coverage is unbalanced")

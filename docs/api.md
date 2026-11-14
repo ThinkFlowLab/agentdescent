@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-617 public names across 122 modules.
+620 public names across 122 modules.
 
 ---
 
@@ -3010,9 +3010,54 @@ DifficultyWeighted(
 |---|---|
 | `stats() -> Dict[str, Tuple[float, float]]` | Copy of the per-task (passes, trials) counters -- for inspection/tests. |
 
+### `FailureStratifiedSampler(...)`
+
+Sample across base-failure strata, not from whichever mode is largest.
+
+```python
+FailureStratifiedSampler(
+    signature: Optional[Any] = None,
+    *,
+    tasks: Optional[Sequence[str]] = None,
+    min_per_stratum: int = 1,
+    search_frac: float = 0.5,
+    select_frac: float = 0.25,
+    final_frac: float = 0.25,
+    dominant_share: float = 0.6,
+    transfer_tolerance: float = 0.0,
+    seed: int = 0
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `pick(keys: Sequence[str], round_index: int) -> str` | Return a `search` task from `keys`, rotating across strata. |
+| `record(task_id: str, score: float) -> None` | Report a rollout score; select/final scores feed the transfer report. |
+| `report() -> SamplingReport` | Coverage, overlap, warnings and transfer status at this point. |
+| `split(keys: Optional[Sequence[str]] = None) -> TaskSplit` | The fixed split, assigning `keys` first when given. |
+| `stratum_of(task_id: str) -> str` | The base failure signature this task belongs to. |
+
 ### `RoundRobin()`
 
 Cycle through the shard in order -- the deterministic default.
+
+### `SamplingReport(...)`
+
+Stratum coverage, split overlap and transfer status for one sampler.
+
+```python
+SamplingReport(
+    split: TaskSplit,
+    coverage: Mapping[str, StratumCoverage],
+    overlap: Mapping[str, Tuple[str, ...]],
+    starved: Tuple[str, ...],
+    ignored: Tuple[str, ...],
+    dominant: Tuple[str, ...],
+    warnings: Tuple[str, ...],
+    transfer: TransferStatus,
+    picks: int
+) -> None
+```
 
 ### `TaskSampler`
 
@@ -3022,6 +3067,22 @@ Chooses the next task id for a worker, and learns from the outcome.
 |---|---|
 | `pick(keys: Sequence[str], round_index: int) -> str` | Return one task id from `keys` (never mutate `keys`). |
 | `record(task_id: str, score: float) -> None` | Report the reward a rollout of `task_id` achieved (0..1). |
+
+### `TaskSplit(...)`
+
+The three disjoint task sets a stratified sampler works from.
+
+```python
+TaskSplit(
+    search: Tuple[str, ...] = (),
+    select: Tuple[str, ...] = (),
+    final: Tuple[str, ...] = ()
+) -> None
+```
+
+| method | what it does |
+|---|---|
+| `overlap() -> Dict[str, Tuple[str, ...]]` | Task id -> the split names it appears in, only for leaked ids. |
 
 ---
 

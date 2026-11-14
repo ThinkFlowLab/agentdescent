@@ -8,6 +8,7 @@ final sets cannot leak into one another.
 
 import pytest
 
+from agentdescent.evolution import Task, evolve
 from agentdescent.sampling import (
     DifficultyWeighted,
     FailureStratifiedSampler,
@@ -174,8 +175,9 @@ def test_a_task_never_moves_split_when_new_ids_arrive():
     sampler = FailureStratifiedSampler(labels)
     before = sampler.split(ids)
     after = sampler.split(ids + ["late-0"])
-    assert after.search[:len(before.search)] == before.search or \
-        set(before.search) <= set(after.search)
+    # Every pre-existing id keeps its split; checking all three covers a move in
+    # either direction (search -> select and select -> search alike).
+    assert set(before.search) <= set(after.search)
     assert set(before.select) <= set(after.select)
     assert set(before.final) <= set(after.final)
 
@@ -189,3 +191,69 @@ def test_min_per_stratum_is_configurable():
         sampler.pick(ids, i)
     assert all(coverage.picks >= 3
                for coverage in sampler.report().coverage.values())
+
+
+def _small_universe(per_stratum=4):
+    """12 tasks in three strata: 6 search, 3 select, 3 final."""
+    labels = {}
+    for stratum in ("timeout", "format", "logic"):
+        for i in range(per_stratum):
+            labels[f"{stratum}-{i}"] = stratum
+    return labels
+
+
+def test_transfer_status_ignores_float_noise_at_zero_tolerance():
+    # 0.1 + 0.2 + 0.3 sums to ...004 in one order and ...000 in another, so the
+    # two means of identical scores differ by ~5e-17. A strict gap > 0 flips the
+    # status to "improves" on that noise and the status stops meaning anything.
+    labels = _small_universe()
+    sampler = FailureStratifiedSampler(labels)
+    split = sampler.split(list(labels))
+    assert (len(split.select), len(split.final)) == (3, 3)
+    for task_id, score in zip(split.select, (0.1, 0.2, 0.3)):
+        sampler.record(task_id, score)
+    for task_id, score in zip(split.final, (0.3, 0.2, 0.1)):
+        sampler.record(task_id, score)
+
+    transfer = sampler.report().transfer
+    assert transfer.gap != 0.0, "the fixture must carry the float difference"
+    assert transfer.status == "holds"
+
+
+def test_pick_on_a_shard_without_search_tasks_says_how_to_fix_it():
+    labels = _small_universe()
+    sampler = FailureStratifiedSampler(labels)
+    split = sampler.split(list(labels))
+    with pytest.raises(ValueError) as err:
+        sampler.pick(list(split.select) + list(split.final), 0)
+    assert "split()['search']" in str(err.value)
+
+
+def test_evolve_runs_when_the_task_list_is_the_search_split():
+    labels = _small_universe()
+    sampler = FailureStratifiedSampler(labels)
+    split = sampler.split(list(labels))
+    tasks = [Task(id=task_id, prompt="p") for task_id in split.search]
+    rolled = []
+
+    def run(rendered, task):
+        rolled.append(task.id)
+        return "answer"
+
+    evolve(tasks, lambda task, output: 0.0, run=run,
+           propose=lambda *args: None, task_sampler=sampler,
+           n_workers=3, max_concurrency=3, max_rollouts=6, rounds=2, seed=1)
+
+    assert rolled, "the run must roll something out"
+    assert set(rolled) <= set(split.search)
+
+
+def test_a_single_stratum_is_not_reported_as_dominant():
+    ids = [f"t{i}" for i in range(6)]
+    sampler = FailureStratifiedSampler()
+    sampler.split(ids)
+    for i in range(3):
+        sampler.pick(ids, i)
+    report = sampler.report()
+    assert report.dominant == ()
+    assert not any("dominant" in warning for warning in report.warnings)

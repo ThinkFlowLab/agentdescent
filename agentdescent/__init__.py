@@ -61,7 +61,15 @@ from .invariants import (
     check_invariants,
 )
 from .fusion import KeepContradictions, ReflectiveFusion, LearnableFusionPolicy, reflective_merge
-from .sampling import DifficultyWeighted, ReplaySampler, RoundRobin, TaskSampler
+from .sampling import (
+    DifficultyWeighted,
+    FailureStratifiedSampler,
+    ReplaySampler,
+    RoundRobin,
+    SamplingReport,
+    TaskSampler,
+    TaskSplit,
+)
 from .replay import ReplayAwareProposal
 from .selection import (
     Archive,
@@ -556,8 +564,11 @@ __all__ = [
     "baselines",
     "dataloader",
     "DifficultyWeighted",
+    "FailureStratifiedSampler",
     "RoundRobin",
+    "SamplingReport",
     "TaskSampler",
+    "TaskSplit",
     "ReflectiveFusion",
     "KeepContradictions",
     "LearnableFusionPolicy",

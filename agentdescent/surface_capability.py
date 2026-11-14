@@ -27,6 +27,7 @@ pipeline, synthesis, admission and archive stay in their tested modules.
 from __future__ import annotations
 
 import os
+import tempfile
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from .artifact_graph import ArtifactGraph
@@ -189,20 +190,55 @@ def capability_run(path: Any, *, out: Optional[str] = None,
     return payload
 
 
+def _write_demo_traces(traces_path: str) -> str:
+    """Write the four demo traces as one finished file, or none at all (#1046).
+
+    A plain ``open(..., "w")`` truncates the leaf before the first line, so an
+    interrupt left a half fixture that still parsed as a runnable trace file;
+    a completed file is fsynced and renamed into place instead, and a rename
+    does not write through a hardlink planted at the leaf.
+    """
+    handle = None
+    staged = None
+    try:
+        descriptor, staged = tempfile.mkstemp(
+            prefix=".staging-", suffix=".jsonl",
+            dir=os.path.dirname(traces_path))
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        for index in range(4):
+            handle.write(json_line({
+                "trace_id": f"demo-trace-{index}",
+                "task": f"Add the two numbers in line {index}: {index} + {index + 1}",
+                "output": "unknown",
+                "reward": 0.0,
+            }))
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(staged, traces_path)
+        staged = None
+    except BaseException:
+        # Ctrl-C is an ordinary way out of a demo run, so `Exception` is not
+        # enough: anything that stops the write must take the staging file with
+        # it, like the ports sidecar writer does.
+        if handle is not None:
+            handle.close()
+        if staged is not None:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+        raise
+    return traces_path
+
+
 def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
     target = os.path.abspath(os.path.expanduser(require_text(out, "out")))
     directory = os.path.dirname(target)
     os.makedirs(directory, exist_ok=True)
     traces_path = os.path.join(directory, "capability-traces.jsonl")
     if demo:
-        with open(traces_path, "w", encoding="utf-8") as handle:
-            for index in range(4):
-                handle.write(json_line({
-                    "trace_id": f"demo-trace-{index}",
-                    "task": f"Add the two numbers in line {index}: {index} + {index + 1}",
-                    "output": "unknown",
-                    "reward": 0.0,
-                }))
         spec = {
             "schema_version": SURFACE_SCHEMA_VERSION,
             "traces": traces_path,
@@ -228,7 +264,11 @@ def capability_init(out: Any, *, demo: bool = False) -> Dict[str, Any]:
             "kind": "tool",
             "tags": [],
         }
+    # The spec is written first: a target that cannot take it (a directory at
+    # ``--out``) is refused before any fixture exists beside it (#1046).
     atomic_write_json(target, spec)
+    if demo:
+        _write_demo_traces(traces_path)
     return {
         "schema_version": SURFACE_SCHEMA_VERSION,
         "ok": True,

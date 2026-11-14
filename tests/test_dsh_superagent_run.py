@@ -100,6 +100,8 @@ def test_a_run_outlives_the_turn_that_started_it_and_leaves_no_orphan(tmp_path):
     assert status["round"] == 3
 
     if report["driver"] == "tmux" and shutil.which("tmux"):
-        left = subprocess.run(["tmux", "has-session", "-t", report["session"]],
+        # `=` asks for that exact name: a bare target also prefix-matches a
+        # longer one, so `-t ad-runs` can answer about an unrelated ad-runs-2.
+        left = subprocess.run(["tmux", "has-session", "-t", "=" + report["session"]],
                               capture_output=True, text=True)
         assert left.returncode != 0, f"orphan tmux session {report['session']}"

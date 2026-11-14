@@ -106,6 +106,10 @@ your tree, under the operator's write allowlist).
   the Ticket.
 - `plan` is the budget line: it estimates cost without executing. Read it before
   `start`, and put the number in the Ticket.
+- A detached run no longer inherits the worker session: `launch` drops the
+  `DSH_*`, `CLAUDE*`, `CODEX*` and `MCP_*` variables before it starts the
+  grandchild, so the worker's session identity and MCP config stay with the
+  host while the API keys the run needs are passed through (`#1082`).
 
 ## 6. Long runs, Reports and Attention
 

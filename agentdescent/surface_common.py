@@ -38,6 +38,7 @@ __all__ = [
     "resolve_ref",
     "surface_allow_from_env",
     "surface_write_dirs_from_env",
+    "scrub_host_env",
 ]
 
 SURFACE_SCHEMA_VERSION = 1
@@ -198,6 +199,25 @@ def surface_write_dirs_from_env(environ: Optional[Mapping[str, str]] = None
         home = env.get("AGENTDESCENT_HOME") or "~/.agentdescent"
         return (os.getcwd(), os.path.abspath(os.path.expanduser(home)))
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+#: Host-session variables a child must not inherit (#1082): the worker's own
+#: identity, its MCP server configuration, and the harness markers around them.
+_HOST_MARKER_PREFIXES = ("DSH_", "CLAUDE", "CODEX", "MCP_")
+
+
+def scrub_host_env(environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """Drop the host session's markers and MCP config from a child environment.
+
+    The candidate's gates run under an allowlist (:func:`runners._child_env`),
+    but a detached run is our own process: it needs the API keys and ``PATH``
+    that an allowlist would drop. A denylist of the host-session prefixes keeps
+    the credentials while the worker's identity -- and any MCP config that would
+    hand the child a second set of tools -- stays with the host (#1082).
+    """
+    env = dict(os.environ if environ is None else environ)
+    return {name: value for name, value in env.items()
+            if not name.upper().startswith(_HOST_MARKER_PREFIXES)}
 
 
 def _allowed_module(module_name: str, allow: Optional[Sequence[str]]) -> bool:

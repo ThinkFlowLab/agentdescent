@@ -44,7 +44,8 @@ returns its rejection untouched — a cheap candidate the quality gate refused i
 still refused. It only prices candidates that were *about* to commit:
 
 ```python
-from agentdescent import CostPolicy, DefaultAcceptance
+from agentdescent import CostPolicy
+from agentdescent.defaults import DefaultAcceptance
 
 acceptance = CostPolicy(
     DefaultAcceptance(),

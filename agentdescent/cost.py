@@ -515,25 +515,43 @@ def cost_report(records: Iterable[Any], *,
     ``cost_status`` compares ``tokens_per_point`` with
     ``reference_tokens_per_point`` (lower is better); with no reference or no
     priced accepted diff it is ``unknown``.
+
+    A derived read is per **unit**, not per row: ``usd_per_accepted`` needs
+    every decision to have measured ``usd``, ``tokens_per_accepted`` needs
+    ``tokens`` on every one of them, and the same holds for ``calls`` and for
+    the per-point reads (``usd`` is optional by design and ``from_cards`` never
+    records ``calls``, so a row priced in one unit is normal). A row that is
+    priced but lacks the unit would otherwise enter the amortization as a free
+    contribution in that unit and make the diff read cheaper than the evidence
+    -- the failure the all-unpriced rule was for, one field down.
     """
     rows = list(records)
     accepted = 0
     missing = 0
-    unpriced = 0
     totals = {name: 0 for name in (
         "calls", "prompt_tokens", "completion_tokens", "tokens")}
     wallclock = 0.0
     usd = 0.0
     seen = set()
     gain_sum = 0.0
+    # Per unit: does every decision measure it? The amortized reads divide total
+    # spend by accepted diffs, so a rejected decision that never priced itself
+    # understates the numerator exactly as an accepted one does.
+    measured = {"calls": True, "tokens": True, "usd": True}
     for index, row in enumerate(rows):
         flag = row.get("accepted") if isinstance(row, Mapping) else getattr(
             row, "accepted", None)
         if not isinstance(flag, bool):
             raise ValueError(f"record {index}: accepted must be a bool")
         cost = _row_cost(row, index)
-        accepted_row = flag
-        if accepted_row:
+        if cost is None:
+            for name in measured:
+                measured[name] = False
+        else:
+            for name in measured:
+                if getattr(cost, name) is None:
+                    measured[name] = False
+        if flag:
             accepted += 1
             gain = _row_gain(row, index)
             if gain is not None and gain > 0.0:
@@ -541,7 +559,6 @@ def cost_report(records: Iterable[Any], *,
             if cost is None:
                 missing += 1
         if cost is None:
-            unpriced += 1
             continue
         for name in totals:
             value = getattr(cost, name)
@@ -564,21 +581,20 @@ def cost_report(records: Iterable[Any], *,
     dollars = usd if "usd" in seen else None
 
     # A partial numerator over a full denominator reads as a cheaper diff: an
-    # unpriced *accepted* row would be a free gain, and an unpriced rejected row
-    # hides spend the amortized numbers are meant to cover. So any unpriced
-    # decision leaves every derived read None; the totals stay partial and
-    # `missing_cost` says by how much (#945 review).
-    complete = unpriced == 0
-
-    def _per(value: Optional[float]) -> Optional[float]:
-        if not complete or value is None or accepted <= 0:
+    # unpriced *accepted* row would be a free gain, and a priced row that simply
+    # did not measure this unit would be a free contribution in it. Both are the
+    # same failure, so each derived read needs its own unit complete over the
+    # accepted rows it amortizes; the totals stay partial and `missing_cost`
+    # says how many decisions carry no cost at all (#945 review).
+    def _per(value: Optional[float], unit: str) -> Optional[float]:
+        if not measured[unit] or value is None or accepted <= 0:
             return None
         return value / accepted
 
-    tokens_per_point = (None if not complete or tokens is None or gain_sum <= 0.0
-                        else tokens / gain_sum)
-    usd_per_point = (None if not complete or dollars is None or gain_sum <= 0.0
-                     else dollars / gain_sum)
+    tokens_per_point = (None if not measured["tokens"] or tokens is None
+                        or gain_sum <= 0.0 else tokens / gain_sum)
+    usd_per_point = (None if not measured["usd"] or dollars is None
+                     or gain_sum <= 0.0 else dollars / gain_sum)
     status = UNKNOWN
     if reference_tokens_per_point is not None and tokens_per_point is not None:
         status = cost_status(tokens_per_point, reference_tokens_per_point,
@@ -587,8 +603,9 @@ def cost_report(records: Iterable[Any], *,
         decisions=len(rows), accepted=accepted, calls=calls,
         prompt_tokens=prompt, completion_tokens=completion, tokens=tokens,
         wallclock=wall, usd=dollars,
-        calls_per_accepted=_per(calls), tokens_per_accepted=_per(tokens),
-        usd_per_accepted=_per(dollars),
+        calls_per_accepted=_per(calls, "calls"),
+        tokens_per_accepted=_per(tokens, "tokens"),
+        usd_per_accepted=_per(dollars, "usd"),
         tokens_per_point=tokens_per_point, usd_per_point=usd_per_point,
         cost_status=status, missing_cost=missing,
         reference_tokens_per_point=reference_tokens_per_point)

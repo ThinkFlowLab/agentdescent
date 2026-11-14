@@ -94,6 +94,15 @@ accepted diffs that carried no usable cost, and `cost_status` is `unknown`
 without a reference — there is no scale to call anything better or worse
 against.
 
+The averages are per **unit**, and each one is `None` unless every decision
+measured that unit: `usd` is optional by design and an evidence card records
+tokens and wallclock but never `calls`, so a row priced in one unit and not
+another is normal. Dividing a tokens-only numerator by all accepted diffs would
+report a dollar figure cheaper than the evidence, which is the same failure as
+counting an unpriced diff as free — one field down. The partial totals
+(`tokens`, `usd`, `wallclock`) and `missing_cost` stay visible so the gap is
+still countable.
+
 ## 4. The promotion bar
 
 `PromotionRules(require_cost=True)` is the fail-closed bar on the promotion

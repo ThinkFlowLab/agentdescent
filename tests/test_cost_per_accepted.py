@@ -322,3 +322,56 @@ def test_an_unpriced_rejected_row_also_leaves_the_per_accepted_unknown():
     assert report.missing_cost == 0, "only accepted rows carry missing_cost"
     assert report.tokens_per_accepted is None
     assert report.tokens_per_point is None
+
+
+def test_a_priced_row_that_lacks_the_unit_never_enters_that_units_average():
+    """A row priced in tokens only must not read as a free dollar gain."""
+    report = cost_report([
+        {"accepted": True, "gain": 0.2, "cost": {"tokens": 1000, "usd": 0.02}},
+        {"accepted": True, "gain": 0.1, "cost": {"tokens": 1000}},
+    ])
+
+    # Both rows measured tokens, so the token average is real.
+    assert report.tokens_per_accepted == 1000.0
+    assert report.tokens_per_point == pytest.approx(2000 / 0.3)
+    # Only one row measured dollars: $0.02 over two diffs would read as $0.01.
+    assert report.usd == pytest.approx(0.02)
+    assert report.usd_per_accepted is None
+    assert report.usd_per_point is None
+    # Every decision carried a cost block, so nothing is counted missing.
+    assert report.missing_cost == 0
+
+
+def test_a_wallclock_only_row_never_enters_the_token_average():
+    """`Cost.from_cards` records tokens and wallclock but never calls, so a
+    unit-complete row is normal and must not be read as free tokens."""
+    report = cost_report([
+        {"accepted": True, "gain": 0.2, "cost": {"tokens": 1000}},
+        {"accepted": True, "gain": 0.1, "cost": {"wallclock": 1.5}},
+    ])
+
+    assert report.missing_cost == 0
+    assert report.tokens == 1000
+    assert report.wallclock == pytest.approx(1.5)
+    # 1000 tokens over two accepted diffs would read as 500: cheaper than the
+    # evidence, because the second diff never measured tokens at all.
+    assert report.tokens_per_accepted is None
+    assert report.tokens_per_point is None
+    assert report.cost_status == "unknown"
+
+
+def test_a_unit_every_decision_measured_keeps_its_average():
+    """The per-unit rule is not "any gap blanks everything": a complete unit
+    still reports, and only the incomplete ones go None."""
+    report = cost_report([
+        {"accepted": True, "gain": 0.2, "cost": {"tokens": 1000, "usd": 0.02}},
+        {"accepted": True, "gain": 0.1, "cost": {"tokens": 3000, "usd": 0.06}},
+        {"accepted": False, "cost": {"tokens": 2000, "usd": 0.04}},
+    ])
+
+    assert report.accepted == 2
+    assert report.tokens == 6000
+    assert report.tokens_per_accepted == pytest.approx(3000.0)
+    assert report.tokens_per_point == pytest.approx(6000 / 0.3)
+    assert report.usd_per_accepted == pytest.approx(0.06)
+    assert report.calls_per_accepted is None, "no row measured calls"

@@ -146,11 +146,13 @@ class MergeContext:
     #: :mod:`agentdescent.acceptance`, which imports this one for the types.
     probes: Optional[Any] = None
     #: What producing this diff cost (#945), or ``None`` when nobody measured
-    #: it. Additive and optional: the aggregator fills it only for a policy that
-    #: reads it, and a gate without cost still behaves exactly as before. Typed
-    #: as ``Any`` for the same reason as ``probes``: :mod:`agentdescent.cost`
-    #: imports this module, and a policy that wants the type imports ``Cost``
-    #: from there.
+    #: it. Additive and optional: ``None`` is what every run has today, and a
+    #: gate without cost still behaves exactly as before. ``aggregator._decide``
+    #: does **not** fill it yet -- a caller, or :class:`CostPolicy`'s card
+    #: fallback, supplies it -- so anything that reads this field must handle
+    #: ``None``. Typed as ``Any`` for the same reason as ``probes``:
+    #: :mod:`agentdescent.cost` imports this module, and a policy that wants the
+    #: type imports ``Cost`` from there.
     diff_cost: Optional[Any] = None
 
     @staticmethod

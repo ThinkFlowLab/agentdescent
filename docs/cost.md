@@ -111,6 +111,13 @@ side. A `PromotionRequest` without a measured `cost` (or with an all-`None`
 a rejection. With the default `require_cost=False`, requests without cost keep
 exactly the decision and hashes they had before this feature.
 
+The promotion bar and `CostPolicy(require_cost=True)` are not the same test, and
+the difference is deliberate: promotion needs *a* measurement (`Cost.known`), so
+a wallclock-only cost passes it, while `CostPolicy` needs a measurement in the
+unit it divides by, so the same cost defers there. A caller who wants the
+stricter reading on the promotion side should price the diff in the unit it
+gates on.
+
 ## 5. What is not here
 
 Provider billing, a price table, a claim that tokens are the only cost axis, and

@@ -581,11 +581,13 @@ def cost_report(records: Iterable[Any], *,
     dollars = usd if "usd" in seen else None
 
     # A partial numerator over a full denominator reads as a cheaper diff: an
-    # unpriced *accepted* row would be a free gain, and a priced row that simply
-    # did not measure this unit would be a free contribution in it. Both are the
-    # same failure, so each derived read needs its own unit complete over the
-    # accepted rows it amortizes; the totals stay partial and `missing_cost`
-    # says how many decisions carry no cost at all (#945 review).
+    # unpriced decision understates the spend the amortized reads divide, and a
+    # priced row that simply did not measure this unit is a free contribution in
+    # it. Both are the same failure, so each derived read needs its own unit
+    # complete over **every** decision -- the numerator is total spend, not
+    # accepted spend -- while the denominator stays the accepted diffs. The
+    # totals remain partial and `missing_cost` says how many accepted diffs
+    # carry no cost at all (#945 review).
     def _per(value: Optional[float], unit: str) -> Optional[float]:
         if not measured[unit] or value is None or accepted <= 0:
             return None

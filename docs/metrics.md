@@ -66,17 +66,14 @@ if exporter is not None:
 - A host can pass any object with `export_span`/`export_metric` (the
   `TelemetryExporter` protocol), so tests need no collector.
 - Off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set; `OTEL_EXPORTER_OTLP_HEADERS`
-  and `OTEL_SERVICE_NAME` are read too. Without
-  `pip install "agentdescent[otel]"`, constructing `OtlpExporter` raises an
-  `ImportError` naming that line — the failure lands at configuration time, not
-  after the host has already handed records over.
-- The endpoint is checked before anything is built, and its value is never
-  echoed in the error. Credentials in the URL are refused: pass them in
-  `OTEL_EXPORTER_OTLP_HEADERS`, because an HTTP client quotes a userinfo URL in
-  its own error text. Plain `http://` is accepted only for a literal loopback
-  host (`localhost`, `127.0.0.0/8`, `::1`); a private-network collector over
-  `http://` needs `AGENTDESCENT_OTEL_ALLOW_INSECURE=1`, which is the single
-  named escape hatch.
+  and `OTEL_SERVICE_NAME` are read too. Constructing `OtlpExporter` imports the
+  SDK, so without `pip install "agentdescent[otel]"` construction itself raises
+  an `ImportError` naming that line, before a run starts.
+- The endpoint is checked before anything is exported: a URL carrying
+  credentials (`https://user:token@host/`) is refused without the value being
+  repeated in the error, and plain `http://` is accepted only for a literal
+  loopback collector (`localhost`, `127.0.0.0/8`, `[::1]`). A remote collector
+  needs TLS terminated in front of it.
 - Delivery is per exporter and explicit. Each `OtlpExporter` owns its tracer and
   meter providers, so a second exporter in the same process does not export
   through the first one's endpoint or headers. The SDK batches spans for 5 s and

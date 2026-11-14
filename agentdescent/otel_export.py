@@ -12,13 +12,12 @@ piece between them and a collector:
   dashboard reads one set of names whichever export it consumes;
 - :func:`exporter_from_env` is the switch, and it is **off by default**: with no
   ``OTEL_EXPORTER_OTLP_ENDPOINT`` it returns ``None`` and nothing is exported;
-- :class:`OtlpExporter` is the only place the ``[otel]`` extra is imported, and
-  it imports it at construction: importing this module stays standard-library
-  only, constructing the exporter raises the install line when the extra is
-  missing, and the endpoint is checked before a single provider is built. Each
+- :class:`OtlpExporter` is the only place the ``[otel]`` extra is imported, in
+  its constructor: importing this module needs nothing extra, and a missing
+  extra raises the install line at construction, before a run starts. Each
   instance owns its tracer and meter providers, because the SDK keeps the first
-  provider installed process-wide: a second exporter must not export through the
-  first one's endpoint and headers;
+  provider installed process-wide: a second exporter must not export through
+  the first one's endpoint and headers;
 - :meth:`OtlpExporter.force_flush` and :meth:`OtlpExporter.shutdown` touch only
   this instance. The SDK batches spans (5 s) and exports metrics on an interval
   (60 s), so without a flush a short process loses what it handed over.
@@ -229,6 +228,48 @@ def export_run(exporter: TelemetryExporter, *, run_id: str,
     return exported
 
 
+def _is_loopback(host: str) -> bool:
+    """Literal loopback only: no name resolution, so no DNS-based bypass."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _endpoint_problem(endpoint: str) -> Optional[str]:
+    """Why an endpoint is refused, or ``None`` when it is acceptable.
+
+    The message never quotes the endpoint: a URL can carry a token, and a
+    refusal goes to the same logs the URL must not reach. The one non-TLS
+    allowance is a literal loopback collector; every other plain-``http``
+    endpoint is refused with TLS termination named as the remedy (no switch).
+    """
+    try:
+        parts = urlsplit(endpoint)
+    except ValueError:
+        return "the endpoint is not a valid URL"
+    if parts.scheme not in ("http", "https"):
+        return "the endpoint must be an http(s) URL"
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        return ("the endpoint must not carry credentials in the URL; put them "
+                "in OTEL_EXPORTER_OTLP_HEADERS instead")
+    host = parts.hostname or ""
+    if not host:
+        return "the endpoint needs a host"
+    if parts.scheme == "http" and not _is_loopback(host):
+        return ("plain http:// is only accepted for a loopback collector; "
+                "terminate TLS in front of a remote collector instead")
+    return None
+
+
+def _refuse_bad_endpoint(endpoint: str) -> None:
+    problem = _endpoint_problem(endpoint)
+    if problem is not None:
+        raise ValueError("refusing the OTLP endpoint: " + problem)
+
+
 def exporter_from_env(environ: Optional[Mapping[str, str]] = None
                       ) -> Optional[TelemetryExporter]:
     """The opt-in switch: ``None`` unless ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set."""
@@ -236,6 +277,7 @@ def exporter_from_env(environ: Optional[Mapping[str, str]] = None
     endpoint = str(env.get("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
     if not endpoint:
         return None
+    _refuse_bad_endpoint(endpoint)
     headers: Dict[str, str] = {}
     for pair in str(env.get("OTEL_EXPORTER_OTLP_HEADERS") or "").split(","):
         key, _, value = pair.partition("=")
@@ -243,7 +285,7 @@ def exporter_from_env(environ: Optional[Mapping[str, str]] = None
             headers[key.strip()] = value.strip()
     service = str(env.get("OTEL_SERVICE_NAME") or "").strip()
     return OtlpExporter(endpoint, headers=headers,
-                        service_name=service or DEFAULT_SERVICE_NAME, env=env)
+                        service_name=service or DEFAULT_SERVICE_NAME)
 
 
 _OTEL_INSTALL_HINT = (
@@ -251,7 +293,7 @@ _OTEL_INSTALL_HINT = (
 
 
 def _load_otel() -> Dict[str, Any]:
-    """The SDK classes the exporter needs, imported on the first export.
+    """The SDK classes the exporter needs, imported by the constructor.
 
     Behind a function so a test can stand a fake SDK in: the ``[otel]`` extra is
     not installed in CI, and the per-instance provider wiring is the part that
@@ -283,64 +325,12 @@ def _load_otel() -> Dict[str, Any]:
     }
 
 
-
-
-_INSECURE_ENV = "AGENTDESCENT_OTEL_ALLOW_INSECURE"
-
-
-def _is_loopback(host: str) -> bool:
-    """True for a literal loopback host, without resolving anything."""
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _endpoint_problem(endpoint: str, env: Optional[Mapping[str, str]] = None
-                      ) -> Optional[str]:
-    """Why *endpoint* is unusable, or ``None``. The value is never echoed."""
-    raw = str(endpoint).strip()
-    if not raw:
-        return "OTEL_EXPORTER_OTLP_ENDPOINT must not be empty"
-    try:
-        parts = urlsplit(raw)
-    except ValueError:
-        return "OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) URL"
-    scheme = parts.scheme.lower()
-    if scheme not in ("http", "https"):
-        return "OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) URL"
-    if "@" in parts.netloc:
-        return ("OTEL_EXPORTER_OTLP_ENDPOINT must not embed credentials; pass "
-                "them in OTEL_EXPORTER_OTLP_HEADERS instead")
-    if not parts.hostname:
-        return "OTEL_EXPORTER_OTLP_ENDPOINT must name a host"
-    if scheme == "http":
-        source = os.environ if env is None else env
-        allowed = str(source.get(_INSECURE_ENV) or "").strip() == "1"
-        if not allowed and not _is_loopback(parts.hostname):
-            return ("plain http is refused for a non-loopback collector: use "
-                    "https, or set " + _INSECURE_ENV + "=1 for a trusted "
-                    "private-network collector")
-    return None
-
-
 class OtlpExporter:
     """OTLP/HTTP through the OpenTelemetry SDK, imported at construction.
 
     Importing this module needs nothing extra; constructing this class imports
-    the SDK and raises the install line when it is missing, so a misconfigured
-    host learns at configuration time rather than after it has already handed
-    records over. The endpoint is validated first, and its value is never echoed
-    in the error.
-
-    Plain ``http://`` is accepted only for a literal loopback collector
-    (``localhost``, ``127.0.0.0/8``, ``::1``); anything else needs ``https`` or
-    the single named escape hatch ``AGENTDESCENT_OTEL_ALLOW_INSECURE=1`` for a
-    private-network collector. Credentials in the URL are refused outright --
-    they belong in ``OTEL_EXPORTER_OTLP_HEADERS``, and a userinfo URL would be
-    quoted by an HTTP client's error text.
+    the SDK, so a missing extra raises the install line here, before a run
+    starts, rather than on the first span a caller writes.
 
     Each instance owns its tracer and meter providers. The SDK keeps the *first*
     provider installed process-wide, so a bridge that installed a global
@@ -353,48 +343,30 @@ class OtlpExporter:
     """
 
     def __init__(self, endpoint: str, *, headers: Optional[Mapping[str, str]] = None,
-                 service_name: str = DEFAULT_SERVICE_NAME,
-                 env: Optional[Mapping[str, str]] = None) -> None:
-        problem = _endpoint_problem(endpoint, env)
-        if problem is not None:
-            raise ValueError(problem)
-        self.endpoint = str(endpoint).strip().rstrip("/")
+                 service_name: str = DEFAULT_SERVICE_NAME) -> None:
+        endpoint = str(endpoint).strip()
+        _refuse_bad_endpoint(endpoint)
+        self.endpoint = endpoint.rstrip("/")
         self.headers = dict(headers or {})
         self.service_name = service_name
-        # Imported here, not on the first export: the docs promise an install
-        # error at configuration time, and a host that reaches the first span
-        # has already counted records it cannot deliver.
-        self._otel: Optional[Dict[str, Any]] = _load_otel()
-        self._tracer_provider: Any = None
-        self._meter_provider: Any = None
-        self._tracer: Any = None
-        self._meter: Any = None
         self._instruments: Dict[str, Any] = {}
         self._stopped = False
+        self._otel = _load_otel()    # fail at construction, not mid-run
+        resource = self._otel["Resource"].create({"service.name": service_name})
+        self._tracer_provider = self._otel["TracerProvider"](resource=resource)
+        self._tracer_provider.add_span_processor(self._otel["BatchSpanProcessor"](
+            self._otel["OTLPSpanExporter"](endpoint=self._url("traces"),
+                                           headers=self.headers or None)))
+        self._meter_provider = self._otel["MeterProvider"](
+            resource=resource,
+            metric_readers=[self._otel["PeriodicExportingMetricReader"](
+                self._otel["OTLPMetricExporter"](endpoint=self._url("metrics"),
+                                                 headers=self.headers or None))])
+        self._tracer = self._tracer_provider.get_tracer("agentdescent")
+        self._meter = self._meter_provider.get_meter("agentdescent")
 
     def _url(self, signal: str) -> str:
         return f"{self.endpoint}/v1/{signal}"
-
-    def _open(self) -> None:
-        """Build *this* instance's providers, once, on the first export."""
-        if self._tracer_provider is not None:
-            return
-        otel = self._otel if self._otel is not None else _load_otel()
-        resource = otel["Resource"].create({"service.name": self.service_name})
-        tracer_provider = otel["TracerProvider"](resource=resource)
-        tracer_provider.add_span_processor(otel["BatchSpanProcessor"](
-            otel["OTLPSpanExporter"](endpoint=self._url("traces"),
-                                     headers=self.headers or None)))
-        meter_provider = otel["MeterProvider"](
-            resource=resource,
-            metric_readers=[otel["PeriodicExportingMetricReader"](
-                otel["OTLPMetricExporter"](endpoint=self._url("metrics"),
-                                           headers=self.headers or None))])
-        self._otel = otel
-        self._tracer_provider = tracer_provider
-        self._meter_provider = meter_provider
-        self._tracer = tracer_provider.get_tracer("agentdescent")
-        self._meter = meter_provider.get_meter("agentdescent")
 
     def force_flush(self, timeout_millis: int = 3000) -> bool:
         """Flush this instance's batched spans and pending metrics now."""
@@ -415,7 +387,6 @@ class OtlpExporter:
                 provider.shutdown()
 
     def export_span(self, span: ExportedSpan) -> None:   # pragma: no cover - extra
-        self._open()
         status, status_code = self._otel["Status"], self._otel["StatusCode"]
         current = self._tracer.start_span(
             span.name, start_time=int(float(span.start) * 1_000_000_000),
@@ -425,7 +396,6 @@ class OtlpExporter:
         current.end(end_time=int(float(span.end) * 1_000_000_000))
 
     def export_metric(self, metric: ExportedMetric) -> None:   # pragma: no cover
-        self._open()
         instrument = self._instruments.get(metric.name)
         if instrument is None:
             # ``create_gauge`` exists at the pinned floor: present in the SDK

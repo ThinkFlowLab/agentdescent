@@ -69,8 +69,26 @@ block (with `status`) is on `provenance["cost"]`. The decision that a cost
 quality gain is real, it just did not pay for itself.
 
 The cost the policy reads is `MergeContext.diff_cost` when the caller measured
-one; otherwise it is `Cost.from_cards` over the cards that justify the diff —
-the usage the loop already records per working diff.
+one. Otherwise it is `Cost.from_cards` over the cards that justify the diff, and
+**in-tree that fallback is always unknown**: no producer writes
+`cost_tokens`/`cost_wallclock` onto an `EvidenceCard` — `evolution.py` and
+`async_evolve.py` build cards without them — so the sum is empty and
+`from_cards` returns `Cost()`, not a free diff. A caller that wants the gate to
+price a diff passes the measurement itself:
+
+```python
+from agentdescent import Cost
+
+ctx.diff_cost = Cost.from_usage(usage)   # the caller's own metered Usage
+```
+
+!!! warning "`require_cost=True` on a run whose cards carry no cost"
+
+    Every candidate the inner gate accepted is then deferred, with
+    `category="cost-unknown"`: that run cannot commit until the caller prices
+    the diff. The `reference_quality_per_cost` and `min_gain_per_1k_tokens`
+    branches are read only from a measured cost, so neither fires on the card
+    fallback.
 
 ## 3. The report
 

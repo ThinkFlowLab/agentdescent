@@ -31,7 +31,10 @@ print(cost_status(cost_efficiency(0.10, cost), 0.05))   # improved/neutral/…
 free"); an unmeasured field is not. `Cost().known` is `False`, and every derived
 value (`cost_efficiency`, the report's per-accepted fields) stays `None` rather
 than pretending the diff was free. `Cost.from_cards` sums what the contributing
-[evidence cards](data-model.md) already record for one working diff.
+[evidence cards](data-model.md) record for one working diff — and in-tree that
+is nothing, since no producer writes a cost onto a card, so it returns `Cost()`
+as well. [The acceptance option](#2-the-acceptance-option) has the fallback and
+what `require_cost` does with it.
 
 `usd` is whatever the caller measured. There is no provider price table and no
 billing in this repository: an unpriced run leaves `usd=None` and still reports

@@ -7,6 +7,6 @@ stay with the host while the credentials and `PATH` the run needs still pass
 through (#1082). The list is the one the candidate worker already dropped
 (`agentdescent.agents.worker_env`); it used to be a second, shorter copy, and
 five of its eleven entries crossed the scrub. The host's config/home
-directories (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`) are kept, because
-they name configuration rather than session and the run resolves a host's real
-home from them (#1082).
+directories (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`, `XDG_CONFIG_HOME`)
+are kept, because they name configuration rather than session and the run
+resolves a host's real home from them (#1082).

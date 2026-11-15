@@ -113,9 +113,10 @@ your tree, under the operator's write allowlist).
   host while the API keys the run needs are passed through (`#1082`). The list
   is the one the candidate worker drops, not a second copy of it. The host's
   config/home directories (`DETACHED_KEEP_VARS`: `CLAUDE_CONFIG_DIR`,
-  `CODEX_HOME`, `DSH_HOME`) are kept: they name configuration, not session, and
-  this run resolves a host's real home from them for `isolate: false` workers
-  and for `agentdescent start` from a terminal.
+  `CODEX_HOME`, `DSH_HOME`, `XDG_CONFIG_HOME`) are kept: they name
+  configuration, not session, and this run resolves a host's real home from
+  them for `isolate: false` workers and for `agentdescent start` from a
+  terminal.
 
 ## 6. Long runs, Reports and Attention
 

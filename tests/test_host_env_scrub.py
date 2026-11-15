@@ -13,14 +13,16 @@ so a marker added for a new host is covered here the day it is added.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import subprocess
+from unittest import mock
 
 import pytest
 
-from agentdescent import runstore
+from agentdescent import integrations, runstore
 from agentdescent.agents import SESSION_MARKERS as AGENTS_SESSION_MARKERS
-from agentdescent.agents import WORKER_CONFIG_DIRS
 from agentdescent.surface_common import DETACHED_KEEP_VARS, SESSION_MARKERS, scrub_host_env
 
 HOST_MARKERS = {
@@ -35,11 +37,14 @@ HOST_MARKERS = {
 #: The host config/home directories the run itself reads
 #: (``integrations._host_root``), so a worker spec with ``isolate: false`` -- and
 #: every ``agentdescent start`` from a plain terminal -- resolves the user's real
-#: setup instead of the default home (#1082 review).
+#: setup instead of the default home (#1082 review). The fourth is
+#: ``XDG_CONFIG_HOME``: OpenCode resolves its config under XDG, which is the
+#: variable that actually moves it.
 HOST_CONFIG_DIRS = {
     "CLAUDE_CONFIG_DIR": "/home/someone/.claude-work",
     "CODEX_HOME": "/home/someone/.codex-work",
     "DSH_HOME": "/home/someone/.dsh-work",
+    "XDG_CONFIG_HOME": "/home/someone/.config-work",
 }
 
 #: One variable per marker, spelled the way a host would set it: the bare name
@@ -59,6 +64,84 @@ def test_scrub_drops_host_markers_and_keeps_what_the_run_needs(monkeypatch):
         assert name not in env
     assert env["ARK_API_KEY"] == "not-a-real-key"
     assert env["PATH"] == os.environ["PATH"]
+
+
+def _host_root_variables() -> set:
+    """The names ``integrations._host_root`` is actually called with.
+
+    Read from the module's own source, so a fifth host root added there fails the
+    drift row below instead of silently resolving to its default directory.
+    """
+    tree = ast.parse(inspect.getsource(integrations))
+    names = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_host_root" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            names.add(node.args[0].value)
+    return names
+
+
+def test_the_keep_set_covers_every_variable_host_root_reads():
+    """The keep list is in the leaf module, so a test binds it to `integrations`.
+
+    Both directions: a fifth host root fails the first assert, and a name the
+    worker's own map does not know fails the second -- so neither list can move
+    alone.
+    """
+    from agentdescent.agents import WORKER_CONFIG_DIRS
+
+    roots = _host_root_variables()
+    assert roots == {"DSH_HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR"}
+    assert roots <= set(DETACHED_KEEP_VARS)
+    assert set(DETACHED_KEEP_VARS) <= set(WORKER_CONFIG_DIRS)
+
+
+def test_every_host_root_resolves_under_the_scrubbed_environment(monkeypatch):
+    """After the scrub each host still finds the directory it was configured with."""
+    for name, value in HOST_CONFIG_DIRS.items():
+        monkeypatch.setenv(name, value)
+
+    env = scrub_host_env(os.environ)
+
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert integrations._dsh_root("/home/someone", True) == HOST_CONFIG_DIRS["DSH_HOME"]
+        assert integrations._codex_root("/home/someone", True) == HOST_CONFIG_DIRS["CODEX_HOME"]
+        assert (integrations._claude_root("/home/someone", True)
+                == HOST_CONFIG_DIRS["CLAUDE_CONFIG_DIR"])
+        assert (integrations._opencode_root("/home/someone", True)
+                == os.path.join(HOST_CONFIG_DIRS["XDG_CONFIG_HOME"], "opencode"))
+
+
+def test_an_isolated_worker_still_loses_and_redirects_the_config_dirs(tmp_path, monkeypatch):
+    """The keep set is the detached run's; a candidate worker keeps none of it.
+
+    Asserted as where each value points, not merely as absence: an absence-only
+    row would pass while the worker still pointed at the host's directory if the
+    redirect ever stopped taking (#1082 review).
+    """
+    from agentdescent.agents import worker_env
+
+    for name, value in HOST_CONFIG_DIRS.items():
+        monkeypatch.setenv(name, value)
+
+    env = worker_env(str(tmp_path), isolate=True)
+    expected = {
+        "CLAUDE_CONFIG_DIR": "claude",
+        "CODEX_HOME": "codex",
+        "DSH_HOME": "dsh",
+        "XDG_CONFIG_HOME": "xdg",
+    }
+
+    for name, leaf in expected.items():
+        assert env[name] == os.path.join(str(tmp_path), ".agentdescent-worker", leaf), name
+
+    # `isolate=False` is the opposite contract: the worker sees the user's setup,
+    # which is why the detached run keeps these four in the first place.
+    loose = worker_env(str(tmp_path), isolate=False)
+    for name, value in HOST_CONFIG_DIRS.items():
+        assert loose[name] == value, name
 
 
 def test_the_host_config_dirs_survive_and_the_session_does_not(monkeypatch):
@@ -81,12 +164,6 @@ def test_the_host_config_dirs_survive_and_the_session_does_not(monkeypatch):
         assert env[name] == value, name
     for name in HOST_MARKERS:
         assert name not in env, name
-
-
-def test_the_keep_set_cannot_name_a_directory_agents_does_not_know():
-    """The keep list lives in this leaf module, so a test binds it to `agents`."""
-    assert set(DETACHED_KEEP_VARS) == set(HOST_CONFIG_DIRS)
-    assert set(DETACHED_KEEP_VARS) <= set(WORKER_CONFIG_DIRS)
 
 
 def test_launch_keeps_the_host_config_dirs_and_drops_the_session(tmp_path, monkeypatch):
@@ -186,10 +263,10 @@ def test_launch_re_scrubs_a_caller_supplied_env(tmp_path, monkeypatch):
     monkeypatch.setattr(runstore.subprocess, "run", fake_run)
 
     runstore.launch(rd, env={"MCP_SERVERS": '{"filesystem": {}}',
-                             "XDG_CONFIG_HOME": "/home/someone/.config",
+                             "DSH_SESSION_ID": "host-session",
                              "RUN_TAG": "kept"})
 
     env = seen["env"]
-    assert "MCP_SERVERS" not in env and "XDG_CONFIG_HOME" not in env
+    assert "MCP_SERVERS" not in env and "DSH_SESSION_ID" not in env
     assert env["RUN_TAG"] == "kept"
     assert env["PYTHONPATH"]

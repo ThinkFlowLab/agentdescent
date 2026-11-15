@@ -243,15 +243,18 @@ SESSION_MARKERS: Tuple[str, ...] = (
 #:
 #: The candidate worker redirects these into its own workspace
 #: (:func:`agentdescent.agents.worker_env`), but the detached run is this
-#: package: ``integrations._host_root`` reads them so a worker spec with
+#: package: ``integrations._host_root`` reads all four so a worker spec with
 #: ``isolate: false`` -- and every ``agentdescent start`` from a plain terminal
 #: -- resolves the user's configured home. Dropping them sent such a run to
-#: ``~/.claude`` / ``~/.codex``, which for a custom ``CLAUDE_CONFIG_DIR`` is the
-#: wrong, often unauthenticated, login. The names are listed here, not imported
-#: from ``agents``, because this module stays a leaf; the test
-#: ``test_the_keep_set_cannot_name_a_directory_agents_does_not_know`` binds them
-#: to :data:`agentdescent.agents.WORKER_CONFIG_DIRS`.
-DETACHED_KEEP_VARS: Tuple[str, ...] = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME")
+#: ``~/.claude`` / ``~/.codex`` / ``~/.config``, which for a custom directory is
+#: the wrong, often unauthenticated, login. ``XDG_CONFIG_HOME`` is the one
+#: OpenCode actually follows, which is why it is here too. The names are listed
+#: here, not imported from ``agents``, because this module stays a leaf; the test
+#: ``test_the_keep_set_covers_every_variable_host_root_reads`` reads the names
+#: out of ``integrations``' own source, so a fifth host root fails it.
+DETACHED_KEEP_VARS: Tuple[str, ...] = (
+    "CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME", "XDG_CONFIG_HOME",
+)
 
 
 def is_session_marker(name: str) -> bool:

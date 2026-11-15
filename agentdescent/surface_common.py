@@ -17,7 +17,8 @@ import inspect
 import json
 import os
 import tempfile
-from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Type, TypeVar
+from typing import (Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple,
+                    Type, TypeVar)
 
 __all__ = [
     "SURFACE_SCHEMA_VERSION",
@@ -39,6 +40,8 @@ __all__ = [
     "surface_allow_from_env",
     "surface_write_dirs_from_env",
     "scrub_host_env",
+    "SESSION_MARKERS",
+    "is_session_marker",
 ]
 
 SURFACE_SCHEMA_VERSION = 1
@@ -201,9 +204,50 @@ def surface_write_dirs_from_env(environ: Optional[Mapping[str, str]] = None
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-#: Host-session variables a child must not inherit (#1082): the worker's own
-#: identity, its MCP server configuration, and the harness markers around them.
-_HOST_MARKER_PREFIXES = ("DSH_", "CLAUDE", "CODEX", "MCP_")
+#: Environment variables a host agent sets in its own session and its children
+#: inherit. A worker that sees them believes it is *inside* that session: Claude
+#: Code refuses to start, DSH loads the parent's profile, and a worker whose
+#: host runs this package's MCP server would call it recursively (#1082).
+#:
+#: One tuple, in this leaf module, because there used to be two lists: the
+#: candidate worker (:func:`agentdescent.agents.worker_env`) dropped these
+#: eleven names while :func:`scrub_host_env` dropped the four prefixes
+#: ``DSH_``/``CLAUDE``/``CODEX``/``MCP_``. Measured on that pair, five of the
+#: eleven crossed the scrub -- ``OPENAI_AGENT_*``, ``OPENCODE_CONFIG``,
+#: ``OPENCODE_CONFIG_CONTENT``, ``OPENCODE_CONFIG_DIR`` and ``XDG_CONFIG_HOME``
+#: -- and the two OpenCode config carriers are the ones measured to hand a
+#: nested process the parent's MCP servers. The tuple lives here rather than in
+#: ``agents`` because ``agents`` imports ``socket``/``threading``/``urllib``
+#: and every surface module imports this one.
+SESSION_MARKERS: Tuple[str, ...] = (
+    "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_CONFIG_DIR", "CODEX_", "DSH_",
+    "OPENAI_AGENT_", "MCP_",
+    # OpenCode reads three of these, and redirecting only the directory is not
+    # isolation: `OPENCODE_CONFIG` (a file) and `OPENCODE_CONFIG_CONTENT`
+    # (inline JSON) both win over `OPENCODE_CONFIG_DIR` -- measured, a config
+    # named by `OPENCODE_CONFIG` still supplied its MCP servers with the dir
+    # pointed at an empty directory. They are dropped by name rather than by an
+    # "OPENCODE_" prefix on purpose: `OPENCODE_API_KEY` is a provider
+    # credential, and a worker needs its keys.
+    "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT",
+    # Dropped so a redirect can take: `setdefault` cannot override a value the
+    # parent already exported, and this one usually is exported. It is broader
+    # than the others -- every XDG-respecting tool the child runs sees the
+    # workspace copy -- which is the point of an isolated worker.
+    "XDG_CONFIG_HOME",
+)
+
+
+def is_session_marker(name: str) -> bool:
+    """Whether ``name`` belongs to a host agent's session rather than to the run.
+
+    ``CLAUDECODE`` is a bare name, not a prefix, so a marker matches when the
+    variable is the marker without its trailing underscore, or starts with the
+    marker itself.
+    """
+    upper = name.upper()
+    return any(upper == marker.rstrip("_") or upper.startswith(marker)
+               for marker in SESSION_MARKERS)
 
 
 def scrub_host_env(environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
@@ -211,13 +255,16 @@ def scrub_host_env(environ: Optional[Mapping[str, str]] = None) -> Dict[str, str
 
     The candidate's gates run under an allowlist (:func:`runners._child_env`),
     but a detached run is our own process: it needs the API keys and ``PATH``
-    that an allowlist would drop. A denylist of the host-session prefixes keeps
+    that an allowlist would drop. A denylist of the host-session variables keeps
     the credentials while the worker's identity -- and any MCP config that would
     hand the child a second set of tools -- stays with the host (#1082).
+
+    The list is :data:`SESSION_MARKERS`, the same one the candidate worker
+    drops, so the two cannot drift apart again.
     """
     env = dict(os.environ if environ is None else environ)
     return {name: value for name, value in env.items()
-            if not name.upper().startswith(_HOST_MARKER_PREFIXES)}
+            if not is_session_marker(name)}
 
 
 def _allowed_module(module_name: str, allow: Optional[Sequence[str]]) -> bool:

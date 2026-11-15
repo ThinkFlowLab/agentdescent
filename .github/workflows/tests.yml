@@ -56,4 +56,4 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[otel]" pytest
       - run: python scripts/otel_wire_smoke.py
-      - run: AGENTDESCENT_OTEL_WIRE=1 pytest -q tests/test_otel_wire.py
+      - run: AGENTDESCENT_OTEL_WIRE=1 pytest -q tests/test_otel_wire.py tests/test_otel_export.py

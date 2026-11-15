@@ -41,6 +41,7 @@ __all__ = [
     "surface_write_dirs_from_env",
     "scrub_host_env",
     "SESSION_MARKERS",
+    "DETACHED_KEEP_VARS",
     "is_session_marker",
 ]
 
@@ -238,6 +239,21 @@ SESSION_MARKERS: Tuple[str, ...] = (
 )
 
 
+#: The host config/home directories a *detached run* keeps (#1082 review).
+#:
+#: The candidate worker redirects these into its own workspace
+#: (:func:`agentdescent.agents.worker_env`), but the detached run is this
+#: package: ``integrations._host_root`` reads them so a worker spec with
+#: ``isolate: false`` -- and every ``agentdescent start`` from a plain terminal
+#: -- resolves the user's configured home. Dropping them sent such a run to
+#: ``~/.claude`` / ``~/.codex``, which for a custom ``CLAUDE_CONFIG_DIR`` is the
+#: wrong, often unauthenticated, login. The names are listed here, not imported
+#: from ``agents``, because this module stays a leaf; the test
+#: ``test_the_keep_set_cannot_name_a_directory_agents_does_not_know`` binds them
+#: to :data:`agentdescent.agents.WORKER_CONFIG_DIRS`.
+DETACHED_KEEP_VARS: Tuple[str, ...] = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME")
+
+
 def is_session_marker(name: str) -> bool:
     """Whether ``name`` belongs to a host agent's session rather than to the run.
 
@@ -260,11 +276,13 @@ def scrub_host_env(environ: Optional[Mapping[str, str]] = None) -> Dict[str, str
     hand the child a second set of tools -- stays with the host (#1082).
 
     The list is :data:`SESSION_MARKERS`, the same one the candidate worker
-    drops, so the two cannot drift apart again.
+    drops, so the two cannot drift apart again. The exception is
+    :data:`DETACHED_KEEP_VARS`: those three name the host's *configuration*, not
+    its session, and this run resolves a host's real home from them.
     """
     env = dict(os.environ if environ is None else environ)
     return {name: value for name, value in env.items()
-            if not is_session_marker(name)}
+            if name.upper() in DETACHED_KEEP_VARS or not is_session_marker(name)}
 
 
 def _allowed_module(module_name: str, allow: Optional[Sequence[str]]) -> bool:

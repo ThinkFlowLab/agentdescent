@@ -20,7 +20,8 @@ import pytest
 
 from agentdescent import runstore
 from agentdescent.agents import SESSION_MARKERS as AGENTS_SESSION_MARKERS
-from agentdescent.surface_common import SESSION_MARKERS, scrub_host_env
+from agentdescent.agents import WORKER_CONFIG_DIRS
+from agentdescent.surface_common import DETACHED_KEEP_VARS, SESSION_MARKERS, scrub_host_env
 
 HOST_MARKERS = {
     "DSH_SESSION_ID": "host-session",
@@ -29,6 +30,16 @@ HOST_MARKERS = {
     "CLAUDECODE": "1",
     "CODEX_SANDBOX": "1",
     "MCP_SERVERS": '{"filesystem": {}}',
+}
+
+#: The host config/home directories the run itself reads
+#: (``integrations._host_root``), so a worker spec with ``isolate: false`` -- and
+#: every ``agentdescent start`` from a plain terminal -- resolves the user's real
+#: setup instead of the default home (#1082 review).
+HOST_CONFIG_DIRS = {
+    "CLAUDE_CONFIG_DIR": "/home/someone/.claude-work",
+    "CODEX_HOME": "/home/someone/.codex-work",
+    "DSH_HOME": "/home/someone/.dsh-work",
 }
 
 #: One variable per marker, spelled the way a host would set it: the bare name
@@ -44,9 +55,65 @@ def test_scrub_drops_host_markers_and_keeps_what_the_run_needs(monkeypatch):
 
     env = scrub_host_env(os.environ)
 
-    assert [k for k in env if k.upper().startswith(("DSH_", "CLAUDE", "CODEX", "MCP_"))] == []
+    for name in HOST_MARKERS:
+        assert name not in env
     assert env["ARK_API_KEY"] == "not-a-real-key"
     assert env["PATH"] == os.environ["PATH"]
+
+
+def test_the_host_config_dirs_survive_and_the_session_does_not(monkeypatch):
+    """The row the review named: the host's config/home dirs survive `launch`.
+
+    `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `DSH_HOME` are host *configuration*,
+    which this package reads through `integrations._host_root`, not session
+    identity: dropping them sent a worker spec with `isolate: false` -- and every
+    `agentdescent start` from a terminal -- to `~/.claude` / `~/.codex`, which for
+    a custom directory is the wrong, often unauthenticated, login (#1082 review).
+    """
+    for name, value in HOST_CONFIG_DIRS.items():
+        monkeypatch.setenv(name, value)
+    for name, value in HOST_MARKERS.items():
+        monkeypatch.setenv(name, value)
+
+    env = scrub_host_env(os.environ)
+
+    for name, value in HOST_CONFIG_DIRS.items():
+        assert env[name] == value, name
+    for name in HOST_MARKERS:
+        assert name not in env, name
+
+
+def test_the_keep_set_cannot_name_a_directory_agents_does_not_know():
+    """The keep list lives in this leaf module, so a test binds it to `agents`."""
+    assert set(DETACHED_KEEP_VARS) == set(HOST_CONFIG_DIRS)
+    assert set(DETACHED_KEEP_VARS) <= set(WORKER_CONFIG_DIRS)
+
+
+def test_launch_keeps_the_host_config_dirs_and_drops_the_session(tmp_path, monkeypatch):
+    for name, value in HOST_CONFIG_DIRS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("DSH_SESSION_ID", "host-session")
+    monkeypatch.setenv("MCP_SERVERS", '{"filesystem": {}}')
+    rd = runstore.create({"kind": "text", "target": str(tmp_path / "out.md")},
+                         store=str(tmp_path / "store"))
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0, stdout="4242\n", stderr="")
+
+    monkeypatch.setattr(runstore.subprocess, "run", fake_run)
+
+    st = runstore.launch(rd)
+
+    assert st.pid == 4242
+    env = seen["env"]
+    for name, value in HOST_CONFIG_DIRS.items():
+        assert env[name] == value, name
+    assert "CLAUDECODE" not in env
+    assert "DSH_SESSION_ID" not in env
+    assert "MCP_SERVERS" not in env
 
 
 def test_scrub_does_not_mutate_the_caller(monkeypatch):

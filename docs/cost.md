@@ -30,8 +30,10 @@ print(cost_status(cost_efficiency(0.10, cost), 0.05))   # improved/neutral/…
 **A missing number is `None`, never `0`.** Zero is a measurement ("this diff was
 free"); an unmeasured field is not. `Cost().known` is `False`, and every derived
 value (`cost_efficiency`, the report's per-accepted fields) stays `None` rather
-than pretending the diff was free. `Cost.from_cards` sums what the contributing
-[evidence cards](data-model.md) already record for one working diff.
+than pretending the diff was free. `Cost.from_cards` sums the cost the
+contributing [evidence cards](data-model.md) record for one working diff
+(`EvidenceCard.cost_tokens` / `cost_wallclock`); no producer in this tree fills
+either field, so that sum is `Cost()` — see §2.
 
 `usd` is whatever the caller measured. There is no provider price table and no
 billing in this repository: an unpriced run leaves `usd=None` and still reports
@@ -69,8 +71,22 @@ block (with `status`) is on `provenance["cost"]`. The decision that a cost
 quality gain is real, it just did not pay for itself.
 
 The cost the policy reads is `MergeContext.diff_cost` when the caller measured
-one; otherwise it is `Cost.from_cards` over the cards that justify the diff —
-the usage the loop already records per working diff.
+one; otherwise it is `Cost.from_cards` over the cards that justify the diff.
+That fallback is always unknown on a normal in-tree run: no producer fills
+`EvidenceCard.cost_tokens` or `cost_wallclock`, so `Cost.from_cards` returns
+`Cost()` and `known` is `False`. A caller that wants the gate to price a diff
+supplies the measurement — `Cost.from_usage(usage)` over the usage the run
+already recorded, passed as `diff_cost` on the `MergeContext`. That dataclass is
+frozen, so the field is set when the context is built, or with
+`dataclasses.replace` on one that already exists.
+
+**`require_cost=True` on such a run defers every candidate.** An unpriced diff
+leaves `cost_efficiency` `None`, so the wrapper returns
+`AcceptDecision(accept=False, category="cost-unknown", defer=True)` for every
+candidate the inner gate accepted: a gate configured that way can never commit
+until a caller supplies a price. The same unknown leaves
+`reference_quality_per_cost` and `min_gain_per_1k_tokens` nothing to compare
+against, so neither can refuse a candidate on this tree either.
 
 ## 3. The report
 

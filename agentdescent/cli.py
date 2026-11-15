@@ -80,6 +80,26 @@ def _version() -> str:
 #: host that is itself being evolved cannot start a nested run. See docs/plugins.md.
 NESTED_ENV = "AGENTDESCENT_NESTED"
 
+#: Machine-readable reason a nested start is refused, so a host can branch on it
+#: instead of matching the sentence. Doctor reports it as `nested_guard`.
+NESTED_REFUSAL = "nested-run"
+
+
+def nested_refusal() -> Optional[str]:
+    """The sentence that refuses a nested run, or ``None`` outside a worker.
+
+    ``runners._child_env`` sets ``NESTED_ENV`` in every worker it spawns, so a
+    host that is itself being evolved would otherwise reach ``evolve`` and start
+    a second run on a machine already running one -- and each of its workers can
+    do it again. The MCP ``start`` tool had the stub; the CLI read no marker at
+    all, which is the recursion this closes (#963).
+    """
+    if not os.environ.get(NESTED_ENV):
+        return None
+    return (f"{NESTED_ENV} is set: this session is itself a worker of an evolution "
+            f"run, so a nested run would recurse; no run was started "
+            f"(reason: {NESTED_REFUSAL})")
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -634,6 +654,9 @@ def doctor_report(*, home: Optional[str] = None) -> Dict[str, Any]:
         "optional": optional, "container_engine": container,
         "hosts": hosts, "hints": hints,
         "nested": bool(os.environ.get(NESTED_ENV)),
+        # The name, not the sentence: doctor output is logged and compared, and
+        # the sentence is in `nested_refusal()` for whoever prints the refusal.
+        "nested_guard": (NESTED_REFUSAL if os.environ.get(NESTED_ENV) else None),
         "run_store": runstore.root(),
         "problems": problems,
     }
@@ -2526,6 +2549,17 @@ def _warn_budget_round(comp, budget_usd: Optional[float],
 
 
 def cmd_evolve(a: argparse.Namespace) -> int:
+    # First, before the spec is read or anything is created: inside a worker the
+    # answer is no whatever the spec says, and a spec error must not be the thing
+    # that hides a recursion refusal (#963).
+    refusal = nested_refusal()
+    if refusal is not None:
+        if getattr(a, "json", False):
+            _out({"ok": False, "error": refusal, "reason": NESTED_REFUSAL},
+                 as_json=True)
+        else:
+            print(f"error: {refusal}", file=sys.stderr)
+        return 2
     try:
         spec = load_spec(a.spec)
         _apply_algorithm_flag(spec, a)

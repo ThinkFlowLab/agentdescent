@@ -66,8 +66,11 @@ _CREDENTIAL_COMPONENTS = frozenset((
     "apikey", "accesskey", "privatekey", "secretkey", "clientsecret",
     "apitoken", "accesstoken", "authtoken", "refreshtoken", "bearertoken",
     "password", "passwd", "pwd", "credential", "credentials", "authorization",
+    # A plural compound is still a credential in any position (`db_passwords`).
+    "passwords", "passwds", "secretkeys", "apikeys", "privatekeys",
+    "accesskeys", "clientsecrets",
 ))
-_CREDENTIAL_NOUNS = frozenset(("token", "secret"))
+_CREDENTIAL_NOUNS = frozenset(("token", "secret", "secrets"))
 #: A credential written as one word (#1095): `PGPASSWORD` is libpq's password
 #: variable and `s3secretkey` / `AWSSecretAccessKey` carry no separator, so a
 #: single-component key is matched by whole-word suffix. `tokens` ends `okens`,
@@ -75,6 +78,8 @@ _CREDENTIAL_NOUNS = frozenset(("token", "secret"))
 _CREDENTIAL_WORDS = frozenset((
     "password", "passwd", "secret", "secretkey", "apikey", "privatekey",
     "accesskey", "clientsecret", "credential",
+    "passwords", "passwds", "secrets", "secretkeys", "apikeys", "privatekeys",
+    "accesskeys", "clientsecrets", "credentials",
 ))
 #: Two components of one credential spelling (`api` + `key`).
 _CREDENTIAL_PAIRS = frozenset((

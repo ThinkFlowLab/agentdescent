@@ -3,7 +3,11 @@
 # back (#964). The worker reports `waiting` and ends its turn; a follow-up
 # Trigger, a person or a scheduled check reads the run with `status`/`show`.
 #
-#   dsh-superagent-run.sh --store DIR -- agentdescent evolve spec.json --detach
+#   dsh-superagent-run.sh --store DIR -- agentdescent --store DIR evolve spec.json --detach
+#
+# The wrapper's --store is where the report goes; the run's store is the CLI's
+# own --store. Give both the same value, or the run lands in the default store
+# and the report says found: false.
 #
 # tmux is preferred because dsh-superagent already depends on it and a session
 # is not in the worker's process group, so the kill that ends the worker's
@@ -36,8 +40,31 @@ STORE="$(cd "$STORE" && pwd)"
 command -v python3 >/dev/null || die "python3 is required to write the handoff report"
 
 LOG="$STORE/worker.log"
-SESSION="ad-$(printf '%s' "$(basename "$STORE")" | tr -c 'A-Za-z0-9_.-' '-')"
+# The store's basename is not unique -- a worker that hands off two runs keeps
+# both in a directory called `runs` -- so the session carries a per-launch
+# suffix. Two handoffs then never ask tmux for the same name (#1084 review).
+SESSION="ad-$(printf '%s' "$(basename "$STORE")" | tr -c 'A-Za-z0-9_.-' '-')-$$-$RANDOM"
 QUOTED="$(printf '%q ' "${CMD[@]}")"
+
+# What the store already holds, taken before the launch: a reused store always
+# has earlier runs in it, and reporting the newest of those as this handoff is
+# worse than reporting nothing (#1084 review). Only a status.json that this
+# launch creates or rewrites may be reported.
+SNAP="$STORE/.handoff-$$-$RANDOM.json"
+trap 'rm -f "$SNAP"' EXIT
+python3 - "$STORE" "$SNAP" <<'PY'
+import glob, json, os, sys
+store, out = sys.argv[1:3]
+snap = {}
+paths = [os.path.join(store, "status.json")] + sorted(
+    glob.glob(os.path.join(store, "*", "status.json")))
+for path in paths:
+    if os.path.isfile(path):
+        st = os.stat(path)
+        snap[path] = [st.st_mtime, st.st_size]
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(snap, fh)
+PY
 if command -v tmux >/dev/null 2>&1; then
   DRIVER=tmux
   tmux new-session -d -s "$SESSION" -c "$PWD" "$QUOTED >> '$LOG' 2>&1" \
@@ -52,16 +79,26 @@ fi
 # The run owns its status.json (`<store>/<run_id>/status.json`, or the store
 # itself when the caller owns the run directory). Absent is reported as such:
 # an invented run id is worse than a gap a Trigger can see.
-python3 - "$STORE" "$WAIT" "$DRIVER" "$SESSION" "$LOG" "$QUOTED" <<'PY'
+python3 - "$STORE" "$WAIT" "$DRIVER" "$SESSION" "$LOG" "$QUOTED" "$SNAP" <<'PY'
 import glob, json, os, sys, time
-store, wait, driver, session, log, command = sys.argv[1:7]
+store, wait, driver, session, log, command, snap_path = sys.argv[1:8]
+before = json.load(open(snap_path, encoding="utf-8"))
 deadline, found = time.time() + float(wait), None
 while time.time() < deadline:
     paths = [p for p in [os.path.join(store, "status.json")]
              + sorted(glob.glob(os.path.join(store, "*", "status.json")))
              if os.path.isfile(p)]
-    if paths:
-        found = max(paths, key=os.path.getmtime)
+    fresh = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        seen = before.get(path)
+        if seen is None or [st.st_mtime, st.st_size] != seen:
+            fresh.append(path)
+    if fresh:
+        found = max(fresh, key=os.path.getmtime)
         break
     time.sleep(0.2)
 run_dir = os.path.dirname(found) if found else store

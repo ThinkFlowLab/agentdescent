@@ -126,16 +126,29 @@ back:
 
 ```bash
 bash scripts/dsh-superagent-run.sh --store "$RUN_STORE" -- \
-    agentdescent evolve spec.json --detach --budget 5
+    agentdescent --store "$RUN_STORE" evolve spec.json --detach --budget 5
 # waiting 3f9c1a… round 2 /runs/3f9c1a…
 # report /runs/3f9c1a…/waiting.json
 ```
+
+Two stores, one variable: the wrapper's `--store` is where the report goes, and
+the run's store is the CLI's own `--store`, so pass the same value on both. The
+wrapper cannot see the child's store — give it only to the wrapper and `evolve`
+writes to the default store, the wrapper waits out its deadline and reports
+`found: false`, and the read-back below cannot find the run.
 
 It starts the command in a detached `tmux` session (`setsid` when tmux is
 absent), waits for the run's own `status.json`, writes `waiting.json` beside it
 with `run_id`, `round`, `state`, `run_dir`, `driver`, `session` and `log`, and
 exits 0 within seconds. Post the run id, the round and the run directory on the
 Ticket and end the turn; nothing holds the slot.
+
+A store is reused for every Ticket, so it already holds earlier runs. The
+wrapper only reports a `status.json` that appears or changes after it launches,
+so a handoff into a used store reports `found: false` until its own run writes
+one, instead of naming a finished run from last week. The tmux session carries a
+per-launch suffix for the same reason: two handoffs into stores both called
+`runs` get two sessions, not one shared, refused name.
 
 Read it back from a follow-up Trigger, a person, or a scheduled check — the
 wrapper adds no daemon and no scheduler. `--store` is a **global** flag, so it

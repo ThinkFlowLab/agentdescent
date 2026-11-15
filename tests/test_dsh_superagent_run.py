@@ -41,6 +41,26 @@ write(run_id="fake-run-1", round=3, state="finished", pid=os.getpid())
 '''
 
 
+def _page_handoff_example() -> str:
+    """The page's fenced example that starts a run through the wrapper."""
+    page = PAGE.read_text(encoding="utf-8")
+    for block in page.split("```"):
+        if "scripts/dsh-superagent-run.sh" in block:
+            return block
+    raise AssertionError("the page has no example that starts the wrapper")
+
+
+def test_the_page_hands_the_run_the_store_the_wrapper_reports_into():
+    # Two stores, one variable. The wrapper's `--store` is where the report
+    # goes; the run's store is the CLI's own global flag. Naming only the
+    # wrapper's store made `evolve` write to the default store, so the wrapper
+    # waited out its deadline and reported found: false, and the page's
+    # read-back could not find the run (#1084 review).
+    example = " ".join(_page_handoff_example().split())
+    assert 'dsh-superagent-run.sh --store "$RUN_STORE" --' in example, example
+    assert 'agentdescent --store "$RUN_STORE" evolve' in example, example
+
+
 def test_the_page_documents_a_wrapper_that_exists_and_takes_its_flags():
     assert WRAPPER.is_file(), f"no {WRAPPER}"
     # Invoked as `bash scripts/dsh-superagent-run.sh`, the way the page and
@@ -120,3 +140,59 @@ def test_a_run_outlives_the_turn_that_started_it_and_leaves_no_orphan(tmp_path):
         assert left != 0, (
             f"orphan tmux session {report['session']!r} still listed after "
             f"{waited:.1f}s (last `tmux has-session` rc={left})")
+
+
+@pytest.mark.skipif(os.environ.get("AGENTDESCENT_LONG_RUN_SMOKE") != "1",
+                    reason="set AGENTDESCENT_LONG_RUN_SMOKE=1 to run the detached smoke")
+def test_a_reused_store_does_not_report_an_earlier_run(tmp_path):
+    # A store is reused for every Ticket, so it always holds earlier runs. The
+    # first poll used to take the newest `*/status.json` it could see and report
+    # that run -- a finished one -- as the handoff (#1084 review). Nothing here
+    # writes a status.json, so the report must say it found nothing.
+    store = tmp_path / "runs"
+    old = store / "old-run"
+    old.mkdir(parents=True)
+    (old / "status.json").write_text(
+        json.dumps({"run_id": "old-run", "round": 7, "state": "finished"}),
+        encoding="utf-8")
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "1"],
+        cwd=REPO, capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, DSH_RUN_HANDOFF_WAIT="1"))
+    assert handed.returncode == 0, handed.stderr
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert report["found"] is False, report
+    assert report["run_id"] == "", report
+    assert report["round"] == 0, report
+    assert os.path.realpath(report["run_dir"]) == os.path.realpath(str(store)), report
+
+
+@pytest.mark.skipif(os.environ.get("AGENTDESCENT_LONG_RUN_SMOKE") != "1",
+                    reason="set AGENTDESCENT_LONG_RUN_SMOKE=1 to run the detached smoke")
+def test_two_handoffs_into_stores_called_runs_do_not_take_one_session(tmp_path):
+    # The session name came from the store's basename, so two handoffs into
+    # stores both called `runs` asked tmux for the same session and the second
+    # died with "tmux refused the session" (#1084 review).
+    if not shutil.which("tmux"):
+        pytest.skip("no tmux on this host: the setsid fallback has no session name")
+    fake = tmp_path / "fake_run.py"
+    fake.write_text(FAKE, encoding="utf-8")
+    reports = []
+    for name in ("a", "b"):
+        store = tmp_path / name / "runs"
+        handed = subprocess.run(
+            ["bash", str(WRAPPER), "--store", str(store), "--",
+             sys.executable, str(fake), str(store)],
+            cwd=REPO, capture_output=True, text=True, timeout=60)
+        assert handed.returncode == 0, handed.stderr
+        reports.append(json.loads((store / "waiting.json").read_text(encoding="utf-8")))
+    assert reports[0]["driver"] == "tmux", reports
+    assert reports[0]["session"] and reports[1]["session"], reports
+    assert reports[0]["session"] != reports[1]["session"], reports
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and any(
+            subprocess.run(["tmux", "has-session", "-t", "=" + report["session"]],
+                           capture_output=True, text=True).returncode == 0
+            for report in reports):
+        time.sleep(0.1)

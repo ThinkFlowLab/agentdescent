@@ -177,3 +177,50 @@ def test_a_memory_block_keeps_its_counters_too() -> None:
 
     assert attributes["budget_tokens"] == 500
     assert attributes["token_count"] == 3
+
+
+# --- a credential written as one word is still a credential (#1095) --------
+#
+# `#1070` matches a whole component, so a credential name that arrives as one
+# word falls through all three rules: `PGPASSWORD` is libpq's password variable,
+# `s3secretkey` and `AWSSecretAccessKey` need a separator to split, and
+# `client_secrets` / `api_keys` are the pair with a plural `s`. `auth` stays a
+# non-goal: it names a mode (`auth_mode`, `auth_ok`) as often as a credential.
+
+ONE_WORD_CREDENTIAL_KEYS = (
+    "PGPASSWORD", "pgpassword", "client_secrets", "api_keys", "s3secretkey",
+    "AWSSecretAccessKey",
+)
+
+#: Names that are not credentials, including the recorded `auth` non-goal.
+NOT_CREDENTIAL_KEYS = ("REDISCLI_AUTH", "auth", "sort_key")
+
+
+def _is_secret_key(key: object) -> bool:
+    from agentdescent.rsi_telemetry import _is_secret_key as predicate
+
+    return predicate(key)
+
+
+def test_a_one_word_credential_key_is_dropped() -> None:
+    for key in ONE_WORD_CREDENTIAL_KEYS:
+        assert _is_secret_key(key) is True, key
+
+
+def test_the_counters_and_an_auth_mode_are_not_credentials() -> None:
+    for key in list(MEASUREMENT_KEYS) + list(NOT_CREDENTIAL_KEYS):
+        assert _is_secret_key(key) is False, key
+
+
+def test_a_one_word_credential_never_reaches_the_export() -> None:
+    telemetry = _telemetry()
+    span = telemetry.start_span(
+        "cost", attributes={"PGPASSWORD": "hunter2", "MAX_TOKENS": 16})
+
+    assert "PGPASSWORD" not in span.attributes
+    assert span.attributes["MAX_TOKENS"] == 16
+
+    (exported,) = telemetry.to_otel()
+    assert "PGPASSWORD" not in exported["attributes"]
+    assert exported["attributes"]["MAX_TOKENS"] == 16
+    assert "hunter2" not in str(exported)

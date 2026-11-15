@@ -184,16 +184,22 @@ def test_a_memory_block_keeps_its_counters_too() -> None:
 # `#1070` matches a whole component, so a credential name that arrives as one
 # word falls through all three rules: `PGPASSWORD` is libpq's password variable,
 # `s3secretkey` and `AWSSecretAccessKey` need a separator to split, and
-# `client_secrets` / `api_keys` are the pair with a plural `s`. `auth` stays a
+# `client_secrets` / `api_keys` are the pair with a plural `s`. The amendment
+# also pins the plain plurals (`passwords`, `pgpasswords`, `db_secrets`), which
+# only the last-position noun rule and the plural suffixes reach. `auth` stays a
 # non-goal: it names a mode (`auth_mode`, `auth_ok`) as often as a credential.
 
-ONE_WORD_CREDENTIAL_KEYS = (
-    "PGPASSWORD", "pgpassword", "client_secrets", "api_keys", "s3secretkey",
-    "AWSSecretAccessKey",
+CREDENTIAL_WORD_KEYS = (
+    "PGPASSWORD", "pgpassword", "passwords", "pgpasswords", "db_passwords",
+    "db_secrets", "client_secrets", "CLIENT_SECRETS", "api_keys",
+    "secret_keys", "s3secretkey", "AWSSecretAccessKey", "AWS_SECRET_ACCESS_KEY",
 )
 
 #: Names that are not credentials, including the recorded `auth` non-goal.
-NOT_CREDENTIAL_KEYS = ("REDISCLI_AUTH", "auth", "sort_key")
+NOT_CREDENTIAL_KEYS = (
+    "REDISCLI_AUTH", "auth", "sort_key", "monkey", "max_new_tokens",
+    "total_tokens", "status", "access_level",
+)
 
 
 def _is_secret_key(key: object) -> bool:
@@ -202,25 +208,27 @@ def _is_secret_key(key: object) -> bool:
     return predicate(key)
 
 
-def test_a_one_word_credential_key_is_dropped() -> None:
-    for key in ONE_WORD_CREDENTIAL_KEYS:
-        assert _is_secret_key(key) is True, key
+@pytest.mark.parametrize("key", CREDENTIAL_WORD_KEYS)
+def test_a_credential_key_is_dropped(key: str) -> None:
+    assert _is_secret_key(key) is True
 
 
-def test_the_counters_and_an_auth_mode_are_not_credentials() -> None:
-    for key in list(MEASUREMENT_KEYS) + list(NOT_CREDENTIAL_KEYS):
-        assert _is_secret_key(key) is False, key
+@pytest.mark.parametrize("key", tuple(MEASUREMENT_KEYS) + NOT_CREDENTIAL_KEYS)
+def test_the_counters_and_an_auth_mode_are_not_credentials(key: str) -> None:
+    assert _is_secret_key(key) is False
 
 
 def test_a_one_word_credential_never_reaches_the_export() -> None:
     telemetry = _telemetry()
-    span = telemetry.start_span(
-        "cost", attributes={"PGPASSWORD": "hunter2", "MAX_TOKENS": 16})
+    span = telemetry.start_span("cost", attributes={
+        "PGPASSWORD": "hunter2", "MAX_TOKENS": 16, "secrets_scanned": 12})
 
     assert "PGPASSWORD" not in span.attributes
     assert span.attributes["MAX_TOKENS"] == 16
+    assert span.attributes["secrets_scanned"] == 12
 
     (exported,) = telemetry.to_otel()
     assert "PGPASSWORD" not in exported["attributes"]
     assert exported["attributes"]["MAX_TOKENS"] == 16
+    assert exported["attributes"]["secrets_scanned"] == 12
     assert "hunter2" not in str(exported)

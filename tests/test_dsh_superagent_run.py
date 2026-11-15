@@ -12,6 +12,7 @@ Two checks, and neither needs a model:
 """
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from agentdescent import cli, runstore
 
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER = REPO / "scripts" / "dsh-superagent-run.sh"
@@ -50,15 +53,67 @@ def _page_handoff_example() -> str:
     raise AssertionError("the page has no example that starts the wrapper")
 
 
+def _handoff_argv():
+    """The page's example as the shell would hand it over: (wrapper, child) argv.
+
+    Parsed, not matched as a substring. The block is a command a worker copies,
+    so its flags have to be the ones the CLI accepts *as a pair* -- a
+    substring check passes a command that exits 2, which is how `--budget` went
+    out without its `--usd-per-call` (#1084 review).
+    """
+    block = _page_handoff_example()
+    # The shell's line continuations, then the `#` lines showing its output --
+    # both are page furniture, not arguments.
+    code = block.replace("\\\n", " ")
+    code = " ".join(line for line in code.splitlines()
+                    if not line.strip().startswith("#"))
+    argv = shlex.split(code)
+    assert argv[0] == "bash", f"the example does not invoke the wrapper with bash: {argv}"
+    assert "--" in argv, f"the example does not separate the wrapper's flags: {argv}"
+    cut = argv.index("--")
+    return argv[1:cut], argv[cut + 1:]
+
+
+def _store_flag(argv) -> str:
+    """The value after `--store`, which is what must agree on both sides."""
+    assert "--store" in argv, f"no --store in {argv}"
+    return argv[argv.index("--store") + 1]
+
+
 def test_the_page_hands_the_run_the_store_the_wrapper_reports_into():
     # Two stores, one variable. The wrapper's `--store` is where the report
     # goes; the run's store is the CLI's own global flag. Naming only the
     # wrapper's store made `evolve` write to the default store, so the wrapper
     # waited out its deadline and reported found: false, and the page's
     # read-back could not find the run (#1084 review).
-    example = " ".join(_page_handoff_example().split())
-    assert 'dsh-superagent-run.sh --store "$RUN_STORE" --' in example, example
-    assert 'agentdescent --store "$RUN_STORE" evolve' in example, example
+    wrapper_argv, child_argv = _handoff_argv()
+    assert Path(wrapper_argv[1]).name == "dsh-superagent-run.sh", wrapper_argv
+
+    # Drop the child's program name ("agentdescent", or `python -m
+    # agentdescent.cli`); the CLI's own parser then says whether the rest is a
+    # command it has.
+    start = next((i for i, token in enumerate(child_argv)
+                  if token in ("agentdescent", "agentdescent.cli")), None)
+    assert start is not None, f"the example does not run agentdescent: {child_argv}"
+    cli_argv = child_argv[start + 1:]
+    try:
+        args = cli.build_parser().parse_args(cli_argv)
+    except SystemExit as e:  # argparse exits 2 on a flag the CLI does not have
+        raise AssertionError(
+            f"the page's handoff command is not one the CLI accepts: {cli_argv} "
+            f"(exit {e.code})") from e
+
+    assert _store_flag(wrapper_argv) == _store_flag(cli_argv), (
+        "the report's store and the run's store must be the same value")
+    assert getattr(args, "detach", False), "the handoff must start the run detached"
+    # The section promises a run that stops itself and writes why, which is what
+    # --budget buys; the CLI refuses that flag without a per-call price.
+    assert args.budget is not None, (
+        "the section documents a capped run, so the example carries --budget")
+    assert args.usd_per_call, (
+        f"the page passes --budget {args.budget} without --usd-per-call, so the "
+        "documented command exits 2 and starts nothing")
+    runstore.require_budget_pair(args.budget, args.usd_per_call)
 
 
 def test_the_page_documents_a_wrapper_that_exists_and_takes_its_flags():

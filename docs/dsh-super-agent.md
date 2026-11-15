@@ -126,10 +126,16 @@ back:
 
 ```bash
 bash scripts/dsh-superagent-run.sh --store "$RUN_STORE" -- \
-    agentdescent --store "$RUN_STORE" evolve spec.json --detach --budget 5
+    agentdescent --store "$RUN_STORE" evolve spec.json --detach \
+    --budget 5 --usd-per-call 0.01
 # waiting 3f9c1a… round 2 /runs/3f9c1a…
 # report /runs/3f9c1a…/waiting.json
 ```
+
+`--budget` needs `--usd-per-call`: the engine counts calls, and a per-call price
+is the only way a dollar figure becomes a stop rule. With one and not the other
+the CLI exits 2 before creating anything (`budget_usd needs usd_per_call`), so
+the pair is what makes the run stop itself and write why.
 
 Two stores, one variable: the wrapper's `--store` is where the report goes, and
 the run's store is the CLI's own `--store`, so pass the same value on both. The
@@ -148,7 +154,10 @@ wrapper only reports a `status.json` that appears or changes after it launches,
 so a handoff into a used store reports `found: false` until its own run writes
 one, instead of naming a finished run from last week. The tmux session carries a
 per-launch suffix for the same reason: two handoffs into stores both called
-`runs` get two sessions, not one shared, refused name.
+`runs` get two sessions, not one shared, refused name. One live handoff per
+store: two launched into one store inside the same wait window both read that
+store's `waiting.json` and the second can report the first's run, so give each
+handoff its own store or wait for the first to finish.
 
 Read it back from a follow-up Trigger, a person, or a scheduled check — the
 wrapper adds no daemon and no scheduler. `--store` is a **global** flag, so it

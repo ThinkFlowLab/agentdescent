@@ -2242,13 +2242,13 @@ class _Engine:
     #: for nothing. Read by ``record_round``; set by ``_build_engine`` from
     #: ``evolve(checkpointing=)``.
     checkpointing: bool = False
-    #: Rounds the search had already run when this process started, from the
-    #: restored checkpoint. Both drivers number rounds from zero per process
-    #: (``index=r`` in one, ``index=len(history)`` in the other), so without
-    #: this offset a resume writes ``round_0.json`` over the previous run's,
-    #: reports ``round 0`` for a search 40 rounds deep, and hands
-    #: ``_prune_round_files`` a history that no longer sorts.
-    checkpoint_round_base: int = 0
+    #: The number this process's first round gets (#1092). Both drivers number
+    #: rounds from zero per process (``index=r`` in one, ``index=len(history)``
+    #: in the other), so a relaunch on an existing ledger renumbered the rows it
+    #: appended; the same offset keeps checkpoint names and the reported round
+    #: increasing. ``_build_engine`` sets it to the further of the restored
+    #: checkpoint and ``evolve(round_base=)`` (the ledger's last round + 1).
+    round_base: int = 0
     #: Which decision procedure this run is using (#943), as
     #: :func:`~agentdescent.policies.policy_digest`'s 64-hex content hash.
     #: Computed once in ``_build_engine`` from the *resolved* Policies (legacy
@@ -2320,6 +2320,11 @@ class _Engine:
         different questions and only the loop knows the second.
         """
         reports = list(reports)
+        # Number the round against the run, not against the process: a resume
+        # appends to a ledger that already has rows, and ``index`` is what the
+        # row says (#1092). Applied here rather than at the two call sites so a
+        # third driver cannot forget it.
+        index = self.round_base + index
         # Offer the reports (with the diff each candidate measured) to a
         # recorder before they are reduced to counters. `show` reads rejected
         # candidates from what this writes (#452).
@@ -2359,7 +2364,7 @@ class _Engine:
             from .checkpoint import save_checkpoint
             save_checkpoint(
                 repo,
-                self.checkpoint_round_base + index,
+                index,
                 self.aggregator,
                 artifact_id=self.artifact_id,
                 round_info={
@@ -2542,6 +2547,7 @@ def _build_engine(tasks, reward, *, agent, run, propose, strategy, initial_state
                   ledger_impl: Optional[Any] = None,
                   policies_bundle: Optional[Policies] = None,
                   checkpointing: bool = False,
+                  round_base: int = 0,
                   allocator: Optional[Any] = None,
                   record_trajectories: bool = False,
                   trajectory_store: Optional[Any] = None,
@@ -3043,13 +3049,17 @@ def _build_engine(tasks, reward, *, agent, run, propose, strategy, initial_state
             expected_aggregator_type=type(aggregator).__name__,
         )
     # Where this process's round numbering starts. The checkpoint records the
-    # last round the *search* reached, so the next one is that plus one; a run
-    # with no checkpoint starts at zero, as it always did.
+    # last round the *search* reached, so the next one is that plus one; a
+    # caller resuming on an existing ledger passes its last round + 1 as
+    # ``round_base``. The further of the two wins: a checkpoint is search state
+    # and a ledger is the record of it, so either can be ahead of the other and
+    # the numbering must never go backwards (#1092).
     _cp_round_base = 0
     if _cp_payload is not None:
         _last = _cp_payload.get("round")
         if isinstance(_last, int) and _last >= 0:
             _cp_round_base = _last + 1
+    _round_base = max(_cp_round_base, int(round_base or 0))
 
     # Imported here rather than at module scope: `executor` reaches `workspec`,
     # which reaches back here for `Task`.
@@ -3094,7 +3104,7 @@ def _build_engine(tasks, reward, *, agent, run, propose, strategy, initial_state
                   test=test,
                   executor=executor, meter=meter, scratch_repo=scratch,
                   checkpoint_payload=_cp_payload, checkpointing=checkpointing,
-                  checkpoint_round_base=_cp_round_base,
+                  round_base=_round_base,
                   policy_digest=policy_digest_value)
     # A contract-breaking commit lands atomically (commit_atomic); this is the
     # consumer side -- re-measure the artifacts that depended on the changed
@@ -3209,6 +3219,12 @@ def evolve(
     #: ``repo_path`` in a tempdir) would pay the write cost for nothing.
     #: Turn it on when the ledger is durable and you might resume.
     checkpointing: bool = False,
+    #: The number this run's first round is recorded as (#1092). ``0`` (the
+    #: default) numbers from zero, as every fresh run always did. A caller
+    #: relaunching on an existing ledger passes its last recorded round + 1, so
+    #: the rows it appends keep increasing instead of repeating the numbering.
+    #: It does not shorten the run: ``rounds`` is still the number executed.
+    round_base: int = 0,
     agg_config: Optional[AggregatorConfig] = None,
     staleness_policy: Optional[StalenessPolicy] = None,
     aggregator_factory: Optional[AggregatorFactory] = None,
@@ -3547,6 +3563,14 @@ def evolve(
         (state that does not serialise, a lock another process holds, a full
         disk) is skipped, never raised: the cost of a missing checkpoint is a
         resume that starts the search fresh, which is what ``False`` does.
+    round_base:
+        The number this run's **first** round is recorded as. ``0`` (the
+        default) numbers from zero, as every fresh run did. A caller relaunching
+        on a ledger that already holds rounds passes its last recorded round + 1,
+        so the rows it appends keep increasing instead of repeating ``0, 1, 2``.
+        Numbering only: ``rounds`` is still the number of rounds executed. A
+        restored checkpoint further ahead still wins (``max`` of the two), so
+        numbering never goes backwards.
     agg_config:
         Tuning for the reference aggregator (batching, acceptance risk, trust
         region, staleness tolerance).
@@ -3749,7 +3773,8 @@ def evolve(
         async_ratio=async_ratio, resync_on_commit=resync_on_commit,
         pipelined_gate=pipelined_gate, gate_workers=gate_workers,
         self_verify=self_verify, held_out_frac=held_out_frac,
-        checkpointing=checkpointing, cheap_eval_tasks=cheap_eval_tasks,
+        checkpointing=checkpointing, round_base=round_base,
+        cheap_eval_tasks=cheap_eval_tasks,
         fusion_tournament=fusion_tournament, solved_threshold=solved_threshold,
         shuffle=shuffle, seed=seed, population_islands=population_islands,
     )
@@ -3784,6 +3809,7 @@ def evolve(
     self_verify = _runtime.self_verify
     held_out_frac = _runtime.held_out_frac
     checkpointing = _runtime.checkpointing
+    round_base = _runtime.round_base
     cheap_eval_tasks = _runtime.cheap_eval_tasks
     fusion_tournament = _runtime.fusion_tournament
     solved_threshold = _runtime.solved_threshold
@@ -3885,7 +3911,10 @@ def evolve(
             # Bags already folded into the flat locals above; forward them so
             # the async surface does not look like it dropped the new knobs,
             # and a bag-only caller still works if resolve is re-run (#804).
-            budget=budget, runtime=runtime, observability=observability)
+            # The *resolved* runtime bag, not the caller's: a flat shortcut
+            # (``round_base=`` included, #1092) is folded into ``_runtime``, and
+            # forwarding the raw bag would drop it on this path.
+            budget=budget, runtime=_runtime, observability=observability)
 
     if pipelined_gate:
         # The mirror of the block above, and the same reasoning: a knob accepted
@@ -3945,6 +3974,7 @@ def evolve(
             shuffle=shuffle, seed=seed,
         usage=usage, verifier=_pol.verifier, ledger_impl=_pol.ledger,
         policies_bundle=_pol, checkpointing=checkpointing,
+        round_base=round_base,
         allocator=allocator, record_trajectories=record_trajectories,
         trajectory_store=trajectory_store, contract=contract,
         extra_artifacts=extra_artifacts,

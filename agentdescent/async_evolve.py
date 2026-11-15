@@ -548,6 +548,7 @@ def async_evolve(
     self_verify = _runtime.self_verify
     held_out_frac = _runtime.held_out_frac
     checkpointing = _runtime.checkpointing
+    round_base = _runtime.round_base
     cheap_eval_tasks = _runtime.cheap_eval_tasks
     fusion_tournament = _runtime.fusion_tournament
     solved_threshold = _runtime.solved_threshold
@@ -583,6 +584,7 @@ def async_evolve(
         shuffle=shuffle, seed=seed,
         usage=usage, verifier=_pol.verifier, ledger_impl=_pol.ledger,
         policies_bundle=_pol, checkpointing=checkpointing,
+        round_base=round_base,
         allocator=allocator, record_trajectories=record_trajectories,
         trajectory_store=trajectory_store, contract=contract,
         extra_artifacts=extra_artifacts,

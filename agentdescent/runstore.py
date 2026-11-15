@@ -822,7 +822,18 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     usage.on_change = _progress
     rd.update_status(state="running", pid=os.getpid(), started=time.time(),
                      kind=spec.kind, target=spec.target)
-    best: List[float] = []
+    # A resume relaunches on this run's own directory, so the ledger already
+    # holds rows and its panel already holds a best reward. Both are read here,
+    # before the run starts, or the second pass renumbers from zero and reports
+    # a best that is only its own (#1092).
+    previous = rd.rounds()
+    best: List[float] = [r for r in
+                         (_finite_or_none(row.get("held_out_reward"))
+                          for row in previous) if r is not None]
+    # One past the last round on disk; 0 for a run that has not recorded any,
+    # which is the fresh-run behaviour.
+    round_base = 1 + max((row["round"] for row in previous
+                          if isinstance(row.get("round"), int)), default=-1)
 
     def on_round(info: RoundInfo) -> None:
         rd.append_round(info)
@@ -890,6 +901,10 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     if spec.record_rollouts and spec.kind != "policy_slot":
         # `show` reads the merger's rejected candidates back from this (#452).
         overrides["on_reports"] = on_reports
+    # Continue the ledger's numbering. The file is the record, so its floor wins
+    # over a spec that names a smaller base; the engine still takes the further
+    # of this and a restored checkpoint.
+    overrides["round_base"] = round_base
     try:
         comp = compose(spec, usage=usage, on_round=on_round, repo_path=rd.ledger_path,
                        **overrides)

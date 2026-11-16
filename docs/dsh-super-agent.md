@@ -167,6 +167,14 @@ arguments rather than splicing them into a shell string, so a `--store`
 containing a quote, a space, `$` or `;` is used literally instead of being read
 as shell syntax (`#1109`).
 
+A child that exits before writing a `status.json` handed nothing off, and the
+wrapper says so: when the window closes with the run's session gone and no new
+status file, `waiting.json` carries `status: failed` and `state: exited`, the
+wrapper exits nonzero, and `log` names the `worker.log` where the child's own
+reason sits (`#1096`). The window itself is unchanged for the case it exists
+for — a run that is alive and has not written its status yet is still
+`waiting`, with exit 0.
+
 A store is reused for every Ticket, so it already holds earlier runs. The
 wrapper only reports a `status.json` that appears after it launches, or one that
 changes with a `started` no older than the launch, so a handoff into a used store

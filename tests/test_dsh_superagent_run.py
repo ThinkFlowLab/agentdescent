@@ -172,10 +172,14 @@ def test_a_store_path_with_shell_metacharacters_hands_off_without_running_them(
         env["PATH"] = _path_without_tmux(tmp_path)
 
     # The child writes a marker, so "the run started" is measured rather than
-    # inferred from a log file the redirection alone would have created.
+    # inferred from a log file the redirection alone would have created, and it
+    # stays alive past the wait window: a child that has already exited with no
+    # status.json is now a failed handoff (#1096), and this row is about where
+    # the arguments went, not about when the child ends.
     marker = tmp_path / "ran.txt"
     child = [sys.executable, "-c",
-             "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('ran\\n')",
+             "import pathlib, sys, time; "
+             "pathlib.Path(sys.argv[1]).write_text('ran\\n'); time.sleep(2)",
              str(marker)]
     handed = subprocess.run(
         ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
@@ -196,6 +200,40 @@ def test_a_store_path_with_shell_metacharacters_hands_off_without_running_them(
     assert (store / "worker.log").is_file(), report
     assert marker.read_text(encoding="utf-8") == "ran\n", (
         f"the run did not start through the handed-off log: {report}")
+
+
+@pytest.mark.parametrize("driver", ["tmux", "setsid"])
+def test_a_child_that_exits_before_writing_a_status_is_a_failed_handoff(
+        tmp_path, driver):
+    # The wrapper promises to exit 0 once the run is detached and waiting.json
+    # is written, and it did that whatever the child did: a child that exited 2
+    # before creating anything still produced `status: waiting`, `found: false`
+    # and exit 0, with its reason only in worker.log (#1096). `found: false`
+    # alone cannot tell "alive, no status yet" from "gone", so the end of the
+    # window is where liveness has to decide.
+    store = tmp_path / "gone"
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    if driver == "tmux":
+        if shutil.which("tmux") is None:
+            pytest.skip("no tmux on this host: the session row cannot run")
+    else:
+        if shutil.which("setsid") is None:
+            pytest.skip("no setsid on this host: the fallback row cannot run")
+        env["PATH"] = _path_without_tmux(tmp_path)
+
+    child = [sys.executable, "-c", "import sys; sys.exit(2)"]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode != 0, (
+        "the child exited before writing a status and the wrapper still "
+        f"reported a handoff (exit {handed.returncode}): {report}")
+    assert report["found"] is False, report
+    assert report["status"] not in ("waiting", "running"), report
+    assert report["state"] not in ("waiting", "running"), report
+    assert report["log"] == str(store / "worker.log"), report
 
 
 @pytest.mark.skipif(os.environ.get("AGENTDESCENT_LONG_RUN_SMOKE") != "1",
@@ -273,8 +311,11 @@ def test_a_reused_store_does_not_report_an_earlier_run(tmp_path):
     (old / "status.json").write_text(
         json.dumps({"run_id": "old-run", "round": 7, "state": "finished"}),
         encoding="utf-8")
+    # `sleep 3` outlives the 1 s window: a child that has already exited with no
+    # status.json is a failed handoff (#1096), and this row needs one that is
+    # still going when the window closes.
     handed = subprocess.run(
-        ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "1"],
+        ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "3"],
         cwd=REPO, capture_output=True, text=True, timeout=60,
         env=dict(os.environ, DSH_RUN_HANDOFF_WAIT="1"))
     assert handed.returncode == 0, handed.stderr
@@ -336,8 +377,10 @@ def test_a_live_earlier_run_is_never_reported_as_this_handoff(tmp_path):
     try:
         # Nothing this launch started: the ticking earlier run is not a handoff,
         # so the report is the same gap as an empty store.
+        # `sleep 3` outlives the 1 s window, for the same reason as the row
+        # above: the child must still be running when liveness is decided.
         handed = subprocess.run(
-            ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "1"],
+            ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "3"],
             cwd=REPO, capture_output=True, text=True, timeout=60,
             env=dict(os.environ, DSH_RUN_HANDOFF_WAIT="1"))
         assert handed.returncode == 0, handed.stderr

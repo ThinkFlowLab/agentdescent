@@ -16,7 +16,10 @@
 # worker hands on.
 #
 # Exit 0 once the run is detached and DIR/waiting.json is written. It never
-# waits for the run: a handoff that blocks is the failure this replaces.
+# waits for the run: a handoff that blocks is the failure this replaces. Exit 2
+# when the child was already gone at the end of the wait window and wrote no
+# status.json -- nothing was handed off, and DIR/worker.log holds its reason
+# (#1096).
 set -euo pipefail
 
 WAIT="${DSH_RUN_HANDOFF_WAIT:-10}"   # seconds to wait for the run's status.json
@@ -78,11 +81,13 @@ with open(out, "w", encoding="utf-8") as fh:
 PY
 if command -v tmux >/dev/null 2>&1; then
   DRIVER=tmux
+  RUN_PID=""
   tmux new-session -d -s "$SESSION" -c "$PWD" "${LAUNCH[@]}" "${CMD[@]}" \
     || die "tmux refused the session $SESSION"
 elif command -v setsid >/dev/null 2>&1; then
   DRIVER=setsid
   setsid "${LAUNCH[@]}" "${CMD[@]}" >/dev/null 2>&1 &
+  RUN_PID=$!
 else
   die "neither tmux nor setsid is available; this host cannot hand off a run"
 fi
@@ -90,12 +95,35 @@ fi
 # The run owns its status.json (`<store>/<run_id>/status.json`, or the store
 # itself when the caller owns the run directory). Absent is reported as such:
 # an invented run id is worse than a gap a Trigger can see.
-python3 - "$STORE" "$WAIT" "$DRIVER" "$SESSION" "$LOG" "$QUOTED" "$SNAP" <<'PY'
-import glob, json, os, sys, time
-store, wait, driver, session, log, command, snap_path = sys.argv[1:8]
+python3 - "$STORE" "$WAIT" "$DRIVER" "$SESSION" "$LOG" "$QUOTED" "$SNAP" "$RUN_PID" <<'PY'
+import glob, json, os, subprocess, sys, time
+store, wait, driver, session, log, command, snap_path, run_pid = sys.argv[1:9]
 before = json.load(open(snap_path, encoding="utf-8"))
 epoch = float(before.pop("epoch"))
 deadline, found = time.time() + float(wait), None
+
+
+def still_running():
+    """Whether the command this handoff started is alive at the window's end.
+
+    `found: false` alone cannot tell "alive, no status yet" from "gone" (#1096).
+    The driver answers it: a tmux session ends with its command, and the setsid
+    pid is this shell's own child, so `kill(pid, 0)` says whether it is still
+    there. Unknown is reported as alive -- a false "failed" would be worse than
+    a missed one.
+    """
+    if driver == "tmux":
+        return subprocess.run(["tmux", "has-session", "-t", "=" + session],
+                              capture_output=True).returncode == 0
+    if not run_pid:
+        return True
+    try:
+        os.kill(int(run_pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError):
+        return True
+    return True
 
 
 def started_at(path):
@@ -140,9 +168,16 @@ while time.time() < deadline:
     time.sleep(0.2)
 run_dir = os.path.dirname(found) if found else store
 status = json.load(open(found)) if found else {}
-report = {"status": "waiting", "found": bool(found),
+# Nothing this launch could report. If the child is gone too, nothing was handed
+# off: the wrapper used to print `waiting` and exit 0 here, which is how a
+# child that refused to start read as a successful handoff (#1096). The wait
+# window exists for the other case -- alive, not written yet -- so only the
+# driver's own liveness separates them.
+expired = found is None and not still_running()
+report = {"status": "failed" if expired else "waiting", "found": bool(found),
           "run_id": status.get("run_id", "") if found else "",
-          "round": status.get("round", 0), "state": status.get("state", "unknown"),
+          "round": status.get("round", 0),
+          "state": "exited" if expired else status.get("state", "unknown"),
           "run_dir": run_dir, "driver": driver,
           "session": session if driver == "tmux" else "", "log": log,
           "command": command.strip()}
@@ -150,6 +185,11 @@ path = os.path.join(store, "waiting.json")
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(report, fh, indent=2, sort_keys=True)
     fh.write("\n")
-print(f"waiting {report['run_id'] or '(no run yet)'} round {report['round']} {run_dir}")
+print(f"{report['status']} {report['run_id'] or '(no run yet)'} "
+      f"round {report['round']} {run_dir}")
 print(f"report {path}")
+if expired:
+    print(f"error: the run exited before writing a status; its reason, if it "
+          f"wrote one, is in {log}", file=sys.stderr)
+    sys.exit(2)
 PY

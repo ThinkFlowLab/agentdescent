@@ -277,3 +277,8 @@ conflict-resolved diff-level merge over a git-backed versioned ledger — and it
 throughput premise is a testable hypothesis rather than community consensus.
 Contributions welcome: [CONTRIBUTING.md](CONTRIBUTING.md). The suite is offline
 and deterministic, so `pytest -q` needs no API key.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=ThinkFlowLab/agentdescent&type=Date)](https://www.star-history.com/#ThinkFlowLab/agentdescent&Date)
+

@@ -141,8 +141,11 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "algorithm `name` (from list_algorithms), the absolute target `path`, and the "
         "absolute `cases` JSONL; `params` is the algorithm's params as an object "
         "(check describe_algorithm first), and `rounds`/`workers` = 1/1 is a quick "
-        "trial. It writes the spec file (default beside the target, never inside it) "
-        "and returns the plan estimate plus `spec`, the dict to pass to start. It "
+        "trial. It writes the spec file under `$AGENTDESCENT_HOME` "
+        "(`agentdescent.<name>.spec.json`, inside the operator's write allowlist) "
+        "unless `out` names another path under one of those roots -- never inside "
+        "a directory target -- and returns the plan estimate plus `spec`, the dict "
+        "to pass to start. It "
         "starts nothing: show the user the estimate and get a yes before start. "
         "`model`/`base_url` come from the user, never guess them."),
     "plan": (
@@ -538,21 +541,28 @@ class Tools:
                 return {"ok": False, "error": f"params key {pname!r} was given "
                         "more than once"}
             clean[pname] = value
-        # The server's cwd is not the host's, so paths are made absolute here
-        # and the default spec goes beside the target -- never inside a
-        # directory target, where it would become part of the artifact.
+        # The server's cwd is not the host's, so paths are made absolute here.
+        # The default spec goes under the write allowlist, not beside the
+        # target: the user's file is usually outside the default roots (the
+        # server's cwd and $AGENTDESCENT_HOME), so a beside-the-target default
+        # was refused on an untouched install (#1108).
         abs_path = os.path.abspath(os.path.expanduser(path))
         abs_cases = (os.path.abspath(os.path.expanduser(cases))
                      if cases is not None else None)
+        registered = name
         if out is None:
             from . import algorithms
+            from .surface_common import SurfaceError, default_write_root
 
             try:
                 registered = algorithms.get(name, where="algorithm_spec").name
             except algorithms.AlgorithmError as e:
                 return {"ok": False, "error": str(e)}
-            out = os.path.join(os.path.dirname(abs_path.rstrip(os.sep)) or os.sep,
-                               f"agentdescent.{registered}.spec.json")
+            try:
+                root = default_write_root(self.surface_write_dirs)
+            except SurfaceError as e:
+                return {"ok": False, "error": str(e)}
+            out = os.path.join(root, f"agentdescent.{registered}.spec.json")
         else:
             out = os.path.abspath(os.path.expanduser(out))
         # Every other tool that writes a file routes its destination through
@@ -564,7 +574,16 @@ class Tools:
         try:
             self._check_write(out, "out")
         except SurfaceError as e:
-            return {"ok": False, "error": str(e)}
+            # Actionable, not just the variable name: name a path that works
+            # (#1108). The allowed roots come from _check_write's own message.
+            hint = ""
+            if self.surface_write_dirs:
+                example = os.path.join(
+                    os.path.abspath(os.path.expanduser(
+                        str(self.surface_write_dirs[0]))),
+                    f"agentdescent.{registered}.spec.json")
+                hint = f"; pass `out` under one of those roots, e.g. {example!r}"
+            return {"ok": False, "error": f"{e}{hint}"}
         try:
             obj = algorithms_run_payload(
                 name, abs_path, kind=kind, cases=abs_cases, agent=agent,

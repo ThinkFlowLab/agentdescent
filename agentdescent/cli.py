@@ -3437,6 +3437,11 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
         return {"written": [dest], "unchanged": [], "backup": saved, "noop": False,
                 "dest": dest}
     _refuse_dest_link(dest, dest)
+    # `_write_to`'s plan has no way to say "dest did not exist", so a deleted
+    # target came back as an ordinary `written`/`backup: []`/`noop: false` and
+    # read like an in-place update; a recreated root is also the one case with
+    # nothing to roll back to (#1118). Read here, where the decision is taken.
+    created = not os.path.isdir(dest)
     try:
         plan = result._write_to(dest, backup=backup, dry_run=dry_run,
                                 check_write=check_write)
@@ -3445,6 +3450,13 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
         # artifact write too (#990).
         raise _cannot_write(dest, e) from None
     plan["dest"] = dest
+    # A no-op plan never reaches `materialize`, so a missing `dest` it did not
+    # create must not be reported as created: an empty artifact writes nothing
+    # and leaves the directory absent, while `created: true` would claim a write
+    # that never happened and print the "nothing was restored" line beside the
+    # existing "already matches" one (#1118). `_write_to` always sets `noop`, but
+    # `.get` keeps one plan shape from turning this into a KeyError.
+    plan["created"] = created and not plan.get("noop", False)
     if spec.kind == "skill_library":
         # write_to default prune=False: host skills outside the evolved keys
         # stay as `extra` and are not deleted (#823).
@@ -3659,6 +3671,12 @@ def cmd_apply(a: argparse.Namespace) -> int:
     _out(payload, as_json=True)
     for note in notes:
         print(note, file=sys.stderr)
+    if payload.get("created") and not a.dry_run:
+        # The JSON flag alone reads like an ordinary write; a recreated root is
+        # the one case with nothing to roll back to, so say it once on stderr
+        # (#1118). A dry run gets the flag and no line: nothing was created.
+        print(f"created {payload.get('dest')} from {what}; nothing was restored "
+              "and no backup was taken", file=sys.stderr)
     if payload.get("noop"):
         # After the JSON, on stderr: stdout stays one machine-readable document.
         print(f"nothing to apply: {payload.get('dest') or '(target)'} already matches "

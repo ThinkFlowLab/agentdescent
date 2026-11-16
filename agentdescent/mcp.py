@@ -141,9 +141,10 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "algorithm `name` (from list_algorithms), the absolute target `path`, and the "
         "absolute `cases` JSONL; `params` is the algorithm's params as an object "
         "(check describe_algorithm first), and `rounds`/`workers` = 1/1 is a quick "
-        "trial. It writes the spec file under `$AGENTDESCENT_HOME` "
-        "(`agentdescent.<name>.spec.json`, inside the operator's write allowlist) "
-        "unless `out` names another path under one of those roots -- never inside "
+        "trial. It writes the spec file under the operator's write allowlist "
+        "(`$AGENTDESCENT_HOME` when that home is allowed, otherwise another "
+        "allowed root; `agentdescent.<name>.spec.json`) unless `out` names "
+        "another path under one of those roots -- never inside "
         "a directory target -- and returns the plan estimate plus `spec`, the dict "
         "to pass to start. It "
         "starts nothing: show the user the estimate and get a yes before start. "
@@ -552,14 +553,31 @@ class Tools:
         registered = name
         if out is None:
             from . import algorithms
-            from .surface_common import SurfaceError, default_write_root
+            from .surface_common import (
+                SurfaceError, _inside, default_write_root,
+            )
 
             try:
                 registered = algorithms.get(name, where="algorithm_spec").name
             except algorithms.AlgorithmError as e:
                 return {"ok": False, "error": str(e)}
+            # The description promises no default spec inside a directory
+            # target, and after #1108 the root is chosen from the allowlist:
+            # when the target is that root, or contains it, the spec landed in
+            # the target (#1122). Drop those roots; if none is left, refuse
+            # rather than write where the tool says it will not.
+            usable = tuple(root for root in self.surface_write_dirs
+                           if not _inside(abs_path, root))
+            if self.surface_write_dirs and not usable:
+                return {"ok": False, "error": (
+                    f"every write directory the operator allows is the "
+                    f"directory target {abs_path!r} or inside it, so there is "
+                    f"no default place for the spec outside the target; add a "
+                    f"root outside the target to "
+                    f"AGENTDESCENT_SURFACE_WRITE_DIRS, or pass `out` under "
+                    f"such a root")}
             try:
-                root = default_write_root(self.surface_write_dirs)
+                root = default_write_root(usable)
             except SurfaceError as e:
                 return {"ok": False, "error": str(e)}
             out = os.path.join(root, f"agentdescent.{registered}.spec.json")

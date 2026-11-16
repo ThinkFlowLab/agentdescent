@@ -11,6 +11,9 @@ the target becomes target content for later plans.
 """
 
 import json
+import os
+
+import pytest
 
 from agentdescent.mcp import TOOL_DESCRIPTIONS, Tools
 
@@ -31,6 +34,26 @@ def _target(tmp_path):
     (target / "sub").mkdir(parents=True)
     (target / "SKILL.md").write_text("be terse\n")
     return target
+
+
+@pytest.fixture
+def host_cli(tmp_path, monkeypatch):
+    """A ``claude`` on PATH: a directory-kind spec names ``claude_code``.
+
+    ``algorithm_spec`` plans before it returns, and plan hard-refuses a spec
+    whose agent CLI is not installed (#346). CI installs no agent CLI, so the
+    two rows below -- which assert a *usable* default, not just the refusal --
+    failed there on ``ok is False`` even though the spec was written at the
+    right outside-the-target path. The stub keeps the row host-independent
+    without touching what it asserts (#1122 CI).
+    """
+    binary = tmp_path / "bin" / "claude"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH", str(binary.parent) + os.pathsep + os.environ.get("PATH", ""))
+    return binary
 
 
 def test_only_inside_the_target_roots_are_refused(tmp_path):
@@ -72,7 +95,7 @@ def test_a_root_inside_the_target_is_refused_too(tmp_path):
 
 
 def test_a_directory_target_that_is_the_home_falls_back_to_the_cwd(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, host_cli):
     """Target == ``$AGENTDESCENT_HOME`` with the allowlist unset (#1122).
 
     The default allowlist is the server's cwd plus the home, so the cwd is
@@ -95,7 +118,7 @@ def test_a_directory_target_that_is_the_home_falls_back_to_the_cwd(
     assert list(target.rglob("agentdescent.*.spec.json")) == []
 
 
-def test_a_usable_root_outside_the_target_wins(tmp_path):
+def test_a_usable_root_outside_the_target_wins(tmp_path, host_cli):
     """The first allowed root is inside the target; the next one is not."""
     target = _target(tmp_path)
     allowed = tmp_path / "allowed"

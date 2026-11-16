@@ -24,7 +24,11 @@ tempted to round a run up:
 * a missing contamination check defers, a contaminated dataset rejects before
   any model call;
 * the test split must be disjoint from the evolve pool by task id. Overlap is
-  refused before spending, not discovered in the report.
+  refused before spending, not discovered in the report;
+* a multi-seed run never reports one seed's artifact next to scores pooled
+  across every seed. A single artifact is reported only when every seed
+  produced it; otherwise the report summarizes per seed and the pooled
+  scores describe the method, not one candidate.
 
 The module does not apply anything. ``apply``/release stays an explicit,
 separate step.
@@ -418,7 +422,35 @@ def _next_actions(decision: Optional[PromotionDecision]) -> Tuple[str, ...]:
     return ("do not ship this change", "keep the run for the next proposal")
 
 
-def _notes(config: PilotConfig, evidence: Optional[TrustEvidence]) -> Tuple[str, ...]:
+def _artifact_hash(rendered: str) -> str:
+    return hashlib.sha256(rendered.encode()).hexdigest()
+
+
+def _shared_artifact(
+        per_seed: Sequence[Mapping[str, Any]],
+) -> Optional[Tuple[int, str]]:
+    """Return ``(index, hash)`` only when every produced artifact agrees.
+
+    Seeds that never recorded an artifact hash are skipped. If two hashes
+    differ, return ``None`` so pooled scores cannot be pinned on one seed.
+    """
+    seen: list[Tuple[int, str]] = []
+    for index, row in enumerate(per_seed):
+        digest = row.get("artifact_hash")
+        if not digest:
+            continue
+        seen.append((index, str(digest)))
+    if not seen:
+        return None
+    first = seen[0][1]
+    if any(digest != first for _, digest in seen):
+        return None
+    return seen[0][0], first
+
+
+def _notes(config: PilotConfig, evidence: Optional[TrustEvidence],
+           *, reported_seed: Optional[int] = None,
+           artifacts_agree: Optional[bool] = None) -> Tuple[str, ...]:
     notes = []
     if len(config.seeds) == 1:
         notes.append("one seed; rerun with at least two before quoting the "
@@ -426,8 +458,13 @@ def _notes(config: PilotConfig, evidence: Optional[TrustEvidence]) -> Tuple[str,
     else:
         notes.append("seeds reuse the same test tasks; the interval is a paired "
                      "bootstrap over seed-task pairs, not a cluster-robust one")
-        notes.append(f"the reported artifact is seed {config.seeds[0]}; the "
-                     "scores pool every seed")
+        if artifacts_agree is False:
+            notes.append("seeds produced different artifacts; the pooled scores "
+                         "describe the method, not a single artifact")
+        elif artifacts_agree is True and reported_seed is not None:
+            notes.append(
+                f"every seed produced the same artifact (seed {reported_seed}); "
+                "the scores pool every seed")
     notes.append("token counts are real only when the model adapter shares "
                  "the run's Usage")
     if config.contaminated is None:
@@ -534,7 +571,7 @@ def pilot(policy: PilotPolicy,
     after_all: Dict[str, float] = {}
     failed_all: list[str] = []
     per_seed = []
-    chosen = None
+    results = []
     errors = []
     for seed in config.seeds:
         failed_all.extend(f"{seed}:{task}" for task in baseline_failures)
@@ -584,19 +621,45 @@ def pilot(policy: PilotPolicy,
             "final_reward": result.final_reward,
             "test_gain": ((sum(after[t] - before[t] for t in common) /
                            len(common)) if common else None),
+            "artifact_hash": _artifact_hash(result.rendered),
         })
-        if chosen is None:
-            chosen = result
+        results.append(result)
 
-    run_report = {
-        "rounds": config.rounds, "n_workers": config.n_workers,
-        "seeds": list(config.seeds), "stop_reason": chosen.stop_reason,
-        "error": chosen.error, "accepted": chosen.outcomes().get("committed", 0),
-        "outcomes": dict(chosen.outcomes()), "per_seed": per_seed,
-        "initial_reward": chosen.initial_reward,
-        "final_reward": chosen.final_reward,
-    }
+    shared = _shared_artifact(per_seed)
+    if shared is not None:
+        chosen = results[shared[0]]
+        artifact_hash = shared[1]
+        reported_seed = per_seed[shared[0]]["seed"]
+        artifacts_agree = True
+        artifact_changed = initial != chosen.rendered
+        run_report = {
+            "rounds": config.rounds, "n_workers": config.n_workers,
+            "seeds": list(config.seeds), "stop_reason": chosen.stop_reason,
+            "error": chosen.error,
+            "accepted": chosen.outcomes().get("committed", 0),
+            "outcomes": dict(chosen.outcomes()), "per_seed": per_seed,
+            "initial_reward": chosen.initial_reward,
+            "final_reward": chosen.final_reward,
+            "reported_seed": reported_seed, "artifact_hash": artifact_hash,
+            "artifacts_agree": True,
+        }
+    else:
+        chosen = None
+        artifact_hash = None
+        reported_seed = None
+        artifacts_agree = False
+        artifact_changed = any(initial != result.rendered for result in results)
+        run_report = {
+            "rounds": config.rounds, "n_workers": config.n_workers,
+            "seeds": list(config.seeds), "stop_reason": None, "error": None,
+            "accepted": None, "outcomes": {}, "per_seed": per_seed,
+            "initial_reward": None, "final_reward": None,
+            "reported_seed": None, "artifact_hash": None,
+            "artifacts_agree": False,
+        }
     cost = _cost(usage)
+    notes = _notes(config, None, reported_seed=reported_seed,
+                   artifacts_agree=artifacts_agree)
 
     failed_all = list(dict.fromkeys(failed_all))
     if errors or not before_all or not after_all:
@@ -607,7 +670,7 @@ def pilot(policy: PilotPolicy,
             artifact_id=artifact_id, status="error", decision=decision,
             before=before_all, after=after_all, manifest=manifest,
             run=run_report, cost=cost, next=_next_actions(decision),
-            notes=_notes(config, None), alpha=config.alpha, error=reason)
+            notes=notes, alpha=config.alpha, error=reason)
 
     health = RunHealth(
         attempted=len(policy.test_tasks) * len(config.seeds),
@@ -615,14 +678,14 @@ def pilot(policy: PilotPolicy,
         threshold=config.max_failure_rate)
     evidence = build_trust_evidence(
         before_all, after_all, contaminated=config.contaminated,
-        risk=config.risk, artifact_changed=(initial != chosen.rendered),
+        risk=config.risk, artifact_changed=artifact_changed,
         alpha=config.alpha, min_effect=config.min_effect)
     evidence = replace(evidence, run_health=health)
-    artifact_hash = hashlib.sha256(chosen.rendered.encode()).hexdigest()
     evidence, decision = _decide(evidence, artifact_id, config,
                                  artifact_hash=artifact_hash)
     return PilotReport(
         artifact_id=artifact_id, status="decided", decision=decision,
         before=before_all, after=after_all, evidence=evidence, manifest=manifest,
         run=run_report, cost=cost, next=_next_actions(decision),
-        notes=_notes(config, evidence), alpha=config.alpha)
+        notes=_notes(config, evidence, reported_seed=reported_seed,
+                     artifacts_agree=artifacts_agree), alpha=config.alpha)

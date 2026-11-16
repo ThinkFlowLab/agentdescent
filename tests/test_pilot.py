@@ -9,8 +9,8 @@ or unhealthy run cannot come back as ``promote``.
 import json
 
 from agentdescent.evolution import Task
-from agentdescent.pilot import (PilotConfig, PilotPolicy, pilot,
-                                pilot_scores)
+from agentdescent.pilot import (PilotConfig, PilotPolicy, _shared_artifact,
+                                pilot, pilot_scores)
 from agentdescent.promotion import PromotionAction
 from agentdescent.strategies import AppendRules
 
@@ -173,7 +173,105 @@ def test_two_seeds_pool_the_same_test_tasks():
     assert report.action == PromotionAction.PROMOTE
     assert report.evidence.eval_result.n == 24
     assert [row["seed"] for row in report.run["per_seed"]] == [0, 1]
+    assert report.run["artifacts_agree"] is True
+    assert report.run["reported_seed"] == 0
     assert any("pool every seed" in note for note in report.notes)
+    hashes = {row["artifact_hash"] for row in report.run["per_seed"]}
+    assert len(hashes) == 1
+    assert report.run["artifact_hash"] in hashes
+
+
+def test_shared_artifact_is_none_when_hashes_differ():
+    assert _shared_artifact([
+        {"artifact_hash": "aaa"},
+        {"artifact_hash": "bbb"},
+    ]) is None
+    assert _shared_artifact([
+        {"artifact_hash": "aaa"},
+        {"artifact_hash": "aaa"},
+    ]) == (0, "aaa")
+    assert _shared_artifact([{"seed": 0}, {"seed": 1}]) is None
+
+
+def _pairs_pooled_scores_with_one_seed_artifact(report) -> bool:
+    """True when a report pins pooled scores on a single seed's artifact."""
+    rows = list(report.run.get("per_seed") or [])
+    if len(rows) <= 1:
+        return False
+    hashes = [row.get("artifact_hash") for row in rows]
+    if any(not digest for digest in hashes):
+        return False
+    if len(set(hashes)) <= 1:
+        return False
+    if report.run.get("final_reward") is not None:
+        return True
+    if report.run.get("artifact_hash") in hashes:
+        return True
+    if report.run.get("reported_seed") is not None:
+        return True
+    text = " ".join(report.notes)
+    if "the reported artifact is seed" in text:
+        return True
+    return False
+
+
+class _StubResult:
+    def __init__(self, rendered, final_reward):
+        self.rendered = rendered
+        self.final_reward = final_reward
+        self.initial_reward = 0.0
+        self.error = None
+        self.stop_reason = "rounds"
+
+    def outcomes(self):
+        return {"committed": 1}
+
+
+def test_pooled_scores_are_not_paired_with_the_first_seed_artifact(monkeypatch):
+    """Different per-seed artifacts must not be hidden behind seed-0 + a pool."""
+
+    def fake_evolve(*args, **kwargs):
+        seed = kwargs.get("seed", 0)
+        if seed == 0:
+            return _StubResult(rendered="", final_reward=0.1)
+        return _StubResult(rendered="R0 R1 R2", final_reward=0.9)
+
+    monkeypatch.setattr("agentdescent.pilot.evolve", fake_evolve)
+    report = pilot(_policy(), _config(seeds=(0, 1)))
+
+    hashes = [row["artifact_hash"] for row in report.run["per_seed"]]
+    assert hashes[0] != hashes[1]
+    assert row_gains_differ(report)
+    assert report.evidence.eval_result.n == 24
+    assert report.run["artifacts_agree"] is False
+    assert report.run["reported_seed"] is None
+    assert report.run["final_reward"] is None
+    assert report.run["artifact_hash"] is None
+    assert report.run["per_seed"][0]["final_reward"] == 0.1
+    assert report.run["per_seed"][1]["final_reward"] == 0.9
+    text = " ".join(report.notes)
+    assert "the reported artifact is seed 0" not in text
+    assert "not a single artifact" in text
+    assert not _pairs_pooled_scores_with_one_seed_artifact(report)
+
+
+def row_gains_differ(report) -> bool:
+    gains = [row["test_gain"] for row in report.run["per_seed"]]
+    return len(set(gains)) > 1
+
+
+def test_single_seed_report_is_unchanged():
+    report = pilot(_policy(), _config())
+
+    assert report.action == PromotionAction.PROMOTE
+    assert report.run["seeds"] == [0]
+    assert report.run["reported_seed"] == 0
+    assert report.run["artifacts_agree"] is True
+    assert report.run["final_reward"] is not None
+    assert report.run["artifact_hash"]
+    assert any("one seed" in note for note in report.notes)
+    assert not any("the reported artifact is seed" in note
+                   for note in report.notes)
 
 
 def test_same_inputs_produce_the_same_manifest_id():

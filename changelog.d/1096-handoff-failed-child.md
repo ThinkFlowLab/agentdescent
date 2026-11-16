@@ -6,4 +6,6 @@ handoff: when the wait window closes with the child gone and no new
 reason left in `worker.log`. A child that is still running and has not written
 its status yet is unchanged: `waiting`, `found: false`, exit 0. A store the
 caller owns as the run directory is still reported from its own rewritten
-`status.json`. The page says all three (#1096).
+`status.json`. The verdict reads the store again after the liveness probe, so a
+status written while the probe ran is still this handoff's. The page says all
+three (#1096).

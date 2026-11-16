@@ -186,20 +186,25 @@ def fresh():
     return max(found_paths, key=os.path.getmtime) if found_paths else None
 
 
+def make_report(found):
+    """The report for the status file this handoff is, or a bare `waiting`."""
+    status = json.load(open(found)) if found else {}
+    return {"status": "waiting", "found": bool(found),
+            "run_id": status.get("run_id", "") if found else "",
+            "round": status.get("round", 0),
+            "state": status.get("state", "unknown"),
+            "run_dir": os.path.dirname(found) if found else store,
+            "driver": driver,
+            "session": session if driver == "tmux" else "", "log": log,
+            "command": command.strip()}
+
+
 while True:
     found = fresh()
     if found is not None or time.time() >= deadline:
         break
     time.sleep(0.2)
-run_dir = os.path.dirname(found) if found else store
-status = json.load(open(found)) if found else {}
-report = {"status": "waiting", "found": bool(found),
-          "run_id": status.get("run_id", "") if found else "",
-          "round": status.get("round", 0),
-          "state": status.get("state", "unknown"),
-          "run_dir": run_dir, "driver": driver,
-          "session": session if driver == "tmux" else "", "log": log,
-          "command": command.strip()}
+report = make_report(found)
 path = os.path.join(store, "waiting.json")
 
 
@@ -218,11 +223,28 @@ def write_report():
 write_report()
 expired = found is None and not still_running()
 if expired:
+    # The probe spawns a tmux client -- 10-30 ms, unbounded on a loaded box --
+    # and nothing reads the store while it runs, so a status.json written in
+    # that window is on disk when the verdict says it is not. Read once more at
+    # the moment of the decision and believe the file over the probe: a run
+    # that wrote and exited 20 ms after the window is a handoff, and calling it
+    # failed costs a duplicate run (#1096 review). This is the probe's window
+    # only; the deadline is not extended, so a child that wrote nothing is
+    # still `failed`.
+    late = fresh()
+    if late is not None:
+        found = late
+        report = make_report(found)
+        expired = False
+        # The provisional `waiting` report is already on disk and names no run;
+        # replace it so a reader sees the handoff this launch actually made.
+        write_report()
+if expired:
     report["status"] = "failed"
     report["state"] = "exited"
     write_report()
 print(f"{report['status']} {report['run_id'] or '(no run yet)'} "
-      f"round {report['round']} {run_dir}")
+      f"round {report['round']} {report['run_dir']}")
 print(f"report {path}")
 if expired:
     print(f"error: the run exited before writing a status; its reason, if it "

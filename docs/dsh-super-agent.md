@@ -185,7 +185,10 @@ changes with a `started` no older than the launch, so a handoff into a used stor
 reports `found: false` until its own run writes one. A file whose `started`
 predates the launch is never reported: that is a run this handoff did not start
 — possibly still going and rewriting its own file every round — and naming it
-would send the read-back to the wrong run. The tmux session carries a
+would send the read-back to the wrong run. A caller-owned store, where the store
+itself is the run directory, must be the run this handoff starts: the wrapper
+takes its changed top-level `status.json` as this launch's own, so a second live
+writer in that directory can be reported as this handoff. The tmux session carries a
 per-launch suffix for the same reason: two handoffs into stores both called
 `runs` get two sessions, not one shared, refused name. One live handoff per
 store: two launched into one store inside the same wait window both read that

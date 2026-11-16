@@ -119,7 +119,7 @@ return `schema_version: 1`, and never reimplement the decision logic below.
 
 Depending on what you are doing:
 
-**Just using it.** [Install](install.md) → [Quickstart](quickstart-skill.md) →
+**Just using it.** [Install](start.md) → [Quickstart](quickstart-skill.md) →
 [The `evolve` method](evolution.md) → the one module you need to swap.
 
 **Evolving a folder or an agent's code.**

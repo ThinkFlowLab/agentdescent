@@ -8,7 +8,7 @@ This document explains how AgentDescent's components fit together and how a diff
 travels from a worker to a committed change in the shared artifact library.
 
 For the *why* behind each mechanism see [concepts.md](concepts.md); for how to
-run the system see [install and first run](install.md); for extending it, [run everything, and extend it](usage.md).
+run the system see [install and first run](start.md); for extending it, [run everything, and extend it](usage.md).
 
 ---
 

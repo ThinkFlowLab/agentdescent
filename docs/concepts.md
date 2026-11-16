@@ -6,7 +6,7 @@ description: The concepts behind AgentDescent: the training-to-self-improvement 
 
 The ideas behind AgentDescent, in the order you need them. This is the *why*; for
 the *what fits where* see [architecture.md](architecture.md), and for the *how
-to run* see [install and first run](install.md).
+to run* see [install and first run](start.md).
 
 ---
 

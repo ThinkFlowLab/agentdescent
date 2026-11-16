@@ -65,29 +65,65 @@ nav:
   - Documentation: docs.md
   - Ask DeepWiki: deepwiki.md
   - Getting started:
-    - Install and first run: install.md
-    - Start here — the plugin, step by step: plugin-quickstart.md
-    - Use it from your agent (DSH / Claude Code / Codex / OpenCode / Grok Bot): plugins.md
-    - dsh-super-agent — the zero-code composition: dsh-super-agent.md
-    - MCP / CLI Path A: mcp-path-a.md
-    - Set it up and test it: testing-guide.md
+    - Install and first run: start.md
+    - Website quickstart — start in your agent: install.md
+    - The plugin, step by step: plugin-quickstart.md
     - Quickstart — dataset to skill: quickstart-skill.md
     - Quickstart — evolve a directory: quickstart-directory.md
     - Quickstart — evolve an agent's code: quickstart-agent-code.md
+  - Hosts and plugins:
+    - Use it from your agent (DSH / Claude Code / Codex / OpenCode / Grok Bot): plugins.md
+    - MCP / CLI Path A: mcp-path-a.md
+    - Set it up and test it: testing-guide.md
+    - dsh-super-agent — the zero-code composition: dsh-super-agent.md
+    - Agents & LLMs: agents.md
+  - Algorithms:
+    - Named algorithms (spec / plugin): algorithms.md
+    - Register a named Algorithm card: algorithm-authoring.md
+    - Algorithm decision tree: algorithm-decision-tree.md
+    - Overview — twenty-three ports: self-evolution-examples.md
+    - Algorithm tournament: tournament.md
+    - Campaign — iterate a spec: campaign.md
+    - Porting checklist: porting-checklist.md
+    - MethodPolicy porting checklist: porting-methodpolicy.md
+    - Port fidelity: port-fidelity.md
+    - ACE — context evolution: algo-ace.md
+    - Dynamic Cheatsheet — test-time memory: algo-dynamic-cheatsheet.md
+    - GEPA — prompt evolution: algo-gepa.md
+    - EvoSkill — skill discovery: algo-evoskill.md
+    - SkillOpt — skill-document training: algo-skillopt.md
+    - gskill — repository skill: algo-gskill.md
+    - ADAS — meta agent search: algo-adas.md
+    - DGM — Darwin Gödel Machine: algo-dgm.md
+    - OpenEvolve — program evolution: algo-openevolve.md
+    - ERA — empirical-software search: algo-era.md
+    - PromptBreeder — genetic prompts: algo-promptbreeder.md
+    - AFlow — workflow search: algo-aflow.md
+    - Reflexion — episodic memory: algo-reflexion.md
+    - Self-Refine — feedback refinement: algo-self-refine.md
+    - TextGrad — textual gradients: algo-textgrad.md
+    - Voyager — skill library: algo-voyager.md
+    - SkillWeaver — web APIs: algo-skillweaver.md
+    - Absolute Zero — zero-data self-play: algo-absolute-zero.md
+    - R-Zero — challenger/solver: algo-r-zero.md
+    - Agent0 — tool curriculum: algo-agent0.md
+    - SICA — self-edit: algo-sica.md
+    - Gödel Agent — self-modification: algo-godel-agent.md
+    - Genesis — persistent recursive worlds: algo-genesis.md
+    - RRSI — regularized harness selection: algo-rrsi.md
   - Core concepts:
     - Concepts: concepts.md
     - Architecture: architecture.md
     - The data model: data-model.md
     - Governance (L0 / L1 / L2): governance.md
-    - Capability map: capabilities.md
     - The main path: main-path.md
-  - The evolve method: evolution.md
-  - Modules — design and usage:
+    - Capability map: capabilities.md
     - Module map: modules.md
     - Experimental modules: experimental.md
+  - The engine:
+    - The evolve method: evolution.md
     - Strategies — what evolves: strategies.md
     - Evolving a directory: directory-evolution.md
-    - Agents & LLMs: agents.md
     - Document backends: backends.md
     - The aggregator (the optimizer): aggregator.md
     - Population engine: population.md
@@ -108,6 +144,8 @@ nav:
     - The data layer: dataloader.md
     - Rewards: rewards.md
     - Reference orchestrator & domain: orchestrator.md
+    - Demos, config, and extension: usage.md
+    - API reference: api.md
   - Running at scale:
     - Parallelism (DP / TP): parallelism.md
     - Where rollouts run: execution.md
@@ -156,8 +194,6 @@ nav:
     - Staleness policies: staleness.md
     - The aggregator_factory exit: aggregator-factory.md
     - Meta-evolution — evolving the slots: meta-evolution.md
-  - API reference: api.md
-  - Run everything, and extend it: usage.md
   - Examples and results:
     - Complete example — skill evolution: skill-evolution.md
     - Efficiency experiments: efficiency.md
@@ -178,40 +214,6 @@ nav:
     - Verified seeding — gate on trust: verified-seed.md
     - Joint multi-slot evolution: joint-meta.md
     - Solver-challenger self-play: selfplay.md
-  - Self-evolution algorithms:
-    - Overview — twenty-three ports: self-evolution-examples.md
-    - Named algorithms (spec / plugin): algorithms.md
-    - Register a named Algorithm card: algorithm-authoring.md
-    - Algorithm decision tree: algorithm-decision-tree.md
-    - Algorithm tournament: tournament.md
-    - Campaign — iterate a spec: campaign.md
-    - Porting checklist: porting-checklist.md
-    - MethodPolicy porting checklist: porting-methodpolicy.md
-    - Port fidelity: port-fidelity.md
-    - ACE — context evolution: algo-ace.md
-    - Dynamic Cheatsheet — test-time memory: algo-dynamic-cheatsheet.md
-    - GEPA — prompt evolution: algo-gepa.md
-    - EvoSkill — skill discovery: algo-evoskill.md
-    - SkillOpt — skill-document training: algo-skillopt.md
-    - gskill — repository skill: algo-gskill.md
-    - ADAS — meta agent search: algo-adas.md
-    - DGM — Darwin Gödel Machine: algo-dgm.md
-    - OpenEvolve — program evolution: algo-openevolve.md
-    - ERA — empirical-software search: algo-era.md
-    - PromptBreeder — genetic prompts: algo-promptbreeder.md
-    - AFlow — workflow search: algo-aflow.md
-    - Reflexion — episodic memory: algo-reflexion.md
-    - Self-Refine — feedback refinement: algo-self-refine.md
-    - TextGrad — textual gradients: algo-textgrad.md
-    - Voyager — skill library: algo-voyager.md
-    - SkillWeaver — web APIs: algo-skillweaver.md
-    - Absolute Zero — zero-data self-play: algo-absolute-zero.md
-    - R-Zero — challenger/solver: algo-r-zero.md
-    - Agent0 — tool curriculum: algo-agent0.md
-    - SICA — self-edit: algo-sica.md
-    - Gödel Agent — self-modification: algo-godel-agent.md
-    - Genesis — persistent recursive worlds: algo-genesis.md
-    - RRSI — regularized harness selection: algo-rrsi.md
   - Design records:
     - Evolving a directory: design-directory-evolution.md
     - Plugin for DSH, Claude Code, Codex and other agents: plugin-design.md

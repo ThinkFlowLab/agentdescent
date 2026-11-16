@@ -6,8 +6,9 @@ web panel and the test suite) and what no automated test can confirm. Every
 command here was run against the real CLIs; where something is known not to
 work, it says so rather than leaving you to find out.
 
-New to AgentDescent? [Start here — the plugin, step by step](plugin-quickstart.md)
-is the shorter walk-through; this page is the complete checklist.
+New to AgentDescent? [Install and first run](start.md) is the shortest
+Python and CLI path, and [the plugin, step by step](plugin-quickstart.md) is
+the shorter host walk-through. This page is the complete checklist.
 
 ---
 

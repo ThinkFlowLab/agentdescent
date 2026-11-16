@@ -566,9 +566,11 @@ class Tools:
             # when the target is that root, or contains it, the spec landed in
             # the target (#1122). Drop those roots; if none is left, refuse
             # rather than write where the tool says it will not.
-            usable = tuple(root for root in self.surface_write_dirs
+            allowed = tuple(root for root in self.surface_write_dirs
+                            if str(root).strip())
+            usable = tuple(root for root in allowed
                            if not _inside(abs_path, root))
-            if self.surface_write_dirs and not usable:
+            if allowed and not usable:
                 return {"ok": False, "error": (
                     f"every write directory the operator allows is the "
                     f"directory target {abs_path!r} or inside it, so there is "
@@ -580,6 +582,12 @@ class Tools:
                 root = default_write_root(usable)
             except SurfaceError as e:
                 return {"ok": False, "error": str(e)}
+            # ``default_write_root`` prefers the home whenever it lies inside
+            # an allowed root, so a home that is the target came back as the
+            # root after the filter above (#1122 review). What survives is
+            # outside the target, so its first entry is a safe replacement.
+            if _inside(abs_path, root):
+                root = usable[0]
             out = os.path.join(root, f"agentdescent.{registered}.spec.json")
         else:
             out = os.path.abspath(os.path.expanduser(out))

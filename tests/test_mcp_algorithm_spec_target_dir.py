@@ -135,6 +135,56 @@ def test_a_usable_root_outside_the_target_wins(tmp_path, host_cli):
     assert list(target.rglob("agentdescent.*.spec.json")) == []
 
 
+def test_a_home_inside_the_surviving_root_does_not_come_back_as_the_target(
+        tmp_path, monkeypatch, host_cli):
+    """The cwd is the target's parent and ``$AGENTDESCENT_HOME`` is the target.
+
+    ``default_write_root`` prefers the home whenever it lies inside an allowed
+    root, so the target came back as the root *after* it had been filtered out
+    of the allowlist (#1122 review). The surviving root is an ancestor, and the
+    spec belongs one level above the target.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "target"
+    (target / "sub").mkdir(parents=True)
+    (target / "SKILL.md").write_text("be terse\n")
+    cases = _cases(tmp_path)
+    monkeypatch.chdir(parent)
+    monkeypatch.delenv("AGENTDESCENT_SURFACE_WRITE_DIRS", raising=False)
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(target))
+
+    result = Tools(None).algorithm_spec(
+        "archive_selection", str(target), kind="skill_dir", cases=str(cases),
+        **_FLAGS)
+
+    assert result["ok"] is True, result
+    assert result["spec_path"] == str(
+        parent / "agentdescent.archive_selection.spec.json")
+    assert list(target.rglob("agentdescent.*.spec.json")) == []
+
+
+def test_an_ancestor_root_with_the_home_as_the_target_stays_outside(
+        tmp_path, monkeypatch, host_cli):
+    """Same re-pick through an explicit ancestor root, allowlist named."""
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "target"
+    (target / "sub").mkdir(parents=True)
+    (target / "SKILL.md").write_text("be terse\n")
+    cases = _cases(tmp_path)
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(target))
+
+    result = Tools(None, surface_write_dirs=(str(parent),)).algorithm_spec(
+        "archive_selection", str(target), kind="skill_dir", cases=str(cases),
+        **_FLAGS)
+
+    assert result["ok"] is True, result
+    assert result["spec_path"] == str(
+        parent / "agentdescent.archive_selection.spec.json")
+    assert list(target.rglob("agentdescent.*.spec.json")) == []
+
+
 def test_the_description_still_promises_no_spec_inside_a_directory_target():
     text = TOOL_DESCRIPTIONS["algorithm_spec"]
 

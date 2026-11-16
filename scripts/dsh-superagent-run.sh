@@ -6,8 +6,9 @@
 #   dsh-superagent-run.sh --store DIR -- agentdescent --store DIR evolve spec.json --detach
 #
 # The wrapper's --store is where the report goes; the run's store is the CLI's
-# own --store. Give both the same value, or the run lands in the default store
-# and the report says found: false.
+# own --store. Give both the same value: the wrapper decides "failed" from the
+# store it was given, so a child that writes its status into a different store
+# is reported as a failed handoff even when the run did start (#1096).
 #
 # tmux is preferred because dsh-superagent already depends on it and a session
 # is not in the worker's process group, so the kill that ends the worker's
@@ -113,8 +114,14 @@ def still_running():
     a missed one.
     """
     if driver == "tmux":
-        return subprocess.run(["tmux", "has-session", "-t", "=" + session],
-                              capture_output=True).returncode == 0
+        try:
+            return subprocess.run(["tmux", "has-session", "-t", "=" + session],
+                                  capture_output=True).returncode == 0
+        except OSError:
+            # The probe could not run at all (exec pressure, binary gone,
+            # permission): it did not answer, and "cannot judge" is alive. Letting
+            # this raise would kill the report before it is written (#1096 review).
+            return True
     if not run_pid:
         return True
     try:
@@ -138,11 +145,18 @@ def started_at(path):
     return float(started)
 
 
-while time.time() < deadline:
+def fresh():
+    """This launch's own status.json, read from the store now, or None.
+
+    The scan is a function so the decision comes from a read taken at decision
+    time: the old loop exited on a scan up to 200 ms old, and a status.json
+    written during that last sleep was reported as a failed handoff (#1096
+    review).
+    """
     paths = [p for p in [os.path.join(store, "status.json")]
              + sorted(glob.glob(os.path.join(store, "*", "status.json")))
              if os.path.isfile(p)]
-    fresh = []
+    found_paths = []
     for path in paths:
         try:
             st = os.stat(path)
@@ -151,9 +165,16 @@ while time.time() < deadline:
         seen = before.get(path)
         if seen is None:
             # Not there when the snapshot was taken: this launch made it.
-            fresh.append(path)
+            found_paths.append(path)
             continue
         if [st.st_mtime, st.st_size] == seen:
+            continue
+        if path == os.path.join(store, "status.json"):
+            # The store *is* the run directory when the caller owns it, so this
+            # file is this handoff's own run and its `started` predates the
+            # launch by construction. The epoch filter below is for another run
+            # in a shared store and must not reject it (#1096 review).
+            found_paths.append(path)
             continue
         # A reused store can hold a run that is still going, and that run
         # rewrites its own status.json every round (#1101). Only a file whose
@@ -161,30 +182,45 @@ while time.time() < deadline:
         started = started_at(path)
         if started is None or started < epoch:
             continue
-        fresh.append(path)
-    if fresh:
-        found = max(fresh, key=os.path.getmtime)
+        found_paths.append(path)
+    return max(found_paths, key=os.path.getmtime) if found_paths else None
+
+
+while True:
+    found = fresh()
+    if found is not None or time.time() >= deadline:
         break
     time.sleep(0.2)
 run_dir = os.path.dirname(found) if found else store
 status = json.load(open(found)) if found else {}
-# Nothing this launch could report. If the child is gone too, nothing was handed
-# off: the wrapper used to print `waiting` and exit 0 here, which is how a
-# child that refused to start read as a successful handoff (#1096). The wait
-# window exists for the other case -- alive, not written yet -- so only the
-# driver's own liveness separates them.
-expired = found is None and not still_running()
-report = {"status": "failed" if expired else "waiting", "found": bool(found),
+report = {"status": "waiting", "found": bool(found),
           "run_id": status.get("run_id", "") if found else "",
           "round": status.get("round", 0),
-          "state": "exited" if expired else status.get("state", "unknown"),
+          "state": status.get("state", "unknown"),
           "run_dir": run_dir, "driver": driver,
           "session": session if driver == "tmux" else "", "log": log,
           "command": command.strip()}
 path = os.path.join(store, "waiting.json")
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(report, fh, indent=2, sort_keys=True)
-    fh.write("\n")
+
+
+def write_report():
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+# The report lands before the liveness question is asked: if the probe cannot
+# run -- or the wrapper is killed while it waits -- a `waiting` report still
+# exists, which is the direction #1096 calls for. Nothing this launch could
+# report and the child gone means nothing was handed off; the wrapper used to
+# print `waiting` and exit 0 there, which is how a child that refused to start
+# read as a successful handoff (#1096).
+write_report()
+expired = found is None and not still_running()
+if expired:
+    report["status"] = "failed"
+    report["state"] = "exited"
+    write_report()
 print(f"{report['status']} {report['run_id'] or '(no run yet)'} "
       f"round {report['round']} {run_dir}")
 print(f"report {path}")

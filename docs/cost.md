@@ -141,6 +141,11 @@ gates on.
 
 ## 5. What is not here
 
-Provider billing, a price table, a claim that tokens are the only cost axis, and
-the `PilotReport` fields — `agentdescent/pilot.py` does not exist yet (#937), so
-`CostReport` is the report surface in this slice.
+Provider billing, a price table, and a claim that tokens are the only cost axis.
+
+`agentdescent/pilot.py` is shipped, not planned — it landed in #1121 — and its
+[`PilotReport`](https://github.com/ThinkFlowLab/agentdescent/blob/main/agentdescent/pilot.py)
+carries the run's cost mapping in `cost`, beside the scores, evidence and
+manifest of one evolution run. `CostReport` remains the cost-only surface this
+page describes: `cost_report` turns decision records into the two averages above
+and never reads a `PilotReport`. The pilot CLI and its own page are #937 step 3.

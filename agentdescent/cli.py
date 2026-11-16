@@ -4639,8 +4639,11 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
                 then_line=then_line)
     calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
     if (getattr(a, "rounds", None) is None and getattr(a, "workers", None) is None
-            and isinstance(calls, (int, float)) and calls > QUICK_TRIAL_CALLS):
-        # The kind defaults plan a full run; name the one-command cheap trial (#707).
+            and isinstance(calls, (int, float)) and calls > QUICK_TRIAL_CALLS
+            and (probe is None or probe.get("ok", True))):
+        # The kind defaults plan a full run; name the one-command cheap trial
+        # (#707). Not after a refused probe: `next:` is the outcome there, and a
+        # hint printed after it reads as the last word on the refusal (#1106).
         print("      (for a quick trial: re-run with --rounds 1 --workers 1)")
     # Same contract as `plan`: a refused probe exits non-zero before a run (#1048).
     return 0 if probe is None or probe.get("ok", True) else 1

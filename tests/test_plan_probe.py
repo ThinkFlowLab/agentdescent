@@ -270,6 +270,59 @@ def test_algorithms_run_human_form_exits_nonzero_too(tmp_path, monkeypatch, endp
     assert "next: agentdescent evolve" not in out
 
 
+def _algorithms_run_default_shape_args(tmp_path, *, extra=(),
+                                       base_url="http://127.0.0.1:1"):
+    """`algorithms run` without `--rounds` / `--workers`: the kind's defaults."""
+    return ["algorithms", "run", "gepa", _prompt(tmp_path), _cases(tmp_path),
+            "--agent", "openai_compatible", "--model", "m",
+            "--key-env", "FAKE_KEY", "--base-url", base_url,
+            "--out", str(tmp_path / "algo.spec.json"), *extra]
+
+
+def test_a_refused_probe_on_the_default_shape_ends_on_the_next_line(
+        tmp_path, monkeypatch, endpoint):
+    """The last human line is `next:`, not the #707 quick-trial hint (#1106).
+
+    The row above passes `--rounds 1 --workers 1`, which is what hides this: with
+    the defaults the plan is large enough for the hint, and a refused probe used
+    to print it after `next:` -- so a host or a reader took the hint for the
+    outcome of the refusal.
+    """
+    endpoint(body=ARK_SUBSCRIPTION)
+
+    code, out, err = _run(_algorithms_run_default_shape_args(
+        tmp_path, extra=["--probe"], base_url=_Handler.url))
+
+    assert code == 1, (code, out, err)
+    assert "probe: agent failed" in out + err
+    lines = out.strip().splitlines()
+    assert lines[-1].startswith("next: renew the subscription"), lines[-3:]
+    assert not any("for a quick trial" in line for line in lines), lines[-3:]
+    assert "next: agentdescent evolve" not in out
+
+
+def test_the_default_shape_still_names_the_quick_trial_without_a_probe(tmp_path,
+                                                                      monkeypatch):
+    """The #707 hint is unchanged when nothing refused; it is only gated on that."""
+    code, out, err = _run(_algorithms_run_default_shape_args(tmp_path))
+
+    assert code == 0, (code, out, err)
+    assert out.strip().splitlines()[-1] == (
+        "      (for a quick trial: re-run with --rounds 1 --workers 1)")
+
+
+def test_the_default_shape_still_names_the_quick_trial_after_a_passing_probe(
+        tmp_path, monkeypatch, endpoint):
+    endpoint(code=200)
+
+    code, out, err = _run(_algorithms_run_default_shape_args(
+        tmp_path, extra=["--probe"], base_url=_Handler.url))
+
+    assert code == 0, (code, out, err)
+    assert out.strip().splitlines()[-1] == (
+        "      (for a quick trial: re-run with --rounds 1 --workers 1)")
+
+
 def test_the_probe_caps_the_reply_budget_and_the_wait(tmp_path, monkeypatch, endpoint):
     """One word is bought, not 4096 tokens (#1048 review)."""
     import agentdescent.probe as probe_module

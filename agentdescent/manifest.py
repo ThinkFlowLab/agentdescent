@@ -3,7 +3,10 @@
 A run is reproducible only if the spec, data, model configuration and code that
 produced it are identifiable. ``RunManifest`` hashes those inputs into one
 stable id and a field-by-field record; ``verify_manifest`` says which input
-changed. Secrets are redacted before hashing and never stored.
+changed. Secrets are redacted before hashing and never stored, by the rules
+``rsi_telemetry`` applies plus this module's own names; a spelling neither rule
+catches -- a bare ``auth``, ``REDISCLI_AUTH``, a prefixed ``mytoken`` -- is kept
+as written (#1100).
 
     manifest = build_manifest(spec, data_paths=[spec.data["path"]],
                               model_config={"model": "x", "api_key": "..."})
@@ -21,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .replay_fidelity import ReplayFidelity
+from .rsi_telemetry import _is_secret_key as _telemetry_is_secret_key
 
 __all__ = ["RunManifest", "build_manifest", "diff_manifest", "verify_manifest"]
 
@@ -31,10 +35,23 @@ _SECRET_NAMES = {
 
 
 def _is_secret_key(key: Any) -> bool:
+    """True when ``key`` names a credential.
+
+    The two rules below are this boundary's own, and they come first so the
+    delegation cannot take a redaction away: ``bearer`` is an exact name here
+    and telemetry does not carry it, and ``*_key`` keeps ``sort_key`` redacted --
+    a retained false positive, because narrowing it would rewrite existing
+    hashes for no security gain (#1100).
+    """
     name = str(key).strip().casefold()
     if name in _SECRET_NAMES:
         return True
-    return name.endswith(("_key", "_token", "_secret", "_password"))
+    if name.endswith(("_key", "_token", "_secret", "_password")):
+        return True
+    # Everything else is telemetry's rule, not a second copy of it: the two
+    # drifted once and 12 of #1095's 18 credential spellings reached storage in
+    # clear through this predicate's shorter table (#1100).
+    return _telemetry_is_secret_key(key)
 
 
 def _canonical(value: Any) -> str:

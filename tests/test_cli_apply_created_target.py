@@ -8,13 +8,21 @@ printed once by ``cmd_apply``.
 
 The in-place row is a pin, not a second red: "never reported as created" and
 no line already hold at the base, where the field does not exist at all.
+
+The empty-artifact row is the other way round: green at the base (no such flag
+yet), red at ``6be6bbfc``, where ``created = not os.path.isdir(dest)`` was
+written unconditionally and the no-op plan returned before
+``filetree.materialize`` ever created the directory -- ``created: true`` next to
+``noop: true``, plus a line claiming a write that never happened (#1118).
 """
 
 from __future__ import annotations
 
 import json
 
-from agentdescent import cli
+from agentdescent import cli, runstore
+from agentdescent.evolution import EvolutionResult
+from agentdescent.filetree import canonical
 
 from tests.test_skill_library_apply_install import _make_library_run
 
@@ -54,3 +62,47 @@ def test_an_in_place_apply_is_not_reported_as_created(tmp_path, capsys):
     plan = json.loads(cap.out)
     assert plan.get("created", False) is False
     assert "created " not in cap.err
+
+
+def _make_empty_library_run(tmp_path):
+    """One completed offline skill_library run whose artifact holds no files."""
+    store = str(tmp_path / "runs")
+    src = tmp_path / "seed-lib"
+    (src / "alpha").mkdir(parents=True)
+    (src / "alpha" / "SKILL.md").write_text("---\nname: alpha\n---\n# alpha\n")
+    rd = runstore.create({
+        "kind": "skill_library",
+        "target": str(src),
+        "data": {"inline": [{"prompt": "p", "gold": "g"}],
+                 "prompt": "prompt", "gold": "gold"},
+        "score": "exact",
+        "agent": {"ref": "claude_code"},
+        "reflect": {"ref": "echo"},
+    }, store=store)
+    EvolutionResult(state={}, rendered=canonical({}), final_reward=0.0,
+                    history=[], ledger_log=[]).save(rd.result_path)
+    rd.update_status(state="done")
+    return store, rd.run_id
+
+
+def test_an_empty_artifact_does_not_claim_to_create_the_target(tmp_path, capsys):
+    """``_write_to`` returns a no-op plan before touching a missing dest."""
+    store, rid = _make_empty_library_run(tmp_path)
+    dest = tmp_path / "gone" / "lib"
+
+    assert cli.main(["--store", store, "apply", rid, "--to", str(dest),
+                     "--dry-run"]) == 0
+    cap = capsys.readouterr()
+    plan = json.loads(cap.out)
+    assert plan.get("created", False) is False
+    assert plan.get("noop") is True
+    assert "created " not in cap.err
+    assert not dest.exists()
+
+    assert cli.main(["--store", store, "apply", rid, "--to", str(dest)]) == 0
+    cap = capsys.readouterr()
+    plan = json.loads(cap.out)
+    assert plan.get("created", False) is False
+    assert "created " not in cap.err
+    assert not dest.exists(), (
+        "an empty artifact is a no-op and does not create a missing directory")

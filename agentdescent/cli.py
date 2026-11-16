@@ -3450,7 +3450,13 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
         # artifact write too (#990).
         raise _cannot_write(dest, e) from None
     plan["dest"] = dest
-    plan["created"] = created
+    # A no-op plan never reaches `materialize`, so a missing `dest` it did not
+    # create must not be reported as created: an empty artifact writes nothing
+    # and leaves the directory absent, while `created: true` would claim a write
+    # that never happened and print the "nothing was restored" line beside the
+    # existing "already matches" one (#1118). `_write_to` always sets `noop`, but
+    # `.get` keeps one plan shape from turning this into a KeyError.
+    plan["created"] = created and not plan.get("noop", False)
     if spec.kind == "skill_library":
         # write_to default prune=False: host skills outside the evolved keys
         # stay as `extra` and are not deleted (#823).

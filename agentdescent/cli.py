@@ -3418,6 +3418,17 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
             except OSError as e:
                 raise _cannot_write(slot, e) from None
             saved = [slot]
+        # `_text_plan` only asks whether `dest` already holds the text, so a
+        # missing parent is invisible to the dry run and the real write died at
+        # `open` (#1124). The tree branch materialises its parents, and so does
+        # the `--from` branch below; a fresh `--to <new>/rule.md` must not be the
+        # one shape that refuses.
+        parent = os.path.dirname(dest)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            raise _cannot_write(dest, e) from None
         try:
             with open(dest, "w", encoding="utf-8", newline="") as fh:
                 fh.write(result.rendered)

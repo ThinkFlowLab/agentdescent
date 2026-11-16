@@ -380,21 +380,26 @@ def _rows(value: Any) -> List[Mapping[str, Any]]:
                 raise TraceDigestError(
                     f"trace {value!r} is not valid JSON: {error}") from None
         else:
-            rows = []
-            for line_no, line in enumerate(text.splitlines(), 1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError as error:
-                    raise TraceDigestError(
-                        f"trace {value!r} line {line_no} is not valid JSON: "
-                        f"{error}") from None
-                if not isinstance(row, Mapping):
-                    raise TraceDigestError(
-                        f"trace {value!r} line {line_no} is not an object")
-                rows.append(row)
-            value = rows
+            try:
+                value = json.loads(stripped)
+            except ValueError:
+                rows = []
+                for line_no, line in enumerate(text.splitlines(), 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError as error:
+                        raise TraceDigestError(
+                            f"trace {value!r} line {line_no} is not valid JSON: "
+                            f"{error}") from None
+                    if not isinstance(row, Mapping):
+                        raise TraceDigestError(
+                            f"trace {value!r} line {line_no} is not an object")
+                    rows.append(row)
+                value = rows
+            else:
+                return _rows(value)
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TraceDigestError("trace events must be a list, an object or a path")
     rows = []

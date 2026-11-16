@@ -90,7 +90,7 @@ never read a card run as paper numbers.
 
 | path | you have | the product surface |
 |---|---|---|
-| **A — evolve one artifact** | tasks, a reward, an actor | `agentdescent plan/evolve/status/show/apply` |
+| **A — evolve one artifact** | tasks, a reward, an actor | `agentdescent plan/evolve/status/show/apply/snapshot` |
 | **B — governed release** | paired held-out scores | `agentdescent release` + `release verify` |
 | **C — continuous platform** | a run database and callbacks | `agentdescent platform` + `platform status` |
 
@@ -105,6 +105,7 @@ own page under **Product surfaces** in the navigation.
 **The engine.**
 [Architecture](architecture.md) · [Concepts](concepts.md) ·
 [The `evolve()` method](evolution.md) · [Strategies](strategies.md) ·
+[Portable snapshots](snapshot.md) ·
 [Policies](policies.md) · [API reference](api.md).
 
 **Run and operate it.**

@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-631 public names across 125 modules.
+637 public names across 126 modules.
 
 ---
 
@@ -1515,6 +1515,19 @@ Ledger(
 ### `Snapshot(artifacts: Dict[str, Evolvable], version: VersionVector) -> None`
 
 An immutable view of one branch at one point in time.
+
+### `read_artifact_lineage(...)`
+
+id / parent / root already implied by a ledger repo, without opening it.
+
+```python
+read_artifact_lineage(
+    repo_path: str,
+    artifact_id: str,
+    *,
+    branch: str = 'dev'
+) -> Optional[Dict[str, Any]]
+```
 
 ---
 
@@ -5485,6 +5498,10 @@ One high-risk candidate's approval request and its latest decision.
 
 Append-only JSONL decisions for high-risk candidates.
 
+### `ArtifactSnapshot`
+
+One candidate's complete context and the lineage already on the ledger.
+
 ### `BootstrapResult`
 
 A paired bootstrap of per-task gains.
@@ -6001,6 +6018,10 @@ What the archive says about one decision slot's evolution.
 
 One decision slot's adoption history and whether it is still rising.
 
+### `SnapshotEvalReport`
+
+A read-only score of one snapshot; no search happened.
+
 ### `SocietyGraph`
 
 A directed graph of `AgentNode` with delegation edges.
@@ -6165,6 +6186,14 @@ The per-arm plan estimate without running anything.
 
 Compare `verifier` with `oracle` on a deterministic sample.
 
+### `evaluate_snapshot`
+
+Score a frozen snapshot on `tasks`. Does not search or write a ledger.
+
+### `evaluate_snapshot_spec`
+
+Score `snapshot` with a destination spec's tasks and scorer.
+
 ### `evaluate_source`
 
 Run the candidate against the tests and the benchmark.
@@ -6236,6 +6265,10 @@ An inner `evolve()` whose candidate is the **whole bundle**.
 ### `layers_from_archive`
 
 One layer per decision slot, aggregated from the archive's rule records.
+
+### `load_snapshot_source`
+
+Load a snapshot JSON file, or capture one from a finished run id.
 
 ### `meta_population_run`
 
@@ -6383,7 +6416,7 @@ The simulator against the real problem: how much the dream is worth.
 
 ### `snapshot`
 
-Compose the archive's per-slot, per-port and health evidence.
+A portable snapshot of one candidate: full context plus ledger lineage.
 
 ### `society_evolve`
 

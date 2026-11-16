@@ -731,3 +731,45 @@ class Ledger:
             if self._current_branch == name:
                 self._checkout(self.DEV)
             _git(self.repo_path, "branch", "-D", name)
+
+def read_artifact_lineage(
+        repo_path: str, artifact_id: str, *,
+        branch: str = Ledger.DEV,
+) -> Optional[Dict[str, Any]]:
+    """id / parent / root already implied by a ledger repo, without opening it.
+
+    ``id`` is ``{artifact_id}@v{version}``, ``parent`` is the previous version
+    (or ``None`` at v1), and ``root`` is ``{artifact_id}@v1``. Commit hashes
+    come from ``git log`` of ``artifacts/<id>.json``. Returns ``None`` when
+    the repo or artifact is missing rather than inventing a second identifier.
+    """
+    if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
+        return None
+    if not isinstance(artifact_id, str) or not artifact_id.strip():
+        raise ValueError("artifact_id must be a non-empty string")
+    rel = os.path.join("artifacts", f"{artifact_id}.json")
+    try:
+        raw = _git(repo_path, "show", f"{branch}:versions.json")
+        versions = json.loads(raw) if raw else {}
+        log = _git(repo_path, "log", branch, "--pretty=format:%H", "--", rel)
+    except (GitError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(versions, dict) or artifact_id not in versions:
+        return None
+    try:
+        version = int(versions[artifact_id])
+    except (TypeError, ValueError):
+        return None
+    commits = [line.strip() for line in (log or "").splitlines() if line.strip()]
+    ident = f"{artifact_id}@v{version}"
+    return {
+        "id": ident,
+        "parent": (f"{artifact_id}@v{version - 1}" if version > 1 else None),
+        "root": f"{artifact_id}@v1",
+        "artifact_id": artifact_id,
+        "version": version,
+        "commit": commits[0] if commits else None,
+        "parent_commit": commits[1] if len(commits) > 1 else None,
+        "root_commit": commits[-1] if commits else None,
+        "branch": branch,
+    }

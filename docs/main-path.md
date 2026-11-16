@@ -26,9 +26,9 @@ tasks + reward + agent + Strategy
 | loop | `evolution`, `async_evolve`, `aggregator`, `policies`, `sampling`, `selection`, `fusion`, `staleness`, `governance` |
 | execution | `agents`, `runners`, `executor`, `parallel`, `scheduler`, `sandbox`, `sandbox_container`, `sandbox_shared` |
 | evidence | `verifier`, `verifier_ensemble`, `audit/`, `stats`, `stats_eval`, `conformal`, `sequential` |
-| state | `ledger`, `runstore`, `checkpoint`, `manifest`, `trajectory`, `decisions` |
+| state | `ledger`, `runstore`, `snapshot`, `checkpoint`, `manifest`, `trajectory`, `decisions` |
 
-This is the path every CLI/MCP `plan/evolve/status/show/apply` verb uses.
+This is the path every CLI/MCP `plan/evolve/status/show/apply` verb uses. A [portable snapshot](snapshot.md) is that same candidate taken off the run: full FileTree context plus ledger lineage, scored or restored without a new search.
 
 ## Path B — governed release
 

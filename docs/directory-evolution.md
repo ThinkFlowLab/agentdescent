@@ -396,3 +396,11 @@ claude_code(extra_args=["--permission-mode", "acceptEdits"], timeout=300)
 And check that the skill is actually being *used*: run one round against an empty
 skill directory as a control. If the score does not move, what you are measuring
 is the model's prior knowledge, not your skill.
+
+## Taking the candidate with you
+
+The tree the engine scores is the complete directory: editable files plus the
+frozen overlay. A [portable snapshot](snapshot.md) writes that whole candidate
+and its ledger lineage (`id` / `parent` / `root`) to JSON, so you can restore
+it or re-score it on another compatible dataset without running search again.
+`kind: plugin` is still the plugin tree, not a host to run inside.

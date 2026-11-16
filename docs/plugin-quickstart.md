@@ -2,8 +2,8 @@
 
 The rest of these docs assume you already have a dataset, a provider key and an
 agent CLI. This page assumes none of that. It is the shortest path from *"I
-just heard about this"* to *an evolution that actually ran on your machine*, and
-then to the plugin living inside your agent.
+just heard about this"* to the plugin living inside your agent. For the
+Python and CLI first run, see [Install and first run](start.md).
 
 Four steps, in order. Nothing here costs money and nothing needs an API key
 until step 4.
@@ -22,8 +22,8 @@ Or, from a source checkout:
 pip install -e ".[mcp]"
 ```
 
-See [Install and first run](install.md) for the source checkout and
-[source examples](install.md#source-examples).
+See [Install and first run](start.md) for the source checkout and
+[source examples](start.md#source-examples).
 
 `[mcp]` is the extra that lets agents talk to AgentDescent. Skip it and the CLI
 still works, but `agentdescent mcp` exits 3 and tells you to add it.
@@ -293,6 +293,7 @@ Two habits worth keeping from the first run:
 
 ## Where to go next
 
+* [Install and first run](start.md) — pip, the offline demo, and the Python / CLI path.
 * [Use it from your agent](plugins.md) — the full plugin surface: every spec
   field, the MCP tools, where runs live, and evolving the plugins themselves.
 * [Set it up and test it](testing-guide.md) — one script that installs

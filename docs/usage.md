@@ -1,6 +1,6 @@
 # Run everything, and extend it
 
-[Install and first run](install.md) covers getting set up. This page is the
+[Install and first run](start.md) covers getting set up. This page is the
 complete list of what you can run, the configuration reference, and how to plug
 your own domain into the loop.
 

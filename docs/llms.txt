@@ -8,7 +8,9 @@ DeepWiki: https://deepwiki.com/ThinkFlowLab/agentdescent
 DeepWiki MCP: https://mcp.deepwiki.com/mcp
 
 ## Start
-- Install: https://thinkflowlab.github.io/agentdescent/install/
+- Install and first run: https://thinkflowlab.github.io/agentdescent/start/
+- Website quickstart: https://thinkflowlab.github.io/agentdescent/install/
+- Plugin quickstart: https://thinkflowlab.github.io/agentdescent/plugin-quickstart/
 - Concepts: https://thinkflowlab.github.io/agentdescent/concepts/
 - Architecture: https://thinkflowlab.github.io/agentdescent/architecture/
 - Measured results: https://thinkflowlab.github.io/agentdescent/results/

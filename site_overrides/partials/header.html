@@ -35,7 +35,7 @@
     <div class="ad-header-links" aria-label="Main navigation">
       {% set u = page.url if page else '' %}
       <a href="{{ nav.homepage.url | url }}"{% if u == '' %} class="ad-header-active" aria-current="page"{% endif %}>Overview</a>
-      <a href="{{ 'install/' | url }}"{% if u.startswith('install') or u.startswith('plugin-quickstart') or u.startswith('quickstart') %} class="ad-header-active" aria-current="page"{% endif %}>Quickstart</a>
+      <a href="{{ 'install/' | url }}"{% if u.startswith('install') or u.startswith('start') or u.startswith('plugin-quickstart') or u.startswith('quickstart') %} class="ad-header-active" aria-current="page"{% endif %}>Quickstart</a>
       <a href="{{ 'results/' | url }}"{% if u.startswith('results') %} class="ad-header-active" aria-current="page"{% endif %}>Results</a>
       <a href="{{ nav.homepage.url | url }}#demo">Demo</a>
       <a href="{{ 'docs/' | url }}"{% if u.startswith('docs') %} class="ad-header-active" aria-current="page"{% endif %}>Docs</a>

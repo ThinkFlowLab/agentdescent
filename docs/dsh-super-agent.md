@@ -152,9 +152,11 @@ the pair is what makes the run stop itself and write why.
 
 Two stores, one variable: the wrapper's `--store` is where the report goes, and
 the run's store is the CLI's own `--store`, so pass the same value on both. The
-wrapper cannot see the child's store — give it only to the wrapper and `evolve`
-writes to the default store, the wrapper waits out its deadline and reports
-`found: false`, and the read-back below cannot find the run.
+wrapper only sees the store it was given: give it only to the wrapper and
+`evolve` writes to the default store, so the wrapper waits out its deadline,
+finds no status of its own where it can look, and reports `status: failed` with
+exit 2 — the child did start, but its status sits in a store this handoff cannot
+read, and the read-back below cannot find the run.
 
 It starts the command in a detached `tmux` session (`setsid` when tmux is
 absent), waits for the run's own `status.json`, writes `waiting.json` beside it
@@ -167,13 +169,26 @@ arguments rather than splicing them into a shell string, so a `--store`
 containing a quote, a space, `$` or `;` is used literally instead of being read
 as shell syntax (`#1109`).
 
+A child that exits without leaving a `status.json` where the wrapper can see it
+handed nothing off, and the wrapper says so: when the window closes with the
+run's session gone and no new status file, `waiting.json` carries
+`status: failed` and `state: exited`, the wrapper exits nonzero, and `log` names
+the `worker.log` where the child's own reason sits (`#1096`). That includes a
+run that wrote its status into a different store — the child started, this
+handoff did not receive it. The window itself is unchanged for the case it
+exists for — a run that is alive and has not written its status yet is still
+`waiting`, with exit 0.
+
 A store is reused for every Ticket, so it already holds earlier runs. The
 wrapper only reports a `status.json` that appears after it launches, or one that
 changes with a `started` no older than the launch, so a handoff into a used store
 reports `found: false` until its own run writes one. A file whose `started`
 predates the launch is never reported: that is a run this handoff did not start
 — possibly still going and rewriting its own file every round — and naming it
-would send the read-back to the wrong run. The tmux session carries a
+would send the read-back to the wrong run. A caller-owned store, where the store
+itself is the run directory, must be the run this handoff starts: the wrapper
+takes its changed top-level `status.json` as this launch's own, so a second live
+writer in that directory can be reported as this handoff. The tmux session carries a
 per-launch suffix for the same reason: two handoffs into stores both called
 `runs` get two sessions, not one shared, refused name. One live handoff per
 store: two launched into one store inside the same wait window both read that

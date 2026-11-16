@@ -172,10 +172,14 @@ def test_a_store_path_with_shell_metacharacters_hands_off_without_running_them(
         env["PATH"] = _path_without_tmux(tmp_path)
 
     # The child writes a marker, so "the run started" is measured rather than
-    # inferred from a log file the redirection alone would have created.
+    # inferred from a log file the redirection alone would have created, and it
+    # stays alive past the wait window: a child that has already exited with no
+    # status.json is now a failed handoff (#1096), and this row is about where
+    # the arguments went, not about when the child ends.
     marker = tmp_path / "ran.txt"
     child = [sys.executable, "-c",
-             "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('ran\\n')",
+             "import pathlib, sys, time; "
+             "pathlib.Path(sys.argv[1]).write_text('ran\\n'); time.sleep(2)",
              str(marker)]
     handed = subprocess.run(
         ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
@@ -196,6 +200,260 @@ def test_a_store_path_with_shell_metacharacters_hands_off_without_running_them(
     assert (store / "worker.log").is_file(), report
     assert marker.read_text(encoding="utf-8") == "ran\n", (
         f"the run did not start through the handed-off log: {report}")
+
+
+@pytest.mark.parametrize("driver", ["tmux", "setsid"])
+def test_a_child_that_exits_before_writing_a_status_is_a_failed_handoff(
+        tmp_path, driver):
+    # The wrapper promises to exit 0 once the run is detached and waiting.json
+    # is written, and it did that whatever the child did: a child that exited 2
+    # before creating anything still produced `status: waiting`, `found: false`
+    # and exit 0, with its reason only in worker.log (#1096). `found: false`
+    # alone cannot tell "alive, no status yet" from "gone", so the end of the
+    # window is where liveness has to decide.
+    store = tmp_path / "gone"
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    if driver == "tmux":
+        if shutil.which("tmux") is None:
+            pytest.skip("no tmux on this host: the session row cannot run")
+    else:
+        if shutil.which("setsid") is None:
+            pytest.skip("no setsid on this host: the fallback row cannot run")
+        env["PATH"] = _path_without_tmux(tmp_path)
+
+    child = [sys.executable, "-c", "import sys; sys.exit(2)"]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode != 0, (
+        "the child exited before writing a status and the wrapper still "
+        f"reported a handoff (exit {handed.returncode}): {report}")
+    assert report["found"] is False, report
+    assert report["status"] not in ("waiting", "running"), report
+    assert report["state"] not in ("waiting", "running"), report
+    assert report["log"] == str(store / "worker.log"), report
+
+
+def _path_whose_tmux_vanishes(base: Path) -> str:
+    """A PATH whose only `tmux` answers `new-session` and then deletes itself.
+
+    The wrapper checks `command -v tmux`, launches through it, and only after the
+    wait window asks `tmux has-session`. A tmux that answered the launch and can
+    no longer be run for the probe is the case where liveness cannot be judged at
+    all, so the probe must read as alive and the report must still exist (#1096
+    review).
+    """
+    real = shutil.which("tmux")
+    if real is None:
+        pytest.skip("no tmux on this host: the launch half of the row cannot run")
+    shim = base / "vanishing"
+    shim.mkdir()
+    script = shim / "tmux"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        f'"{real}" "$@"\n'
+        "rc=$?\n"
+        'rm -f "$0"\n'
+        "exit $rc\n",
+        encoding="utf-8")
+    script.chmod(0o755)
+    return f"{shim}:{_path_without_tmux(base)}"
+
+
+def test_a_status_written_in_the_last_poll_interval_is_reported(tmp_path):
+    # The old poll's last scan ran at deadline-0.2 s, then it slept and left, so a
+    # status written in that sleep was invisible: the store held the file and the
+    # report said failed. The decision has to come from a read at decision time
+    # (#1096 review).
+    store = tmp_path / "late"
+    if shutil.which("setsid") is None:
+        pytest.skip("no setsid on this host: the fallback row cannot run")
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    env["PATH"] = _path_without_tmux(tmp_path)
+    status = store / "live-run" / "status.json"
+    child = [sys.executable, "-c",
+             "import json, pathlib, sys, time; time.sleep(0.9); "
+             "p = pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, "
+             "exist_ok=True); "
+             "p.write_text(json.dumps({'run_id': 'live-run', 'round': 1, "
+             "'state': 'running'}))",
+             str(status)]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode == 0, (
+        "a status written inside the last poll interval was reported as a "
+        f"failed handoff (exit {handed.returncode}): {report}\n{handed.stderr}")
+    assert report["found"] is True, report
+    assert report["run_id"] == "live-run", report
+
+
+def _path_whose_tmux_answers_late(base: Path, delay: str) -> str:
+    """A PATH whose `tmux has-session` answers `delay` seconds after it is asked.
+
+    The liveness probe spawns a tmux client and nothing reads the store while it
+    runs, so a status written in that window is on disk before the probe says
+    "gone". A real probe takes 10-30 ms and is unbounded on a loaded box; this
+    shim makes the window 0.6 s so the row can see it (#1096 review).
+    """
+    real = shutil.which("tmux")
+    if real is None:
+        pytest.skip("no tmux on this host: the slow-probe row cannot run")
+    shim = base / "slow"
+    shim.mkdir(parents=True)
+    script = shim / "tmux"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [ "$1" = "has-session" ]; then sleep {delay}; fi\n'
+        f'exec "{real}" "$@"\n',
+        encoding="utf-8")
+    script.chmod(0o755)
+    return f"{shim}:{_path_without_tmux(base)}"
+
+
+def test_a_status_written_after_the_window_and_before_the_verdict_is_the_handoff(
+        tmp_path):
+    # The decision asked `fresh()`, then spawned the tmux probe, and did not look
+    # again: a status written while the probe ran was on disk when the report was
+    # written as failed. The verdict has to re-read the store after the probe, or
+    # a run that handed off 100 ms late is retried as if it never started
+    # (#1096 review).
+    base = tmp_path / "boundary"
+    store = base / "store"
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    env["PATH"] = _path_whose_tmux_answers_late(base, "0.6")
+    status = store / "late-run" / "status.json"
+    child = [sys.executable, "-c",
+             "import json, pathlib, sys, time; time.sleep(1.2); "
+             "p = pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, "
+             "exist_ok=True); "
+             "p.write_text(json.dumps({'run_id': 'late-run', 'round': 2, "
+             "'state': 'running'}))",
+             str(status)]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert status.is_file(), "the child did not write the status this row is about"
+    assert handed.returncode == 0, (
+        "a status written after the window but before the verdict was reported "
+        f"as a failed handoff (exit {handed.returncode}): {report}\n{handed.stderr}")
+    assert report["found"] is True, report
+    assert report["run_id"] == "late-run", report
+    assert report["status"] == "waiting", report
+
+
+def test_the_late_read_does_not_rescue_a_child_that_wrote_nothing(tmp_path):
+    # The grace is the probe's own duration, not a wider window: a child that is
+    # gone and wrote no status is still a failed handoff when the probe is slow,
+    # and the extra read must not turn it into a handoff (#1096 review).
+    base = tmp_path / "silent"
+    store = base / "store"
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    env["PATH"] = _path_whose_tmux_answers_late(base, "0.6")
+    child = [sys.executable, "-c", "import sys; sys.exit(2)"]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode != 0, (
+        "the child wrote nothing and the wrapper still reported a handoff "
+        f"(exit {handed.returncode}): {report}")
+    assert report["found"] is False, report
+    assert report["status"] == "failed", report
+    assert report["state"] == "exited", report
+    assert report["log"] == str(store / "worker.log"), report
+
+
+def test_a_caller_owned_store_reports_its_own_rewrite_as_the_handoff(tmp_path):
+    # When the caller owns the run directory, the store *is* the run, and the
+    # child's rewrite carries a `started` from before the launch by construction.
+    # The epoch filter is for another run in a shared store; applied here it
+    # turned a real handoff into failed + exit 2 (#1096 review).
+    store = tmp_path / "caller"
+    store.mkdir()
+    status = json.dumps({"started": 1000.0, "run_id": "caller-run", "round": 1,
+                         "state": "running"})
+    (store / "status.json").write_text(status, encoding="utf-8")
+    if shutil.which("setsid") is None:
+        pytest.skip("no setsid on this host: the fallback row cannot run")
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    env["PATH"] = _path_without_tmux(tmp_path)
+    child = [sys.executable, "-c",
+             "import json, pathlib, sys, time; time.sleep(0.3); "
+             "p = pathlib.Path(sys.argv[1]); "
+             "p.write_text(json.dumps({'started': 1000.0, "
+             "'run_id': 'caller-run', 'round': 4, 'state': 'finished'}))",
+             str(store / "status.json")]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode == 0, (
+        "the caller-owned store's own rewrite was reported as a failed handoff "
+        f"(exit {handed.returncode}): {report}\n{handed.stderr}")
+    assert report["found"] is True, report
+    assert report["run_id"] == "caller-run", report
+    assert report["round"] == 4, report
+
+
+def test_a_probe_that_cannot_run_leaves_a_waiting_report(tmp_path):
+    # `tmux has-session` raising is "cannot judge", not "gone": the child here is
+    # still sleeping. An uncaught OSError killed the heredoc before the report was
+    # written, so the caller got exit 1 and no waiting.json at all (#1096 review).
+    store = tmp_path / "unjudgeable"
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    env["PATH"] = _path_whose_tmux_vanishes(tmp_path)
+    child = [sys.executable, "-c", "import time; time.sleep(2)"]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    assert (store / "waiting.json").is_file(), (
+        f"no report was written when the probe could not run: {handed.stderr!r}")
+    report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode == 0, handed.stderr
+    assert report["status"] == "waiting", report
+    assert report["found"] is False, report
+
+
+def test_a_run_written_to_a_different_store_is_a_failed_handoff(tmp_path):
+    # The page tells a worker to pass one store to both the wrapper and the CLI.
+    # A child that writes its status into a store the wrapper was not given has
+    # started, but this handoff cannot see it, and the wrapper now says failed
+    # (#1096 review). This row pins the documented behaviour.
+    reports = tmp_path / "reports"
+    other = tmp_path / "run-store"
+    if shutil.which("setsid") is None:
+        pytest.skip("no setsid on this host: the fallback row cannot run")
+    env = dict(os.environ, DSH_RUN_HANDOFF_WAIT="1")
+    env["PATH"] = _path_without_tmux(tmp_path)
+    child = [sys.executable, "-c",
+             "import json, pathlib, sys; "
+             "p = pathlib.Path(sys.argv[1]) / 'run-1' / 'status.json'; "
+             "p.parent.mkdir(parents=True, exist_ok=True); "
+             "p.write_text(json.dumps({'run_id': 'run-1', 'round': 1, "
+             "'state': 'running'}))",
+             str(other)]
+    handed = subprocess.run(
+        ["bash", str(WRAPPER), "--store", str(reports), "--"] + child,
+        cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+
+    report = json.loads((reports / "waiting.json").read_text(encoding="utf-8"))
+    assert handed.returncode != 0, (
+        "a run written to a store the wrapper cannot see was reported as a "
+        f"handoff (exit {handed.returncode}): {report}")
+    assert report["status"] == "failed", report
+    assert report["state"] == "exited", report
+    assert report["found"] is False, report
+    assert report["log"] == str(reports / "worker.log"), report
 
 
 @pytest.mark.skipif(os.environ.get("AGENTDESCENT_LONG_RUN_SMOKE") != "1",
@@ -273,8 +531,11 @@ def test_a_reused_store_does_not_report_an_earlier_run(tmp_path):
     (old / "status.json").write_text(
         json.dumps({"run_id": "old-run", "round": 7, "state": "finished"}),
         encoding="utf-8")
+    # `sleep 3` outlives the 1 s window: a child that has already exited with no
+    # status.json is a failed handoff (#1096), and this row needs one that is
+    # still going when the window closes.
     handed = subprocess.run(
-        ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "1"],
+        ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "3"],
         cwd=REPO, capture_output=True, text=True, timeout=60,
         env=dict(os.environ, DSH_RUN_HANDOFF_WAIT="1"))
     assert handed.returncode == 0, handed.stderr
@@ -336,8 +597,10 @@ def test_a_live_earlier_run_is_never_reported_as_this_handoff(tmp_path):
     try:
         # Nothing this launch started: the ticking earlier run is not a handoff,
         # so the report is the same gap as an empty store.
+        # `sleep 3` outlives the 1 s window, for the same reason as the row
+        # above: the child must still be running when liveness is decided.
         handed = subprocess.run(
-            ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "1"],
+            ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "3"],
             cwd=REPO, capture_output=True, text=True, timeout=60,
             env=dict(os.environ, DSH_RUN_HANDOFF_WAIT="1"))
         assert handed.returncode == 0, handed.stderr

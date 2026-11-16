@@ -6,8 +6,9 @@
 #   dsh-superagent-run.sh --store DIR -- agentdescent --store DIR evolve spec.json --detach
 #
 # The wrapper's --store is where the report goes; the run's store is the CLI's
-# own --store. Give both the same value, or the run lands in the default store
-# and the report says found: false.
+# own --store. Give both the same value: the wrapper decides "failed" from the
+# store it was given, so a child that writes its status into a different store
+# is reported as a failed handoff even when the run did start (#1096).
 #
 # tmux is preferred because dsh-superagent already depends on it and a session
 # is not in the worker's process group, so the kill that ends the worker's
@@ -16,7 +17,10 @@
 # worker hands on.
 #
 # Exit 0 once the run is detached and DIR/waiting.json is written. It never
-# waits for the run: a handoff that blocks is the failure this replaces.
+# waits for the run: a handoff that blocks is the failure this replaces. Exit 2
+# when the child was already gone at the end of the wait window and wrote no
+# status.json -- nothing was handed off, and DIR/worker.log holds its reason
+# (#1096).
 set -euo pipefail
 
 WAIT="${DSH_RUN_HANDOFF_WAIT:-10}"   # seconds to wait for the run's status.json
@@ -78,11 +82,13 @@ with open(out, "w", encoding="utf-8") as fh:
 PY
 if command -v tmux >/dev/null 2>&1; then
   DRIVER=tmux
+  RUN_PID=""
   tmux new-session -d -s "$SESSION" -c "$PWD" "${LAUNCH[@]}" "${CMD[@]}" \
     || die "tmux refused the session $SESSION"
 elif command -v setsid >/dev/null 2>&1; then
   DRIVER=setsid
   setsid "${LAUNCH[@]}" "${CMD[@]}" >/dev/null 2>&1 &
+  RUN_PID=$!
 else
   die "neither tmux nor setsid is available; this host cannot hand off a run"
 fi
@@ -90,12 +96,41 @@ fi
 # The run owns its status.json (`<store>/<run_id>/status.json`, or the store
 # itself when the caller owns the run directory). Absent is reported as such:
 # an invented run id is worse than a gap a Trigger can see.
-python3 - "$STORE" "$WAIT" "$DRIVER" "$SESSION" "$LOG" "$QUOTED" "$SNAP" <<'PY'
-import glob, json, os, sys, time
-store, wait, driver, session, log, command, snap_path = sys.argv[1:8]
+python3 - "$STORE" "$WAIT" "$DRIVER" "$SESSION" "$LOG" "$QUOTED" "$SNAP" "$RUN_PID" <<'PY'
+import glob, json, os, subprocess, sys, time
+store, wait, driver, session, log, command, snap_path, run_pid = sys.argv[1:9]
 before = json.load(open(snap_path, encoding="utf-8"))
 epoch = float(before.pop("epoch"))
 deadline, found = time.time() + float(wait), None
+
+
+def still_running():
+    """Whether the command this handoff started is alive at the window's end.
+
+    `found: false` alone cannot tell "alive, no status yet" from "gone" (#1096).
+    The driver answers it: a tmux session ends with its command, and the setsid
+    pid is this shell's own child, so `kill(pid, 0)` says whether it is still
+    there. Unknown is reported as alive -- a false "failed" would be worse than
+    a missed one.
+    """
+    if driver == "tmux":
+        try:
+            return subprocess.run(["tmux", "has-session", "-t", "=" + session],
+                                  capture_output=True).returncode == 0
+        except OSError:
+            # The probe could not run at all (exec pressure, binary gone,
+            # permission): it did not answer, and "cannot judge" is alive. Letting
+            # this raise would kill the report before it is written (#1096 review).
+            return True
+    if not run_pid:
+        return True
+    try:
+        os.kill(int(run_pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError):
+        return True
+    return True
 
 
 def started_at(path):
@@ -110,11 +145,18 @@ def started_at(path):
     return float(started)
 
 
-while time.time() < deadline:
+def fresh():
+    """This launch's own status.json, read from the store now, or None.
+
+    The scan is a function so the decision comes from a read taken at decision
+    time: the old loop exited on a scan up to 200 ms old, and a status.json
+    written during that last sleep was reported as a failed handoff (#1096
+    review).
+    """
     paths = [p for p in [os.path.join(store, "status.json")]
              + sorted(glob.glob(os.path.join(store, "*", "status.json")))
              if os.path.isfile(p)]
-    fresh = []
+    found_paths = []
     for path in paths:
         try:
             st = os.stat(path)
@@ -123,9 +165,16 @@ while time.time() < deadline:
         seen = before.get(path)
         if seen is None:
             # Not there when the snapshot was taken: this launch made it.
-            fresh.append(path)
+            found_paths.append(path)
             continue
         if [st.st_mtime, st.st_size] == seen:
+            continue
+        if path == os.path.join(store, "status.json"):
+            # The store *is* the run directory when the caller owns it, so this
+            # file is this handoff's own run and its `started` predates the
+            # launch by construction. The epoch filter below is for another run
+            # in a shared store and must not reject it (#1096 review).
+            found_paths.append(path)
             continue
         # A reused store can hold a run that is still going, and that run
         # rewrites its own status.json every round (#1101). Only a file whose
@@ -133,23 +182,72 @@ while time.time() < deadline:
         started = started_at(path)
         if started is None or started < epoch:
             continue
-        fresh.append(path)
-    if fresh:
-        found = max(fresh, key=os.path.getmtime)
+        found_paths.append(path)
+    return max(found_paths, key=os.path.getmtime) if found_paths else None
+
+
+def make_report(found):
+    """The report for the status file this handoff is, or a bare `waiting`."""
+    status = json.load(open(found)) if found else {}
+    return {"status": "waiting", "found": bool(found),
+            "run_id": status.get("run_id", "") if found else "",
+            "round": status.get("round", 0),
+            "state": status.get("state", "unknown"),
+            "run_dir": os.path.dirname(found) if found else store,
+            "driver": driver,
+            "session": session if driver == "tmux" else "", "log": log,
+            "command": command.strip()}
+
+
+while True:
+    found = fresh()
+    if found is not None or time.time() >= deadline:
         break
     time.sleep(0.2)
-run_dir = os.path.dirname(found) if found else store
-status = json.load(open(found)) if found else {}
-report = {"status": "waiting", "found": bool(found),
-          "run_id": status.get("run_id", "") if found else "",
-          "round": status.get("round", 0), "state": status.get("state", "unknown"),
-          "run_dir": run_dir, "driver": driver,
-          "session": session if driver == "tmux" else "", "log": log,
-          "command": command.strip()}
+report = make_report(found)
 path = os.path.join(store, "waiting.json")
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(report, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-print(f"waiting {report['run_id'] or '(no run yet)'} round {report['round']} {run_dir}")
+
+
+def write_report():
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+# The report lands before the liveness question is asked: if the probe cannot
+# run -- or the wrapper is killed while it waits -- a `waiting` report still
+# exists, which is the direction #1096 calls for. Nothing this launch could
+# report and the child gone means nothing was handed off; the wrapper used to
+# print `waiting` and exit 0 there, which is how a child that refused to start
+# read as a successful handoff (#1096).
+write_report()
+expired = found is None and not still_running()
+if expired:
+    # The probe spawns a tmux client -- 10-30 ms, unbounded on a loaded box --
+    # and nothing reads the store while it runs, so a status.json written in
+    # that window is on disk when the verdict says it is not. Read once more at
+    # the moment of the decision and believe the file over the probe: a run
+    # that wrote and exited 20 ms after the window is a handoff, and calling it
+    # failed costs a duplicate run (#1096 review). This is the probe's window
+    # only; the deadline is not extended, so a child that wrote nothing is
+    # still `failed`.
+    late = fresh()
+    if late is not None:
+        found = late
+        report = make_report(found)
+        expired = False
+        # The provisional `waiting` report is already on disk and names no run;
+        # replace it so a reader sees the handoff this launch actually made.
+        write_report()
+if expired:
+    report["status"] = "failed"
+    report["state"] = "exited"
+    write_report()
+print(f"{report['status']} {report['run_id'] or '(no run yet)'} "
+      f"round {report['round']} {report['run_dir']}")
 print(f"report {path}")
+if expired:
+    print(f"error: the run exited before writing a status; its reason, if it "
+          f"wrote one, is in {log}", file=sys.stderr)
+    sys.exit(2)
 PY

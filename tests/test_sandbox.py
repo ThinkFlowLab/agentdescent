@@ -398,8 +398,9 @@ def test_a_recycled_pid_does_not_keep_a_dead_run_alive_forever(
 
     data = json.load(open(lease))
     data["owner"]["pid"] = os.getpid()          # definitely alive
-    # Expired by a hair, and only 1.1 TTL old, so the grace window still has
-    # 0.7 TTL left when the slow step below eats 0.15 s of it.
+    # Expired by a hair: 1.1 TTL old, i.e. 0.9 TTL below the two-TTL ceiling,
+    # and the 0.15 s step below eats 0.75 TTL of that, leaving 0.15 TTL.
+    # In seconds: 0.22 s old + 0.15 s = 0.37 s against a 0.40 s ceiling.
     data["renewed_at"] = clock.time() - ttl * 1.1
     json.dump(data, open(lease, "w"))
     clock.advance(0.15)                         # a slow step: grace still applies

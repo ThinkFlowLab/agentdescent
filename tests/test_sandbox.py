@@ -352,23 +352,61 @@ def test_a_sandbox_that_is_still_being_renewed_is_left_alone(tmp_path):
     prov.release(sb)
 
 
-def test_a_recycled_pid_does_not_keep_a_dead_run_alive_forever(tmp_path):
+class _Clock:
+    """A hand-advanced stand-in for the ``time`` module ``sandbox`` reads.
+
+    The recycled-pid row below is about a lease that has just expired while its
+    owner is still alive; at ``ttl=0.2`` the distance between "expired by a
+    hair" and "still inside the grace" is 0.1 s, so any step slower than that
+    decided the outcome instead of the code (it flipped once on #1116). The
+    module only reads ``time.time()``, and a test-only name patch keeps the
+    row's timing exact without touching the production clock (#1123)."""
+
+    def __init__(self) -> None:
+        self.now = time.time()
+
+    def time(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_a_recycled_pid_does_not_keep_a_dead_run_alive_forever(
+        tmp_path, monkeypatch):
     """Our own pid is alive, so the one-TTL grace applies; past two it goes.
 
     Without the upper bound, a lease whose pid happened to be reused would be
     protected indefinitely -- the leak the pid check was supposed to prevent,
-    inverted."""
-    prov = WorkspaceProvider(ttl=0.2)
+    inverted.
+
+    The 0.15 s step before the first assertion is the slow CI step that used to
+    flip this row: the lease is expired either way, and the grace still holds
+    because the injected clock, not the wall clock, says how late the renewal
+    is."""
+    from agentdescent import sandbox as sandbox_module
+
+    clock = _Clock()
+    monkeypatch.setattr(sandbox_module, "time", clock)
+    ttl = 0.2
+    prov = WorkspaceProvider(ttl=ttl)
     sb = prov.acquire(SandboxSpec(workspace_root=str(tmp_path)))
     lease = os.path.join(sb.root, LEASE_FILE)
 
     data = json.load(open(lease))
     data["owner"]["pid"] = os.getpid()          # definitely alive
-    data["renewed_at"] = time.time() - 0.3      # expired, within one extra TTL
+    # Expired by a hair: 1.1 TTL old, i.e. 0.9 TTL below the two-TTL ceiling,
+    # and the 0.15 s step below eats 0.75 TTL of that, leaving 0.15 TTL.
+    # In seconds: 0.22 s old + 0.15 s = 0.37 s against a 0.40 s ceiling.
+    data["renewed_at"] = clock.time() - ttl * 1.1
     json.dump(data, open(lease, "w"))
+    clock.advance(0.15)                         # a slow step: grace still applies
     assert prov.reap(root=str(tmp_path)) == 0, "a late renewal deserves one grace"
 
-    data["renewed_at"] = time.time() - 10.0     # long past two TTLs
+    data["renewed_at"] = clock.time() - 10.0    # long past two TTLs
     json.dump(data, open(lease, "w"))
     assert prov.reap(root=str(tmp_path)) == 1
     assert not os.path.exists(sb.root)

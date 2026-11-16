@@ -106,6 +106,36 @@ def test_digest_accepts_jsonl_json_array_and_objects(tmp_path):
         assert other.to_dict() == from_file.to_dict()
 
 
+def test_digest_file_accepts_wrapped_object_compact_and_pretty(tmp_path, capsys):
+    """A file whose top-level object is {"events": [...]} matches a JSON array."""
+    events = [
+        {"kind": "error", "text": "grader refused the checkpoint"},
+        {"kind": "error", "text": "score above 1.0"},
+    ]
+    array = tmp_path / "array.json"
+    rows = tmp_path / "rows.jsonl"
+    wrapped = tmp_path / "wrapped.json"
+    pretty = tmp_path / "pretty.json"
+    array.write_text(json.dumps(events), encoding="utf-8")
+    rows.write_text(
+        "".join(json.dumps(row) + "\n" for row in events), encoding="utf-8")
+    wrapped.write_text(json.dumps({"events": events}), encoding="utf-8")
+    pretty.write_text(json.dumps({"events": events}, indent=2), encoding="utf-8")
+
+    control = digest_traces(load_trace_events(str(array))).to_dict()
+    assert control["events_total"] == 2
+    assert len(control["signatures"]) == 2
+    assert "2 event(s); 2 failure signature(s)" in control["summary"]
+    for path in (rows, wrapped, pretty):
+        other = digest_traces(load_trace_events(str(path))).to_dict()
+        assert other == control
+
+    for path in (array, rows, wrapped, pretty):
+        assert cli.main(["traces", "digest", "--events", str(path)]) == 0
+        out = capsys.readouterr().out
+        assert "2 event(s); 2 failure signature(s)" in out
+
+
 def test_digest_rejects_bad_input(tmp_path):
     with pytest.raises(TraceDigestError):
         load_trace_events("")

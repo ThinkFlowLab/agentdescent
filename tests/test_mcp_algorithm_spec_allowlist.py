@@ -39,7 +39,10 @@ def test_an_out_outside_the_write_allowlist_is_refused(tmp_path):
     assert not outside.exists()
 
 
-def test_the_default_out_beside_an_outside_target_is_refused_too(tmp_path):
+def test_the_default_out_goes_to_the_allowed_root_not_the_target_directory(
+        tmp_path):
+    """A default that lands outside the allowlist is refused before it is
+    written, so it must not be "beside the target" any more (#1108)."""
     prompt, cases = _prompt_and_cases(tmp_path)
     allowed = tmp_path / "allowed"
     allowed.mkdir()
@@ -47,8 +50,8 @@ def test_the_default_out_beside_an_outside_target_is_refused_too(tmp_path):
     result = Tools(None, surface_write_dirs=(str(allowed),)).algorithm_spec(
         "rrsi", str(prompt), str(cases), **_FLAGS)
 
-    assert result["ok"] is False
-    assert "write allowlist" in result["error"]
+    assert result["ok"] is True, result
+    assert result["spec_path"] == str(allowed / "agentdescent.rrsi.spec.json")
     assert not (tmp_path / "agentdescent.rrsi.spec.json").exists()
 
 

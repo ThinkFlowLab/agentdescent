@@ -39,6 +39,8 @@ __all__ = [
     "resolve_ref",
     "surface_allow_from_env",
     "surface_write_dirs_from_env",
+    "surface_home",
+    "default_write_root",
     "scrub_host_env",
     "SESSION_MARKERS",
     "DETACHED_KEEP_VARS",
@@ -200,9 +202,49 @@ def surface_write_dirs_from_env(environ: Optional[Mapping[str, str]] = None
     env = environ if environ is not None else os.environ
     raw = env.get("AGENTDESCENT_SURFACE_WRITE_DIRS")
     if raw is None:
-        home = env.get("AGENTDESCENT_HOME") or "~/.agentdescent"
-        return (os.getcwd(), os.path.abspath(os.path.expanduser(home)))
+        return (os.getcwd(), surface_home(env))
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def surface_home(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``$AGENTDESCENT_HOME``, expanded and absolute (else ``~/.agentdescent``).
+
+    The same normalisation the run store applies (#402): a host config's ``env``
+    is not shell-expanded, so ``~/x`` arrives with a literal ``~``.
+    """
+    env = environ if environ is not None else os.environ
+    return os.path.abspath(os.path.expanduser(
+        env.get("AGENTDESCENT_HOME") or "~/.agentdescent"))
+
+
+def _inside(root: str, path: str) -> bool:
+    target = os.path.normcase(os.path.realpath(path))
+    base = os.path.normcase(os.path.realpath(os.path.expanduser(str(root))))
+    return target == base or target.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def default_write_root(allow: Optional[Sequence[str]],
+                       environ: Optional[Mapping[str, str]] = None) -> str:
+    """The root a surface writes under when its own argument names no path.
+
+    ``$AGENTDESCENT_HOME`` while the operator allows it -- unset, the default
+    allowlist is the server's cwd plus that home -- otherwise the first allowed
+    root. Its whole point is that the default is inside the allowlist: the old
+    "beside the target" default was outside it for every user file outside those
+    two roots, so the shortest documented path failed on an untouched install
+    (#1108).
+    """
+    roots = [os.path.abspath(os.path.expanduser(str(root)))
+             for root in (allow or ()) if str(root).strip()]
+    if not roots:
+        raise SurfaceError(
+            "no write directory is allowed (AGENTDESCENT_SURFACE_WRITE_DIRS is "
+            "empty), so there is no default output path; pass an explicit path "
+            "and name its root in AGENTDESCENT_SURFACE_WRITE_DIRS")
+    home = surface_home(environ)
+    if any(_inside(root, home) for root in roots):
+        return home
+    return roots[0]
 
 
 #: Environment variables a host agent sets in its own session and its children
@@ -318,7 +360,8 @@ def ensure_write_path(path: Any, *, name: str,
                 for root in roots):
             raise SurfaceError(
                 f"{name} {path!r} is outside the operator's write allowlist "
-                f"(AGENTDESCENT_SURFACE_WRITE_DIRS)")
+                f"(AGENTDESCENT_SURFACE_WRITE_DIRS); allowed roots: "
+                + ", ".join(repr(root) for root in allow))
     return resolved
 
 

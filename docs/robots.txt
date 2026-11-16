@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://thinkflowlab.github.io/agentdescent/sitemap.xml

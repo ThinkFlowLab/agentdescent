@@ -171,8 +171,14 @@ def test_a_store_path_with_shell_metacharacters_hands_off_without_running_them(
             pytest.skip("no setsid on this host: the fallback row cannot run")
         env["PATH"] = _path_without_tmux(tmp_path)
 
+    # The child writes a marker, so "the run started" is measured rather than
+    # inferred from a log file the redirection alone would have created.
+    marker = tmp_path / "ran.txt"
+    child = [sys.executable, "-c",
+             "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('ran\\n')",
+             str(marker)]
     handed = subprocess.run(
-        ["bash", str(WRAPPER), "--store", str(store), "--", "sleep", "0.2"],
+        ["bash", str(WRAPPER), "--store", str(store), "--"] + child,
         cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
 
     assert handed.returncode == 0, handed.stderr
@@ -182,12 +188,14 @@ def test_a_store_path_with_shell_metacharacters_hands_off_without_running_them(
     report = json.loads((store / "waiting.json").read_text(encoding="utf-8"))
     assert report["driver"] == driver, report
     assert report["log"] == str(store / "worker.log"), report
-    assert report["command"].strip() == "sleep 0.2", report
+    assert report["command"].strip().startswith(sys.executable), report
     # `waiting.json` is the page's contract; a quoting fix must not rename, add
     # or drop a field the read-back documents.
     assert set(report) == {"status", "found", "run_id", "round", "state",
                            "run_dir", "driver", "session", "log", "command"}
     assert (store / "worker.log").is_file(), report
+    assert marker.read_text(encoding="utf-8") == "ran\n", (
+        f"the run did not start through the handed-off log: {report}")
 
 
 @pytest.mark.skipif(os.environ.get("AGENTDESCENT_LONG_RUN_SMOKE") != "1",

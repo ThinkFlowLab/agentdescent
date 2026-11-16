@@ -180,6 +180,41 @@ def test_demo_evoskill_runs_offline_like_cli(store):
     assert any(s.startswith("agentdescent algorithms run evoskill ") for s in out["next"])
 
 
+def test_demo_tool_description_lists_evoskill_as_offline():
+    """#1107: the MCP demo schema must match the zero-key evoskill path.
+
+    After #934 the tool itself runs evoskill offline, but the description
+    still said it needed a real model and omitted both evoskill and
+    ``skill_library``. Hosts that only read the tool schema skipped the
+    zero-key smoke. The list must stay in lockstep with
+    ``demo.OFFLINE_ALGORITHMS`` / ``demo.skip_reason``.
+    """
+    from agentdescent.demo import OFFLINE_ALGORITHMS, OFFLINE_SKIP
+
+    text = TOOL_DESCRIPTIONS["demo"]
+    lower = text.lower()
+    for name in OFFLINE_ALGORITHMS:
+        assert name in text, name
+    assert "skill_library" in text
+    # The pre-#934 contract, left in the schema after the card went offline.
+    assert "real model" not in lower
+    assert "for example evoskill" not in lower
+    for name in OFFLINE_SKIP:
+        assert name not in OFFLINE_ALGORITHMS
+
+    pytest.importorskip("mcp")
+    import asyncio
+
+    server = build_server(None, advanced=False)
+
+    async def go():
+        tools = await server.list_tools()
+        demo = next(t for t in tools if t.name == "demo")
+        return demo.description
+
+    assert asyncio.run(go()) == text
+
+
 def test_demo_kind_errors_are_actionable(store):
     t = Tools(store)
     plugin = t.demo(kind="plugin")

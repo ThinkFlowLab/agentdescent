@@ -94,17 +94,20 @@ def advanced_from_env(environ: Optional[Dict[str, str]] = None) -> bool:
 #: Written for the calling model: what the tool is for and what to do around it.
 TOOL_DESCRIPTIONS: Dict[str, str] = {
     "demo": (
+        # Keep this list in lockstep with demo.OFFLINE_ALGORITHMS / --help
+        # and demo.skip_reason; evoskill runs offline (#1107, #934).
         "Run the packaged zero-key offline demo and return the same payload as "
         "`agentdescent demo --json` (ok, run_id, initial_reward, final_reward, "
-        "learned, next). Optional `algorithm` names a card (gepa, dgm, ace, "
-        "skillopt, rrsi, archive_selection). Optional `kind` selects the "
-        "offline fixture (`text` or `skill_dir`) when algorithm is omitted. "
-        "Needs no provider key and does not write the user's files. Call this "
-        "when the user wants to see AgentDescent work, has no cases or key "
-        "yet, or wants to know whether a named card can run — before doctor / "
-        "plan / start. Cards that need a real model (for example evoskill) "
-        "return an actionable error; point the user at algorithm_spec for a "
-        "real run. This is a short synchronous smoke, not a detached start."),
+        "learned, next). Optional `algorithm` names a card that runs offline "
+        "(archive_selection, evoskill, gepa, dgm, ace, skillopt, rrsi). "
+        "evoskill defaults to the `skill_library` fixture. Optional `kind` "
+        "selects the offline fixture (`text`, `skill_dir`, or `skill_library`) "
+        "when algorithm is omitted (default `skill_dir`, or `text` when "
+        "algorithm is a text-only card). Needs no provider key and does not "
+        "write the user's files. Call this when the user wants to see "
+        "AgentDescent work, has no cases or key yet, or wants to know whether "
+        "a named card can run — before doctor / plan / start. This is a short "
+        "synchronous smoke, not a detached start."),
     "doctor": (
         "Check what this machine can run: which worker agent CLIs (claude, codex, dsh, "
         "opencode) "

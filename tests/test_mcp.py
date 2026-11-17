@@ -150,6 +150,8 @@ def test_demo_is_on_path_a_and_runs_offline_without_provider_keys(store, monkeyp
     assert out["run_id"]
     assert "COLUMN: amount" in out["learned"]
     assert any("show" in step for step in out["next"])
+    assert any(s.startswith("agentdescent algorithms run gepa ") for s in out["next"])
+    assert "agentdescent evolve agentdescent.gepa.spec.json" not in out["next"]
 
 
 def test_demo_refuses_unknown_cards_like_cli(store, capsys):
@@ -178,6 +180,7 @@ def test_demo_evoskill_runs_offline_like_cli(store):
     assert out["outcomes"].get("evoskill-select", 0) >= 1
     assert "SKILL.md" in out["learned"] and "COLUMN: amount" in out["learned"]
     assert any(s.startswith("agentdescent algorithms run evoskill ") for s in out["next"])
+    assert "agentdescent evolve agentdescent.evoskill.spec.json" not in out["next"]
 
 
 def test_demo_tool_description_lists_evoskill_as_offline():

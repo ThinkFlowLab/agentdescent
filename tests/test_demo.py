@@ -255,6 +255,7 @@ def test_demo_algorithm_evoskill_runs_offline(tmp_path, monkeypatch):
     assert "evoskill-select" in out, out
     assert "algorithm: evoskill" in out
     assert "SKILL.md" in out and "COLUMN: amount" in out
+    assert "agentdescent evolve agentdescent.evoskill.spec.json" not in out
     spec = json.loads((tmp_path / "work" / "spec.json").read_text())
     assert spec["kind"] == "skill_library"
     assert spec["algorithm"]["name"] == "evoskill"
@@ -283,6 +284,7 @@ def test_demo_algorithm_evoskill_json(tmp_path, monkeypatch):
     assert payload["learned"].lstrip().startswith("column-amount/SKILL.md") or "/SKILL.md" in payload["learned"]
     assert any("show" in step for step in payload["next"])
     assert any(s.startswith("agentdescent algorithms run evoskill ") for s in payload["next"])
+    assert "agentdescent evolve agentdescent.evoskill.spec.json" not in payload["next"]
     assert "A two-skill library" not in out
 
 
@@ -459,8 +461,9 @@ def test_demo_algorithm_next_steps_keep_the_algorithm(tmp_path, monkeypatch, nam
     out = buf.getvalue()
     assert code == 0, out
     assert f"agentdescent algorithms run {name} " in out, out
-    assert f"agentdescent evolve agentdescent.{name}.spec.json" in out
     assert "agentdescent doctor" in out
+    # #1145: that spec is not on disk yet; algorithms run prints evolve later.
+    assert f"agentdescent evolve agentdescent.{name}.spec.json" not in out
     assert "--out spec.json" not in out
 
     buf = io.StringIO()
@@ -470,6 +473,6 @@ def test_demo_algorithm_next_steps_keep_the_algorithm(tmp_path, monkeypatch, nam
     payload = json.loads(buf.getvalue())
     assert code == 0
     assert any(s.startswith(f"agentdescent algorithms run {name} ") for s in payload["next"])
-    assert f"agentdescent evolve agentdescent.{name}.spec.json" in payload["next"]
+    assert f"agentdescent evolve agentdescent.{name}.spec.json" not in payload["next"]
     target = "<your-skill-dir>" if payload["kind"] != "text" else "<your-prompt.txt>"
     assert any(target in s for s in payload["next"])

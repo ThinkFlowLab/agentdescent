@@ -799,11 +799,13 @@ def demo_payload(
     target = {"text": "<your-prompt.txt>",
               "skill_library": "<your-skill-library>"}.get(used_kind, "<your-skill-dir>")
     if algo:
+        # #1145: do not point at evolve agentdescent.{algo}.spec.json — that
+        # file is only written when `algorithms run` succeeds, and that
+        # command already prints `evolve` with the absolute path it wrote.
         own_steps = [
             f"agentdescent algorithms run {algo} {target} <your-cases.jsonl> "
             f"--model <model> [--base-url <url>] --rounds 1 --workers 1",
             "agentdescent doctor",
-            f"agentdescent evolve agentdescent.{algo}.spec.json",
         ]
     elif used_kind == "text":
         own_steps = [

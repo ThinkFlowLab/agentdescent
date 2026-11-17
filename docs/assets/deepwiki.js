@@ -11,7 +11,8 @@
     spark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>',
     refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-    send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>'
+    send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>',
+    info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-5M12 8h.01"/></svg>'
   };
 
   var launcher = document.createElement('button');
@@ -35,6 +36,7 @@
     '<div class="dw-brand"><span class="dw-logo">' + icons.logo + '</span>',
     '<div><strong>DeepWiki</strong><span class="dw-repo"><i></i>' + REPO + '</span></div></div>',
     '<div class="dw-head-actions">',
+    '<a class="dw-icon-btn" href="/deepwiki/" title="About DeepWiki and MCP" aria-label="About DeepWiki and MCP">' + icons.info + '</a>',
     '<button type="button" class="dw-icon-btn" id="dw-new" aria-label="New chat" title="New chat">' + icons.refresh + '</button>',
     '<button type="button" class="dw-icon-btn" id="dw-close" aria-label="Close" title="Close">' + icons.close + '</button>',
     '</div></header>',
@@ -57,7 +59,7 @@
     '<textarea id="dw-input" rows="1" placeholder="Ask about the code\u2026" aria-label="Your question"></textarea>',
     '<button type="submit" class="dw-send" id="dw-send" aria-label="Send">' + icons.send + '</button>',
     '</div>',
-    '<div class="dw-hint"><span>Enter to send \u00b7 model-generated</span><a href="/deepwiki/">MCP setup</a></div>',
+    '<div class="dw-hint"><span>DeepWiki is third-party and model-generated. Verify load-bearing answers against the source.</span><a href="/deepwiki/">Caveats</a></div>',
     '</form>'
   ].join('');
 
@@ -72,6 +74,8 @@
   var newChat = panel.querySelector('#dw-new');
   var emptyTemplate = log.querySelector('.dw-empty').cloneNode(true);
   var busy = false;
+  var history = [];
+  var controller = null;
 
   function scroll() { log.scrollTop = log.scrollHeight; }
   function openPanel() {
@@ -93,6 +97,8 @@
     });
   }
   function resetChat() {
+    if (controller) { controller.abort(); controller = null; }
+    history = [];
     while (log.firstChild) log.removeChild(log.firstChild);
     var empty = emptyTemplate.cloneNode(true);
     log.appendChild(empty);
@@ -240,18 +246,29 @@
   function thinking() {
     var row = document.createElement('div');
     row.className = 'dw-msg dw-bot dw-thinking';
-    row.innerHTML = '<span class="dw-avatar">DW</span><div class="dw-bubble"><span class="dw-dots"><i></i><i></i><i></i></span><span>Searching the index\u2026</span></div>';
+    row.innerHTML = '<span class="dw-avatar">DW</span><div class="dw-bubble"><span class="dw-dots"><i></i><i></i><i></i></span><span>Searching the index\u2026</span><button type="button" class="dw-stop">Stop</button></div>';
     log.appendChild(row);
     scroll();
     return row;
   }
 
-  function error(text) {
+  function error(text, question) {
     var row = message('bot', text);
     row.querySelector('.dw-bubble').classList.add('dw-error');
     var link = document.createElement('p');
     link.innerHTML = '<a href="' + PAGE + '" target="_blank" rel="noopener">Open the DeepWiki page \u2197</a>';
     row.querySelector('.dw-md').appendChild(link);
+    if (question) {
+      var retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'dw-retry';
+      retry.textContent = 'Retry';
+      retry.addEventListener('click', function () {
+        row.remove();
+        ask(question);
+      });
+      row.querySelector('.dw-md').appendChild(retry);
+    }
     scroll();
   }
 
@@ -273,7 +290,7 @@
     return last;
   }
 
-  function call(question) {
+  function call(question, signal) {
     var body = {
       jsonrpc: '2.0',
       id: 1,
@@ -286,7 +303,8 @@
     return fetch(ENDPOINT, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: signal
     }).then(function (response) {
       if (!response.ok) throw new Error('DeepWiki returned HTTP ' + response.status);
       return response.text();
@@ -309,13 +327,35 @@
     if (empty) empty.remove();
     message('user', question);
     var pending = thinking();
-    call(question).then(function (result) {
+    var stop = pending.querySelector('.dw-stop');
+    if (stop) stop.addEventListener('click', function () {
+      if (controller) controller.abort();
+    });
+    var context = history.slice(-2).map(function (item) {
+      return 'Q: ' + item.q + '\nA: ' + item.a.slice(0, 900);
+    }).join('\n\n');
+    var prompt = context
+      ? 'Previous conversation for context:\n' + context + '\n\nNew question: ' + question
+      : question;
+    controller = ('AbortController' in window) ? new AbortController() : null;
+    call(prompt, controller ? controller.signal : undefined).then(function (result) {
       if (pending.parentNode) pending.remove();
-      if (result.ok) message('bot', result.text); else error(result.text);
+      if (result.ok) {
+        history.push({ q: question, a: result.text });
+        if (history.length > 4) history.shift();
+        message('bot', result.text);
+      } else {
+        error(result.text, question);
+      }
     }).catch(function (failure) {
       if (pending.parentNode) pending.remove();
-      error('DeepWiki is unavailable right now: ' + failure.message);
+      if (failure && failure.name === 'AbortError') {
+        error('Stopped. Ask again when you are ready.', question);
+      } else {
+        error('DeepWiki is unavailable right now: ' + failure.message, question);
+      }
     }).then(function () {
+      controller = null;
       busy = false;
       send.disabled = false;
       input.focus();

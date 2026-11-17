@@ -57,11 +57,16 @@ proposal or printed.
 
 The publisher creates blobs, a tree over the base tree, a commit whose parent is
 the base head, the proposal branch, the PR (or updates an existing PR for the
-same head/base) and the labels/check. A second publish force-updates only the
-proposal branch; the base branch is never touched. An existing PR's title and
-body are refreshed, but its draft state is left alone. Label and check-run
-failures after the branch/PR exist are reported under `warnings` instead of
-aborting a half-written publish.
+same head/base) and the labels/check. A second publish updates the proposal
+branch only as a fast-forward: the compare against the new base must be `ahead`
+(the branch head is already contained in the base) or `identical`. Anything
+else, including the ordinary case where the previous publish's commit sits on a
+base that has not moved (`behind`), is refused with `refusing to rewrite it`;
+the base branch is never touched. To recover from a refusal, wait until the
+base contains the proposal's head and re-run, or publish under a new branch
+name. An existing PR's title and body are refreshed, but its draft state is
+left alone. Label and check-run failures after the branch/PR exist are reported
+under `warnings` instead of aborting a half-written publish.
 
 ## Status
 
@@ -86,8 +91,9 @@ read-only.
   code in the existing sandbox/runner, never on the publisher host with secrets.
 - **Secrets.** The token is read from the environment at request time. Do not put
   it in a proposal, a commit, a check summary or a log.
-- **Base branch.** Only `proposal.branch` is created/force-updated; a proposal
-  whose branch equals the base is refused.
+- **Base branch.** Only `proposal.branch` is created, and an existing one is
+  updated only as a fast-forward (`ahead` or `identical`); a branch that would
+  need a rewrite is refused, as is a proposal whose branch equals the base.
 
 ## What this is not yet
 

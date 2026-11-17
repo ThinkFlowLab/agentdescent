@@ -45,7 +45,8 @@ EVOLVE_PARAM_ALLOWLIST = frozenset({
     "asynchronous", "async_ratio", "resync_on_commit", "pipelined_gate",
     "gate_workers", "max_seconds", "max_rollouts", "max_calls", "max_tokens",
     "stop_on_diminishing_returns", "efficiency_floor", "call_budget",
-    "self_verify", "held_out_frac", "repo_path", "checkpointing", "agg_config",
+    "self_verify", "held_out_frac", "repo_path", "checkpointing", "round_base",
+    "agg_config",
     "staleness_policy", "aggregator_factory", "oracle_budget",
     "cheap_eval_tasks", "fusion_tournament", "solved_threshold", "shuffle",
     "seed", "on_round", "on_reports", "stop_when", "verbose", "usage",
@@ -130,6 +131,11 @@ class RuntimeSettings:
     self_verify: bool = True
     held_out_frac: float = 0.4
     checkpointing: bool = False
+    #: The number this process's first round is recorded as (#1092). A resume
+    #: passes one past the last round already in the run's ledger, so appended
+    #: rows keep increasing instead of repeating ``0, 1, 2``. Numbering only:
+    #: the run still executes its full ``rounds``.
+    round_base: int = 0
     cheap_eval_tasks: Optional[int] = None
     fusion_tournament: Optional[bool] = None
     solved_threshold: float = 0.999

@@ -2224,16 +2224,17 @@ def _merge_policies_replaced(comp) -> Optional[str]:
             "#807). evolve() may also RuntimeWarning.")
 
 
-def _selection_not_merging(comp) -> Optional[str]:
-    """Say so when `n_workers` buys selection rather than the merge it looks like.
+def _one_key_artifact(comp) -> Optional[str]:
+    """Say so when the artifact shape leaves the merge nothing to fuse (#1113).
 
-    The reflective pair is the default now, so this fires on the one case that
-    is left: a spec whose only model is a file-editing CLI agent, where paying a
-    whole agent session per merge is not something to switch on unasked. Without
-    a fusion policy a one-key artifact -- `SingleSlot`, every prompt -- has its
-    worker proposals contradict by construction and collapse to one candidate,
-    so no fusion is built. Asked against the *composed* bundle rather than the
-    spec's `policies` block, because the default never appears in the latter.
+    Without a fusion policy a one-key artifact -- `SingleSlot`, one prompt, a
+    one-file tree -- has its worker proposals contradict by construction and
+    collapse to one candidate, so no union is ever built; `n_workers` is
+    per-round best-of-N selection and the note says what to change. Asked against
+    the *composed* bundle rather than the spec's `policies` block, because the
+    default never appears in the latter: when the reflective pair is installed a
+    one-key artifact *is* merged by the reflector, so the advice would be wrong
+    and stays quiet.
 
     An ``aggregator_factory`` (gepa's Pareto pool) replaces that conflict
     pipeline: each surviving proposal enters its pool on its own, so nothing
@@ -2245,32 +2246,53 @@ def _selection_not_merging(comp) -> Optional[str]:
     if installed is not None and (installed.fusion is not None
                                   or installed.conflict is not None):
         return None
-    strategy = comp.kwargs.get("strategy")
-    workers = comp.kwargs.get("n_workers") or 1
-    try:
-        keys = list(strategy.keys())
-    except Exception:  # noqa: BLE001 - a strategy that cannot enumerate: say nothing
-        return None
-    if workers > 1 and len(keys) == 1:
-        return (f"n_workers={workers} on a one-key artifact ({type(strategy).__name__}) "
-                "is best-of-N selection, not merging: worker proposals contradict by "
-                "construction and collapse to one candidate, so no fusion is built. "
-                "Name a cheap model in `reflect` and it merges them instead.")
-    return None
+    from .strategies import _one_key_artifact_note
+
+    return _one_key_artifact_note(comp.kwargs.get("strategy"),
+                                  workers=comp.kwargs.get("n_workers") or 1)
 
 
 #: Same rule as ``evolve()`` / ``_build_engine`` — keep the strings aligned (#343).
 _MIN_TASKS_FOR_SPLIT = 4
 _MIN_TASKS_MSG = "need at least 4 tasks to split train/held-out"
 
+#: `plan --baseline-sample`: a seed at or above this score has no headroom left.
+#: `docs/results.md` records a 0.95 baseline as no headroom and the bench probe
+#: refuses above 0.90; the plain number keeps the CLI off the `bench/` package.
+DEFAULT_SATURATION = 0.90
+
+
+def _seed_baseline_score(comp, n: int) -> Tuple[float, int]:
+    """Score the **seed** artifact on the first ``n`` tasks (#1113).
+
+    One agent call per task: the seed is what every round starts from, so its
+    score is the ceiling a run has to climb. Only an explicit
+    ``--baseline-sample`` gets here, and the caller quotes the calls before the
+    first one is spent -- plain `plan` still sends nothing.
+    """
+    strategy = comp.kwargs.get("strategy")
+    run = comp.kwargs.get("run")
+    tasks = list(comp.tasks)[:n]
+    if strategy is None or run is None or not tasks:
+        raise ValueError("this spec has no seed artifact and tasks to sample")
+    rendered = strategy.render(strategy.initial())
+    scores = [float(comp.reward(task, run(rendered, task))) for task in tasks]
+    return sum(scores) / len(scores), len(tasks)
+
 
 def plan_payload(spec: EvolveSpec, *, usd_per_call: Optional[float] = None,
                  budget_usd: Optional[float] = None) -> Dict[str, Any]:
-    comp = compose(spec)
+    return _plan_payload(compose(spec), spec, usd_per_call=usd_per_call,
+                         budget_usd=budget_usd)
+
+
+def _plan_payload(comp, spec: EvolveSpec, *,
+                  usd_per_call: Optional[float] = None,
+                  budget_usd: Optional[float] = None) -> Dict[str, Any]:
     warnings = _unusable_refs(spec)
-    selection = _selection_not_merging(comp)
-    if selection:
-        warnings.append(selection)
+    shape = _one_key_artifact(comp)
+    if shape:
+        warnings.append(shape)
     replaced = _merge_policies_replaced(comp)
     if replaced:
         warnings.append(replaced)
@@ -2393,13 +2415,19 @@ def _print_plan(payload: Dict[str, Any], *, spec_path: str,
                 next_line: Optional[str] = None,
                 printed: Optional[set] = None,
                 probe_lines: Optional[Sequence[str]] = None,
-                then_line: Optional[str] = None) -> None:
+                then_line: Optional[str] = None,
+                baseline_lines: Optional[Sequence[str]] = None,
+                refused_headroom: bool = False) -> None:
     """Print the human `plan` summary; warnings and the held-out note go to stderr.
 
     `payload` is exactly the object `--json` prints, so both surfaces carry the
     same facts and `--json` stays byte-identical (#919). `printed` holds lines an
     earlier report already showed (`algorithms run` prints init's report first),
     so a warning is never repeated.
+
+    `refused_headroom` withholds the paid quote -- the call estimate and the
+    `next:` step -- because `--baseline-sample` found nothing to learn (#1113);
+    the refusal, with its fix, takes its place.
     """
     already = set(printed or ())
     for line in payload.get("warnings") or []:
@@ -2427,10 +2455,13 @@ def _print_plan(payload: Dict[str, Any], *, spec_path: str,
     usd = est.get("usd_upper_bound")
     summary += (f"  (${usd:.2f} upper bound)" if usd is not None
                 else "  (no $ estimate: pass --usd-per-call)")
-    lines = [_plan_target_line(payload), summary]
+    lines = [_plan_target_line(payload)]
+    if not refused_headroom:
+        lines.append(summary)
     agent = _plan_agent_line(payload.get("spec") or {})
     if agent:
         lines.append(agent)
+    lines.extend(baseline_lines or ())
     other_notes = [n for n in notes if not n.startswith(_HELD_OUT_NOTE)]
     for line in other_notes[:3]:
         lines.append(f"note: {line}")
@@ -2443,7 +2474,11 @@ def _print_plan(payload: Dict[str, Any], *, spec_path: str,
     lines.extend(probe_lines or ())
     if then_line:
         lines.append(f"then: {then_line}")
-    lines.append(f"next: {next_line or f'agentdescent evolve {spec_path}'}")
+    if refused_headroom:
+        lines.append("refused: no headroom -- the paid run is not quoted; "
+                     "raise the difficulty or pass --force")
+    else:
+        lines.append(f"next: {next_line or f'agentdescent evolve {spec_path}'}")
     print("\n".join(lines))
 
 
@@ -2488,13 +2523,26 @@ def _probe_if_asked(a: argparse.Namespace,
 
 
 def cmd_plan(a: argparse.Namespace) -> int:
+    sample = getattr(a, "baseline_sample", None)
+    if sample is not None and sample < 1:
+        print("error: --baseline-sample must be >= 1", file=sys.stderr)
+        return 2
+    saturation = getattr(a, "saturation", None)
+    if saturation is None:
+        saturation = DEFAULT_SATURATION
+    if not 0.0 < saturation <= 1.0:
+        print("error: --saturation must be in (0, 1]", file=sys.stderr)
+        return 2
     try:
         # Loading sits inside the guard so an unreadable or malformed spec file
         # answers `--json` with the same `{"ok": false, "error": ...}` object a
         # spec that fails to compile already gets (#648).
         spec = load_spec(a.spec)
         _apply_algorithm_flag(spec, a)
-        payload = plan_payload(spec, usd_per_call=a.usd_per_call,
+        # The composition is kept: `--baseline-sample` scores the seed on it,
+        # and composing twice would load the data twice for one plan (#1113).
+        comp = compose(spec)
+        payload = _plan_payload(comp, spec, usd_per_call=a.usd_per_call,
                                 budget_usd=getattr(a, 'budget', None))
     except (SpecError, ValueError) as e:
         # JSON only on request; otherwise the same `error: ...` line on stderr
@@ -2528,6 +2576,45 @@ def cmd_plan(a: argparse.Namespace) -> int:
             next_line = _first_failed_probe_next(probe)
             payload["next"] = next_line
             then_line = f"agentdescent plan {a.spec} --probe"
+    # `--baseline-sample` spends real calls, so it runs last: a broken spec or a
+    # refused probe must not first pay for N rollouts (#1113). The sample's own
+    # call count is printed before the first one; it is opt-in, and plain `plan`
+    # still sends nothing.
+    baseline_lines: List[str] = []
+    refused_headroom = False
+    if (sample is not None and payload.get("ok", True)
+            and (probe is None or probe.get("ok", True))):
+        quote = f"{sample} agent call(s)"
+        usd_per_call = getattr(a, "usd_per_call", None)
+        if usd_per_call:
+            quote += f" (~${sample * usd_per_call:.2f})"
+        print(f"baseline sample: scoring the seed on up to {sample} task(s) "
+              f"costs {quote}", file=sys.stderr)
+        try:
+            score, used = _seed_baseline_score(comp, sample)
+        except Exception as e:  # noqa: BLE001 - a backend or contract failure
+            print(f"error: baseline sample failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            return 2
+        headroom = score < saturation
+        payload["baseline"] = {"sample": used, "score": score,
+                               "saturation": saturation, "headroom": headroom}
+        baseline_lines.append(
+            f"baseline: the seed scores {score:.3f} on {used} task(s); "
+            f"saturation {saturation:.3f} -> "
+            f"{'headroom' if headroom else 'no headroom'}")
+        if not headroom:
+            forced = bool(getattr(a, "force", False))
+            payload["warnings"].append(
+                f"no headroom: the seed already scores {score:.3f} on {used} "
+                f"sampled task(s), at or above saturation {saturation:.3f}, so a "
+                "run can only report below-threshold. Raise the task difficulty "
+                "(docs/results.md) or lower the model's baseline"
+                + ("; the run is quoted anyway because --force was passed."
+                   if forced else "; pass --force to quote the run anyway."))
+            if not forced:
+                payload["ready"] = False
+                refused_headroom = True
     if a.json:
         _out(payload, as_json=True)
     else:
@@ -2538,9 +2625,14 @@ def cmd_plan(a: argparse.Namespace) -> int:
 
         _print_plan(payload, spec_path=a.spec, next_line=next_line,
                     probe_lines=(_probe_lines(probe) if probe is not None else None),
-                    then_line=then_line)
+                    then_line=then_line, baseline_lines=baseline_lines,
+                    refused_headroom=refused_headroom)
     if not payload.get("ok", True):
         return 2
+    # A saturated seed is a config answer, like a refused probe: plan found the
+    # run cannot learn anything, before the run store gained an entry (#1113).
+    if refused_headroom:
+        return 1
     # A refused probe is a config answer, not a spec error: the same non-zero
     # exit `evolve` would have taken on its first call, taken before the run
     # store gained an entry (#1048).
@@ -5894,6 +5986,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "refused key/endpoint/model/subscription is answered "
                         "before any run starts (default: runs nothing, spends "
                         "nothing)")
+    s.add_argument("--baseline-sample", type=int, default=None, metavar="N",
+                   dest="baseline_sample",
+                   help="score the seed artifact on the first N tasks before "
+                        "quoting the run, so a baseline with nothing left to "
+                        "learn is caught before paying; one agent call per task, "
+                        "quoted first (default: runs nothing)")
+    s.add_argument("--saturation", type=float, default=DEFAULT_SATURATION,
+                   metavar="SCORE",
+                   help="with --baseline-sample: a seed at or above this score "
+                        "has no headroom and the paid run is not quoted "
+                        "(default: %(default).2f)")
+    s.add_argument("--force", action="store_true",
+                   help="with --baseline-sample: quote the paid run even when "
+                        "the seed has no headroom")
     s.set_defaults(fn=cmd_plan)
 
     s = sub.add_parser("evolve", help="run a spec")

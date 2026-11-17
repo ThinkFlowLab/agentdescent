@@ -149,6 +149,25 @@ def test_force_quotes_the_run_anyway(tmp_path, endpoint):
     assert _Handler.hits == 4
 
 
+def test_a_forced_json_plan_still_says_not_ready(tmp_path, endpoint):
+    """`--force` buys the quote, not a verdict change.
+
+    `ready` is what a host follows, so it stays false on a saturated seed even
+    when the estimate was forced out: auto-starting that run is exactly what
+    the flag exists to question.
+    """
+    code, out, err = _run(["plan", _spec(tmp_path, gold="ok"), "--json",
+                           "--baseline-sample", "4", "--force"])
+
+    payload = json.loads(out)
+    assert code == 0
+    assert payload["estimate"]["agent_calls_upper_bound"] == 11
+    assert payload["baseline"]["headroom"] is False
+    assert payload["ready"] is False
+    assert any("because --force was passed" in w for w in payload["warnings"])
+    assert _Handler.hits == 4
+
+
 def test_a_saturated_sample_withholds_the_estimate_from_json_too(tmp_path, endpoint):
     code, out, err = _run(["plan", _spec(tmp_path, gold="ok"), "--json",
                            "--baseline-sample", "4"])

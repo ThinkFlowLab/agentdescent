@@ -2615,8 +2615,12 @@ def cmd_plan(a: argparse.Namespace) -> int:
                 "(docs/results.md) or lower the model's baseline"
                 + ("; the run is quoted anyway because --force was passed."
                    if forced else "; pass --force to quote the run anyway."))
+            # `--force` buys the quote, not a different verdict: `ready` stays
+            # false either way, so a host following it cannot auto-start a run
+            # the plan says has nothing to learn. The human refusal (exit 1,
+            # withheld quote) is what force skips, nothing else (#1113).
+            payload["ready"] = False
             if not forced:
-                payload["ready"] = False
                 refused_headroom = True
     if a.json:
         _out(payload, as_json=True)

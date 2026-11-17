@@ -260,6 +260,44 @@ def row_gains_differ(report) -> bool:
     return len(set(gains)) > 1
 
 
+def test_a_promoting_multi_seed_report_never_points_at_one_artifact(monkeypatch):
+    """Different-but-equally-good artifacts promote, so ``next`` must name the
+    per-seed rows instead of the one diff this report refuses to name (#1141)."""
+
+    def fake_evolve(*args, **kwargs):
+        seed = kwargs.get("seed", 0)
+        rendered = "R0 R1 R2" if seed == 0 else "R0 R1 R2 plus seed1"
+        return _StubResult(rendered=rendered, final_reward=0.9)
+
+    monkeypatch.setattr("agentdescent.pilot.evolve", fake_evolve)
+    report = pilot(_policy(), _config(seeds=(0, 1)))
+
+    assert report.action == PromotionAction.PROMOTE
+    assert report.run["artifacts_agree"] is False
+    assert report.run["artifact_hash"] is None
+    assert report.run["reported_seed"] is None
+    steps = " ".join(report.next)
+    assert "review the artifact diff" not in steps
+    assert "apply it" not in steps
+    assert "run.per_seed" in steps
+    assert "keep the manifest and this report for audit" in report.next
+
+
+def test_an_agreeing_multi_seed_report_keeps_its_promote_steps(monkeypatch):
+    """One shared artifact is nameable, so the single-diff steps stay."""
+
+    def fake_evolve(*args, **kwargs):
+        return _StubResult(rendered="R0 R1 R2", final_reward=0.9)
+
+    monkeypatch.setattr("agentdescent.pilot.evolve", fake_evolve)
+    report = pilot(_policy(), _config(seeds=(0, 1)))
+
+    assert report.action == PromotionAction.PROMOTE
+    assert report.run["artifacts_agree"] is True
+    assert "review the artifact diff" in report.next
+    assert "apply it as a separate, explicit step" in report.next
+
+
 def test_single_seed_report_is_unchanged():
     report = pilot(_policy(), _config())
 

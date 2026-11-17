@@ -3849,10 +3849,25 @@ def cmd_snapshot_apply(a: argparse.Namespace) -> int:
     snap = _snapshot_from_args(a)
     if not a.to:
         raise runstore.RunStoreError("snapshot apply needs --to PATH")
+    dest = os.path.expanduser(a.to)
     with tempfile.TemporaryDirectory(prefix="ad-snapshot-apply-") as tmp:
-        src = os.path.join(tmp, snap.artifact_id or "artifact")
-        os.makedirs(src, exist_ok=True)
-        snap.materialize(src)
+        # A text snapshot's candidate is `rendered`, not the strategy's
+        # internal rule store in `files` (#1149). Materialising `files`
+        # wrote hash-named rule files into a directory even when --to
+        # named a file. Tree kinds keep the materialise path.
+        if snap.kind == "text":
+            if os.path.isdir(dest):
+                raise runstore.RunStoreError(
+                    f"snapshot {snap.snapshot_id} is a text artifact and "
+                    f"{dest!r} is a directory; pass --to FILE to write it "
+                    "to a file")
+            src = os.path.join(tmp, "artifact")
+            with open(src, "w", encoding="utf-8", newline="") as fh:
+                fh.write(snap.render())
+        else:
+            src = os.path.join(tmp, snap.artifact_id or "artifact")
+            os.makedirs(src, exist_ok=True)
+            snap.materialize(src)
         payload = apply_from_payload(
             src, to=a.to, dry_run=a.dry_run, backup=not a.no_backup,
             check_write=_operator_write_guard())

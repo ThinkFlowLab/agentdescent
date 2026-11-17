@@ -16,6 +16,7 @@ commands on a host with no MCP.
     agentdescent watch   <run_id>                                   follow rounds
     agentdescent show    <run_id> [--diff]                          the evolved tree
     agentdescent apply   <run_id> [--to PATH] [--dry-run]           install it, backed up
+    agentdescent snapshot export|show|eval|apply                    portable candidate, readonly re-eval
     agentdescent cancel  <run_id>  /  resume <run_id>
     agentdescent algorithms list|show|run …                         named Algorithm cards
     agentdescent demo                                               one offline run, no key
@@ -3684,6 +3685,80 @@ def cmd_apply(a: argparse.Namespace) -> int:
     return 0
 
 
+def _snapshot_from_args(a: argparse.Namespace):
+    from .artifact_snapshot import load_snapshot_source
+    source = a.source
+    path = os.path.abspath(os.path.expanduser(source))
+    if not os.path.isfile(path):
+        source = resolve_run_id(source, store=a.store) or source
+    return load_snapshot_source(source, store=a.store)
+
+
+def _print_snapshot(snap, *, as_json: bool) -> None:
+    payload = snap.to_dict()
+    if as_json:
+        _out(payload, as_json=True)
+        return
+    lines = [
+        f"snapshot {payload.get('id')}",
+        f"kind: {payload.get('kind') or '(none)'}  version: {payload.get('version')}",
+        f"parent: {payload.get('parent') or '(none)'}  root: {payload.get('root') or '(none)'}",
+        f"files: {len(payload.get('files') or {})}",
+    ]
+    roles = payload.get("roles") or {}
+    for path, role in sorted(roles.items()):
+        lines.append(f"  [{role}] {path}")
+    _out('\n'.join(lines), as_json=False)
+
+
+def cmd_snapshot_export(a: argparse.Namespace) -> int:
+    snap = _snapshot_from_args(a)
+    if a.out:
+        try:
+            snap.save(a.out)
+        except OSError as e:
+            raise _cannot_write(a.out, e) from None
+        if a.json:
+            _out(snap.to_dict(), as_json=True)
+        else:
+            print(f"wrote {a.out}")
+        return 0
+    _out(snap.to_dict(), as_json=True)
+    return 0
+
+
+def cmd_snapshot_show(a: argparse.Namespace) -> int:
+    _print_snapshot(_snapshot_from_args(a), as_json=a.json)
+    return 0
+
+
+def cmd_snapshot_eval(a: argparse.Namespace) -> int:
+    from .artifact_snapshot import evaluate_snapshot_spec
+    snap = _snapshot_from_args(a)
+    spec = load_spec(a.spec)
+    report = evaluate_snapshot_spec(snap, spec)
+    payload = report.to_dict()
+    payload["ok"] = True
+    _out(payload, as_json=True)
+    return 0 if not report.failed else 1
+
+
+def cmd_snapshot_apply(a: argparse.Namespace) -> int:
+    import tempfile
+    snap = _snapshot_from_args(a)
+    if not a.to:
+        raise runstore.RunStoreError("snapshot apply needs --to PATH")
+    with tempfile.TemporaryDirectory(prefix="ad-snapshot-apply-") as tmp:
+        src = os.path.join(tmp, snap.artifact_id or "artifact")
+        os.makedirs(src, exist_ok=True)
+        snap.materialize(src)
+        payload = apply_from_payload(
+            src, to=a.to, dry_run=a.dry_run, backup=not a.no_backup,
+            check_write=_operator_write_guard())
+    _out(payload, as_json=True)
+    return 0
+
+
 def cmd_cancel(a: argparse.Namespace) -> int:
     st = runstore.cancel(a.run_id, store=a.store)
     print(_status_line(st))
@@ -5958,6 +6033,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true", dest="dry_run")
     s.add_argument("--no-backup", action="store_true", dest="no_backup")
     s.set_defaults(fn=cmd_apply)
+
+    s = sub.add_parser(
+        "snapshot",
+        help="export, show, re-evaluate or apply a portable candidate snapshot")
+    snap_sub = s.add_subparsers(dest="snapshot_cmd", required=True)
+    sp = snap_sub.add_parser(
+        "export", help="write a snapshot JSON from a run or an existing snapshot")
+    sp.add_argument("source", help="a run id, `latest`, or a snapshot JSON file")
+    sp.add_argument("-o", "--out", help="write JSON to this path (default: stdout)")
+    sp.set_defaults(fn=cmd_snapshot_export)
+    sp = snap_sub.add_parser(
+        "show", help="lineage, file roles and the complete candidate")
+    sp.add_argument("source", help="a run id, `latest`, or a snapshot JSON file")
+    sp.set_defaults(fn=cmd_snapshot_show)
+    sp = snap_sub.add_parser(
+        "eval", help="score a frozen snapshot on a destination spec; does not search")
+    sp.add_argument("source", help="a run id, `latest`, or a snapshot JSON file")
+    sp.add_argument("--spec", required=True,
+                    help="destination EvolveSpec (tasks and scorer only; target is ignored)")
+    sp.set_defaults(fn=cmd_snapshot_eval)
+    sp = snap_sub.add_parser(
+        "apply", help="materialise a snapshot to a directory, with the usual backup")
+    sp.add_argument("source", help="a run id, `latest`, or a snapshot JSON file")
+    sp.add_argument("--to", required=True, help="destination directory")
+    sp.add_argument("--dry-run", action="store_true", dest="dry_run")
+    sp.add_argument("--no-backup", action="store_true", dest="no_backup")
+    sp.set_defaults(fn=cmd_snapshot_apply)
 
     s = sub.add_parser("cancel", help="stop a run and every worker it started")
     s.add_argument("run_id")

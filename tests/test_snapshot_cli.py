@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from agentdescent.cli import main
-from agentdescent.snapshot import ArtifactSnapshot
+from agentdescent.artifact_snapshot import ArtifactSnapshot
 from agentdescent.treestrategy import FileTree
 
 

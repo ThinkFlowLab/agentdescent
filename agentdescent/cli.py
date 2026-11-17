@@ -3686,7 +3686,7 @@ def cmd_apply(a: argparse.Namespace) -> int:
 
 
 def _snapshot_from_args(a: argparse.Namespace):
-    from .snapshot import load_snapshot_source
+    from .artifact_snapshot import load_snapshot_source
     source = a.source
     path = os.path.abspath(os.path.expanduser(source))
     if not os.path.isfile(path):
@@ -3733,7 +3733,7 @@ def cmd_snapshot_show(a: argparse.Namespace) -> int:
 
 
 def cmd_snapshot_eval(a: argparse.Namespace) -> int:
-    from .snapshot import evaluate_snapshot_spec
+    from .artifact_snapshot import evaluate_snapshot_spec
     snap = _snapshot_from_args(a)
     spec = load_spec(a.spec)
     report = evaluate_snapshot_spec(snap, spec)

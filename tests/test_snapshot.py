@@ -8,7 +8,7 @@ import pytest
 from agentdescent.evolution import EvolvingArtifact, Task
 from agentdescent.evolvespec import EvolveSpec
 from agentdescent.ledger import Ledger, read_artifact_lineage
-from agentdescent.snapshot import (
+from agentdescent.artifact_snapshot import (
     ArtifactSnapshot,
     evaluate_snapshot,
     evaluate_snapshot_spec,
@@ -130,7 +130,7 @@ def test_evaluate_snapshot_scores_readonly_and_does_not_search(monkeypatch):
     def boom(*args, **kwargs):
         raise AssertionError("evaluate_snapshot must not call evolve")
 
-    monkeypatch.setattr("agentdescent.snapshot.evolve", boom, raising=False)
+    monkeypatch.setattr("agentdescent.artifact_snapshot.evolve", boom, raising=False)
     # Also patch the real engine entry point the scorer might import.
     monkeypatch.setattr("agentdescent.evolution.evolve", boom)
 

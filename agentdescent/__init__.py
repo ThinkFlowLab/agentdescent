@@ -476,7 +476,7 @@ from .filetree import (
     tree_summary,
 )
 from .treestrategy import EDIT_PROTOCOL, FileTree, parse_edits, parse_proposal, tree_reflector
-from .snapshot import (
+from .artifact_snapshot import (
     ArtifactSnapshot,
     SnapshotEvalReport,
     evaluate_snapshot,

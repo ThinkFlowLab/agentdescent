@@ -6416,7 +6416,7 @@ The simulator against the real problem: how much the dream is worth.
 
 ### `snapshot`
 
-A portable snapshot of one candidate: full context plus ledger lineage.
+Compose the archive's per-slot, per-port and health evidence.
 
 ### `society_evolve`
 

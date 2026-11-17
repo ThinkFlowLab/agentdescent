@@ -170,6 +170,24 @@ def test_a_baseline_sample_below_one_is_an_input_error(tmp_path, endpoint):
     assert _Handler.hits == 0
 
 
+def test_an_out_of_range_saturation_is_an_input_error(tmp_path, endpoint):
+    code, out, err = _run(["plan", _spec(tmp_path), "--baseline-sample", "4",
+                           "--saturation", "1.5"])
+
+    assert code == 2
+    assert "--saturation must be in (0, 1]" in err
+    assert _Handler.hits == 0, "the input error must be caught before any call"
+
+
+def test_a_saturation_without_a_sample_changes_nothing(tmp_path, endpoint):
+    """`--saturation` is only read by the sample; a plain plan stays free."""
+    code, out, err = _run(["plan", _spec(tmp_path), "--saturation", "0"])
+
+    assert code == 0, (out, err)
+    assert _Handler.hits == 0
+    assert "baseline" not in (out + err).lower()
+
+
 # -- the artifact-shape note -------------------------------------------------
 
 

@@ -2530,7 +2530,10 @@ def cmd_plan(a: argparse.Namespace) -> int:
     saturation = getattr(a, "saturation", None)
     if saturation is None:
         saturation = DEFAULT_SATURATION
-    if not 0.0 < saturation <= 1.0:
+    # Both flags are only read by the sample: refuse a nonsense saturation where
+    # it would be read, and leave `plan --saturation 0` inert rather than failing
+    # a plain plan over a flag that changes nothing (#1113 review).
+    if sample is not None and not 0.0 < saturation <= 1.0:
         print("error: --saturation must be in (0, 1]", file=sys.stderr)
         return 2
     try:

@@ -2,6 +2,7 @@
 
 import json
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -552,3 +553,28 @@ def test_an_approval_with_an_action_word_does_not_block_readiness(monkeypatch):
     assert payload["merge_readiness"]["ready"] is True
     by_text = {row["text"]: row["severity"] for row in payload["constraints"]}
     assert by_text["Approved - no changes required."] == "suggestion"
+
+
+DOCS_GITHUB = Path(__file__).resolve().parents[1] / "docs" / "github.md"
+
+
+def test_publisher_page_documents_fast_forward_only_updates():
+    """The page must not promise the force update `_require_fast_forward` refuses.
+
+    Guards both places that used to promise it (#1120): the publish paragraph
+    and the base-branch bullet. It asserts the rule, not the wording, so a later
+    edit of the prose is not blocked.
+    """
+    page = DOCS_GITHUB.read_text(encoding="utf-8")
+    for number, line in enumerate(page.splitlines(), start=1):
+        if "force-updat" in line.lower():
+            condition = ("fast-forward" in line.lower() or "`ahead`" in line
+                         or "`identical`" in line or "refus" in line.lower())
+            assert condition, (
+                "docs/github.md promises a force update without naming the "
+                f"fast-forward condition or the refusal (line {number}): "
+                f"{line.strip()!r}")
+    lowered = page.lower()
+    assert "fast-forward" in lowered
+    assert "`ahead`" in page and "`identical`" in page
+    assert "refusing to rewrite it" in page

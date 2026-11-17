@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
@@ -98,6 +99,19 @@ class ArtifactSnapshot:
     def __post_init__(self) -> None:
         if not isinstance(self.artifact_id, str) or not self.artifact_id.strip():
             raise ValueError("artifact_id must be a non-empty string")
+        # The id can come from a snapshot JSON someone else wrote, and both
+        # staging writes used to join it under their tempdir: it is an
+        # identifier, so it must be one path-safe component, like the id
+        # `EvolveSpec.artifact_id()` already sanitizes to (#1150).
+        if ("\x00" in self.artifact_id
+                or "/" in self.artifact_id or "\\" in self.artifact_id
+                or os.path.isabs(self.artifact_id)
+                or re.match(r"^[A-Za-z]:", self.artifact_id)
+                or self.artifact_id.strip() in (".", "..")):
+            raise ValueError(
+                "artifact_id must be one path-safe component (no '/', '\\', "
+                "':', NUL, absolute path or '..'), got: "
+                f"{self.artifact_id!r}")
         object.__setattr__(self, "files", _files(self.files))
         object.__setattr__(self, "editable", _as_patterns(self.editable, ("**",)))
         object.__setattr__(self, "frozen", _as_patterns(self.frozen, ()))
@@ -375,13 +389,16 @@ def evaluate_snapshot(
 
 
 def _write_target(snapshot: ArtifactSnapshot, kind: str, tmp: str) -> str:
+    # Staging never derives a path from `artifact_id`: the name is fixed, so
+    # even a construction regression elsewhere cannot steer the write
+    # outside `tmp` (#1150).
     if kind == "text":
-        path = os.path.join(tmp, snapshot.artifact_id)
+        path = os.path.join(tmp, "artifact.txt")
         text = snapshot.render()
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         return path
-    dest = os.path.join(tmp, snapshot.artifact_id)
+    dest = os.path.join(tmp, "artifact")
     os.makedirs(dest, exist_ok=True)
     snapshot.materialize(dest)
     return dest

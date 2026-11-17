@@ -335,12 +335,16 @@ class TrustEvidence:
 def _noise_refusal_note(noise: Any, *, min_effect: float) -> str:
     """Name the actual reason a gain is refused as noise.
 
-    ``distinguishable`` is false for three causes: too few baseline repeats to
-    bound a floor, a measurable floor the gain does not clear, or a floor
-    narrower than ``min_effect`` (the effect-size bar decides). Every branch
-    keeps the phrase ``not distinguishable from noise``.
+    ``distinguishable`` is false for four causes, in the order checked here:
+    the gain is not positive, too few baseline repeats bound no floor, a
+    measurable floor the gain does not clear, or a floor narrower than
+    ``min_effect`` (the effect-size bar decides). Every branch keeps the
+    phrase ``not distinguishable from noise``.
     """
     head = f"gain {noise.gain:+.3f} is not distinguishable from noise"
+    if noise.gain <= 0.0:
+        return (f"{head} (the candidate did not improve on the baseline: "
+                f"the gain must be positive)")
     if noise.repeats < 2:
         return (f"{head} (the noise floor cannot be estimated from "
                 f"{noise.repeats} baseline repeat(s); at least 2 are needed)")

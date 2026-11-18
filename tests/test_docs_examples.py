@@ -75,3 +75,25 @@ def test_snapshot_docs_spec_examples_are_json():
     for name in re.findall(r'load_spec\("([^"]+)"\)', text):
         assert name.endswith(".json"), (
             f'docs/snapshot.md load_spec("{name}") is not a file load_spec can read')
+
+
+FIRST_SCREEN_DEMO_PAGES = (
+    "README.md",
+    "docs/start.md",
+    "docs/plugin-quickstart.md",
+    "docs/testing-guide.md",
+)
+
+
+def test_first_screen_demo_transcript_shows_the_seed_baseline():
+    """#1146: the CLI prints the seed and the final reward on one line.
+
+    `agentdescent demo` ends with `held-out reward: 0.000 -> 1.000`, and these
+    four pages are the transcript a new user compares a working install against;
+    a bare `1.000` makes the first screen disagree with the command it documents.
+    """
+    for page in FIRST_SCREEN_DEMO_PAGES:
+        text = (ROOT / page).read_text()
+        assert "held-out reward: 0.000 -> 1.000" in text, page
+        assert "held-out reward: 1.000 outcomes" not in text, page
+        assert "held-out reward: 1.000   outcomes" not in text, page

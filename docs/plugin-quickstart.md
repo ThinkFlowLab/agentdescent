@@ -78,7 +78,7 @@ plan: 12 tasks, 4 rounds x 2 workers, up to 68 agent calls
 running (20260905-134121-1c695b)...
   round  0  reward=1.000  +1/-0
 
-held-out reward: 1.000   outcomes: {'committed': 1}
+held-out reward: 0.000 -> 1.000   outcomes: {'committed': 1}
 what it learned:  rules.md -> 'COLUMN: amount'
 ```
 

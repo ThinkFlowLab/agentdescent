@@ -2588,6 +2588,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
     # still sends nothing.
     baseline_lines: List[str] = []
     refused_headroom = False
+    baseline_failed = False
     if (sample is not None and payload.get("ok", True)
             and (probe is None or probe.get("ok", True))):
         quote = f"{sample} agent call(s)"
@@ -2599,32 +2600,45 @@ def cmd_plan(a: argparse.Namespace) -> int:
         try:
             score, used = _seed_baseline_score(comp, sample)
         except Exception as e:  # noqa: BLE001 - a backend or contract failure
-            print(f"error: baseline sample failed: {type(e).__name__}: {e}",
-                  file=sys.stderr)
-            return 2
-        headroom = score < saturation
-        payload["baseline"] = {"sample": used, "score": score,
-                               "saturation": saturation, "headroom": headroom}
-        baseline_lines.append(
-            f"baseline: the seed scores {score:.3f} on {used} task(s); "
-            f"saturation {saturation:.3f} -> "
-            f"{'headroom' if headroom else 'no headroom'}")
-        if not headroom:
-            forced = bool(getattr(a, "force", False))
-            payload["warnings"].append(
-                f"no headroom: the seed already scores {score:.3f} on {used} "
-                f"sampled task(s), at or above saturation {saturation:.3f}, so a "
-                "run can only report below-threshold. Raise the task difficulty "
-                "(docs/results.md) or lower the model's baseline"
-                + ("; the run is quoted anyway because --force was passed."
-                   if forced else "; pass --force to quote the run anyway."))
-            # `--force` buys the quote, not a different verdict: `ready` stays
-            # false either way, so a host following it cannot auto-start a run
-            # the plan says has nothing to learn. The human refusal (exit 1,
-            # withheld quote) is what force skips, nothing else (#1113).
+            # A provider/subscription/endpoint failure is a config answer, like
+            # a refused probe: keep the plan envelope, exit 1, write no run
+            # store entry (#1155). Input errors still return 2 above.
+            from .probe import _next_step
+
+            next_line = _next_step(e, retry=f"plan --baseline-sample {sample}")
+            payload["baseline"] = {"ok": False,
+                                   "error": f"{type(e).__name__}: {e}"}
             payload["ready"] = False
-            if not forced:
-                refused_headroom = True
+            payload["next"] = next_line
+            then_line = (
+                f"agentdescent plan {a.spec} --baseline-sample {sample}")
+            baseline_lines.append(
+                f"baseline: scoring failed: {type(e).__name__}: {e}")
+            baseline_failed = True
+        else:
+            headroom = score < saturation
+            payload["baseline"] = {"sample": used, "score": score,
+                                   "saturation": saturation, "headroom": headroom}
+            baseline_lines.append(
+                f"baseline: the seed scores {score:.3f} on {used} task(s); "
+                f"saturation {saturation:.3f} -> "
+                f"{'headroom' if headroom else 'no headroom'}")
+            if not headroom:
+                forced = bool(getattr(a, "force", False))
+                payload["warnings"].append(
+                    f"no headroom: the seed already scores {score:.3f} on {used} "
+                    f"sampled task(s), at or above saturation {saturation:.3f}, so a "
+                    "run can only report below-threshold. Raise the task difficulty "
+                    "(docs/results.md) or lower the model's baseline"
+                    + ("; the run is quoted anyway because --force was passed."
+                       if forced else "; pass --force to quote the run anyway."))
+                # `--force` buys the quote, not a different verdict: `ready` stays
+                # false either way, so a host following it cannot auto-start a run
+                # the plan says has nothing to learn. The human refusal (exit 1,
+                # withheld quote) is what force skips, nothing else (#1113).
+                payload["ready"] = False
+                if not forced:
+                    refused_headroom = True
     if a.json:
         _out(payload, as_json=True)
     else:
@@ -2641,7 +2655,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
         return 2
     # A saturated seed is a config answer, like a refused probe: plan found the
     # run cannot learn anything, before the run store gained an entry (#1113).
-    if refused_headroom:
+    if refused_headroom or baseline_failed:
         return 1
     # A refused probe is a config answer, not a spec error: the same non-zero
     # exit `evolve` would have taken on its first call, taken before the run

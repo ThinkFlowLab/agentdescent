@@ -16,6 +16,7 @@ saturated seed refuses to quote the run unless ``--force`` is passed.
 from __future__ import annotations
 
 import io
+import os
 import json
 import threading
 from contextlib import redirect_stderr, redirect_stdout
@@ -205,6 +206,95 @@ def test_a_saturation_without_a_sample_changes_nothing(tmp_path, endpoint):
     assert code == 0, (out, err)
     assert _Handler.hits == 0
     assert "baseline" not in (out + err).lower()
+
+
+# -- a failed sample keeps the plan envelope (#1155) -------------------------
+
+
+#: Volcengine Ark Coding, an expired plan, on HTTP 400 as measured in #1006.
+ARK_SUBSCRIPTION = {
+    "error": {
+        "code": "InvalidSubscription",
+        "message": ("Your account does not have a valid CodingPlan subscription, "
+                    "or your subscription has expired."),
+    }
+}
+
+
+class _FailHandler(BaseHTTPRequestHandler):
+    body: bytes = b"{}"
+    hits = 0
+    lock = threading.Lock()
+
+    def do_POST(self):  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        with type(self).lock:
+            type(self).hits += 1
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(type(self).body)))
+        self.end_headers()
+        self.wfile.write(type(self).body)
+
+    def log_message(self, *args):  # noqa: D401
+        pass
+
+
+@pytest.fixture
+def failing_endpoint(monkeypatch):
+    _FailHandler.hits = 0
+    _FailHandler.body = json.dumps(ARK_SUBSCRIPTION).encode()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FailHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("FAKE_KEY", "sk-not-real")
+    monkeypatch.setenv("FAKE_BASE_URL",
+                       f"http://127.0.0.1:{server.server_address[1]}")
+    yield
+    server.shutdown()
+    server.server_close()
+
+
+def _store_is_empty(store: str) -> bool:
+    return not os.path.exists(store) or not os.listdir(store)
+
+
+def test_a_failed_baseline_sample_keeps_the_plan_and_names_the_next_step(
+        tmp_path, failing_endpoint):
+    """A provider failure is a config answer, like a refused probe (#1155)."""
+    store = str(tmp_path / "runs")
+    spec = _spec(tmp_path)
+    code, out, err = _run(["--store", store, "plan", spec,
+                           "--baseline-sample", "3"])
+
+    assert code == 1, (code, out, err)
+    assert "plan:" in out
+    assert "baseline: scoring failed: SubscriptionInactive:" in out
+    assert ("next: renew the subscription at the provider, or point "
+            "api_key_env / model at another plan") in out
+    assert f"then: agentdescent plan {spec} --baseline-sample 3" in out
+    assert "next: agentdescent evolve" not in out
+    assert "baseline sample: scoring the seed on up to 3 task(s)" in err
+    assert _store_is_empty(store)
+
+
+def test_a_failed_baseline_sample_json_is_a_complete_object(
+        tmp_path, failing_endpoint):
+    store = str(tmp_path / "runs")
+    spec = _spec(tmp_path)
+    code, out, err = _run(["--store", store, "plan", spec,
+                           "--baseline-sample", "3", "--json"])
+
+    payload = json.loads(out)
+    assert code == 1, (code, out, err)
+    assert payload["ok"] is True, "the plan itself is fine; only scoring failed"
+    assert payload["ready"] is False
+    assert payload["baseline"]["ok"] is False
+    assert "SubscriptionInactive" in payload["baseline"]["error"]
+    assert payload["next"] == (
+        "renew the subscription at the provider, or point api_key_env / "
+        "model at another plan")
+    assert "evolve" not in payload["next"]
+    assert _store_is_empty(store)
 
 
 # -- the artifact-shape note -------------------------------------------------

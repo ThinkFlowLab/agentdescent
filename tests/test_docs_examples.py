@@ -58,3 +58,20 @@ def test_quickstart_defines_every_name_it_uses():
     for name in ("tasks", "reward", "run", "propose"):
         assert re.search(rf"^\s*(def\s+{name}\b|{name}\s*=)", code, re.M), \
             f"{name} is used but never defined in the quickstart"
+
+
+def test_snapshot_docs_spec_examples_are_json():
+    """Every --spec example on the snapshot page must name a JSON file (#1154).
+
+    load_spec is JSON-only, so a documented dest.yaml fails at the first
+    command in the re-evaluation walkthrough.
+    """
+    text = (ROOT / "docs" / "snapshot.md").read_text()
+    names = [n.strip("`'\"") for n in re.findall(r"--spec\s+(\S+)", text)]
+    assert names, "expected at least one --spec example in docs/snapshot.md"
+    for name in names:
+        assert name.endswith(".json"), (
+            f"docs/snapshot.md --spec {name} is not a file load_spec can read")
+    for name in re.findall(r'load_spec\("([^"]+)"\)', text):
+        assert name.endswith(".json"), (
+            f'docs/snapshot.md load_spec("{name}") is not a file load_spec can read')

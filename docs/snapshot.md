@@ -45,7 +45,7 @@ is what you take *with you* when the run directory is not the destination.
 ## Re-evaluate without search
 
 ```bash
-agentdescent snapshot eval skill.json --spec dest.yaml
+agentdescent snapshot eval skill.json --spec dest.json
 ```
 
 The destination spec supplies the **tasks and the scorer** (including whatever
@@ -56,7 +56,7 @@ is the snapshot. Kind must match. In Python:
 from agentdescent import evaluate_snapshot, evaluate_snapshot_spec, load_spec
 
 report = evaluate_snapshot(snap, tasks, run=run, reward=reward)
-# or evaluate_snapshot_spec(snap, load_spec("dest.yaml"))
+# or evaluate_snapshot_spec(snap, load_spec("dest.json"))
 report.reward, report.scores, report.searched  # searched is always False
 ```
 

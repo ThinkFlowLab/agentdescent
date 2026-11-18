@@ -124,6 +124,7 @@ nav:
     - The evolve method: evolution.md
     - Strategies — what evolves: strategies.md
     - Evolving a directory: directory-evolution.md
+    - Portable snapshots: snapshot.md
     - Document backends: backends.md
     - The aggregator (the optimizer): aggregator.md
     - Population engine: population.md

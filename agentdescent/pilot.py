@@ -458,7 +458,8 @@ def _shared_artifact(
 
 def _notes(config: PilotConfig, evidence: Optional[TrustEvidence],
            *, reported_seed: Optional[int] = None,
-           artifacts_agree: Optional[bool] = None) -> Tuple[str, ...]:
+           artifacts_agree: Optional[bool] = None,
+           strategy: Any = None) -> Tuple[str, ...]:
     notes = []
     if len(config.seeds) == 1:
         notes.append("one seed; rerun with at least two before quoting the "
@@ -473,6 +474,14 @@ def _notes(config: PilotConfig, evidence: Optional[TrustEvidence],
             notes.append(
                 f"every seed produced the same artifact (seed {reported_seed}); "
                 "the scores pool every seed")
+    # Same sentence `plan` prints, from the same helper: a one-key artifact has
+    # no union to merge into, so the card says so once (#1113).
+    if strategy is not None:
+        from .strategies import _one_key_artifact_note
+
+        shape = _one_key_artifact_note(strategy, workers=config.n_workers)
+        if shape:
+            notes.append(shape)
     notes.append("token counts are real only when the model adapter shares "
                  "the run's Usage")
     if config.contaminated is None:
@@ -547,6 +556,9 @@ def pilot(policy: PilotPolicy,
             notes=("refused before any model call",))
 
     if config.dry_run:
+        from .strategies import _one_key_artifact_note
+
+        shape = _one_key_artifact_note(policy.strategy, workers=config.n_workers)
         return PilotReport(
             artifact_id=artifact_id, status="planned", manifest=manifest,
             run={"tasks": len(train_ids), "test_tasks": len(test_ids),
@@ -554,7 +566,8 @@ def pilot(policy: PilotPolicy,
                  "n_workers": config.n_workers,
                  "budget": dict(config.budget or {})},
             next=("rerun without --dry-run to spend the quoted budget",),
-            notes=("dry run: no model call was made",))
+            notes=tuple(["dry run: no model call was made"]
+                        + ([shape] if shape else [])))
 
     if config.contaminated is True:
         # Refuse before spending: a contaminated dataset cannot yield a
@@ -667,7 +680,7 @@ def pilot(policy: PilotPolicy,
         }
     cost = _cost(usage)
     notes = _notes(config, None, reported_seed=reported_seed,
-                   artifacts_agree=artifacts_agree)
+                   artifacts_agree=artifacts_agree, strategy=policy.strategy)
 
     failed_all = list(dict.fromkeys(failed_all))
     if errors or not before_all or not after_all:
@@ -698,4 +711,5 @@ def pilot(policy: PilotPolicy,
         run=run_report, cost=cost,
         next=_next_actions(decision, artifacts_agree=artifacts_agree),
         notes=_notes(config, evidence, reported_seed=reported_seed,
-                     artifacts_agree=artifacts_agree), alpha=config.alpha)
+                     artifacts_agree=artifacts_agree, strategy=policy.strategy),
+        alpha=config.alpha)

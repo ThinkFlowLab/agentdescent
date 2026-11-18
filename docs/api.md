@@ -13,7 +13,7 @@ means the parameter has none.
 Each section links to the page that explains *why* the module is shaped the
 way it is; this page is the *what*.
 
-631 public names across 125 modules.
+637 public names across 126 modules.
 
 ---
 
@@ -254,6 +254,7 @@ evolve(
     test_frac: float = 0.0,
     repo_path: Optional[str] = None,
     checkpointing: bool = False,
+    round_base: int = 0,
     agg_config: Optional[AggregatorConfig] = None,
     staleness_policy: Optional[StalenessPolicy] = None,
     aggregator_factory: Optional[AggregatorFactory] = None,
@@ -320,6 +321,7 @@ evolve(
 | `test_frac` | `float` | `0.0` | Carve a **test** partition out of the held-out tail (#843). Selection and every gate keep reading the select partition; the test split is scored once, after the loop, and returned as `test_reward` (with `test_tasks` / `select_tasks` for the sizes). `0.0` (the default) is the old single-split run exactly -- the CLI then says the printed reward is select-set rather than an unseen test. Synchronous only: the async path warns that it does not split yet. |
 | `repo_path` | `Optional[str]` | `None` | Where the git-backed ledger lives. Omit for a throwaway repo that is removed when this call returns (not held until interpreter exit, so a sweep does not accumulate one git repo per run); **passing the same path again resumes** that ledger, and a caller-supplied path is never deleted. Git runs with an isolated config, so a personal `~/.gitconfig` (`commit.gpgsign`, `core.hooksPath`) cannot fail the ledger's own bookkeeping commits. |
 | `checkpointing` | `bool` | `False` | Save the aggregator's in-memory **search** state to `<repo_path>/checkpoints/` after every round, so a later run on the same `repo_path` resumes the search instead of re-deriving it from the ledger head. `repo_path` alone already resumes the *artifact*; what it cannot carry is what the search learned on the way there -- Beta posteriors, a population archive and its `selected` counts, the early-stop patience counter. Off by default, because a run that never resumes (a scratch repo, a tempdir) would pay the serialise-and-write for nothing, and because an aggregator opts in by implementing `checkpoint()` / `restore()` at all -- one without them is unaffected either way. A checkpoint that cannot be written or read (state that does not serialise, a lock another process holds, a full disk) is skipped, never raised: the cost of a missing checkpoint is a resume that starts the search fresh, which is what `False` does. |
+| `round_base` | `int` | `0` | The number this run's **first** round is recorded as. `0` (the default) numbers from zero, as every fresh run did. A caller relaunching on a ledger that already holds rounds passes its last recorded round + 1, so the rows it appends keep increasing instead of repeating `0, 1, 2`. Numbering only: `rounds` is still the number of rounds executed. A restored checkpoint further ahead still wins (`max` of the two), so numbering never goes backwards. |
 | `agg_config` | `Optional[AggregatorConfig]` | `None` | Tuning for the reference aggregator (batching, acceptance risk, trust region, staleness tolerance). |
 | `staleness_policy` | `Optional[StalenessPolicy]` | `None` | What to do with a diff proposed against an out-of-date version -- `full` / `guarded` (default) / `reflective`. |
 | `aggregator_factory` | `Optional[AggregatorFactory]` | `None` | Replace the optimizer entirely; receives `(ledger, verifier, audit, config, staleness_policy)`. |
@@ -1515,6 +1517,19 @@ Ledger(
 ### `Snapshot(artifacts: Dict[str, Evolvable], version: VersionVector) -> None`
 
 An immutable view of one branch at one point in time.
+
+### `read_artifact_lineage(...)`
+
+id / parent / root already implied by a ledger repo, without opening it.
+
+```python
+read_artifact_lineage(
+    repo_path: str,
+    artifact_id: str,
+    *,
+    branch: str = 'dev'
+) -> Optional[Dict[str, Any]]
+```
 
 ---
 
@@ -4912,6 +4927,7 @@ RuntimeSettings(
     self_verify: bool = True,
     held_out_frac: float = 0.4,
     checkpointing: bool = False,
+    round_base: int = 0,
     cheap_eval_tasks: Optional[int] = None,
     fusion_tournament: Optional[bool] = None,
     solved_threshold: float = 0.999,
@@ -5485,6 +5501,10 @@ One high-risk candidate's approval request and its latest decision.
 
 Append-only JSONL decisions for high-risk candidates.
 
+### `ArtifactSnapshot`
+
+One candidate's complete context and the lineage already on the ledger.
+
 ### `BootstrapResult`
 
 A paired bootstrap of per-task gains.
@@ -6001,6 +6021,10 @@ What the archive says about one decision slot's evolution.
 
 One decision slot's adoption history and whether it is still rising.
 
+### `SnapshotEvalReport`
+
+A read-only score of one snapshot; no search happened.
+
 ### `SocietyGraph`
 
 A directed graph of `AgentNode` with delegation edges.
@@ -6165,6 +6189,14 @@ The per-arm plan estimate without running anything.
 
 Compare `verifier` with `oracle` on a deterministic sample.
 
+### `evaluate_snapshot`
+
+Score a frozen snapshot on `tasks`. Does not search or write a ledger.
+
+### `evaluate_snapshot_spec`
+
+Score `snapshot` with a destination spec's tasks and scorer.
+
 ### `evaluate_source`
 
 Run the candidate against the tests and the benchmark.
@@ -6236,6 +6268,10 @@ An inner `evolve()` whose candidate is the **whole bundle**.
 ### `layers_from_archive`
 
 One layer per decision slot, aggregated from the archive's rule records.
+
+### `load_snapshot_source`
+
+Load a snapshot JSON file, or capture one from a finished run id.
 
 ### `meta_population_run`
 

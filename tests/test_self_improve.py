@@ -45,6 +45,21 @@ def _archive(store, run_id, slot, reward, rounds, *, artifact_id="meta-rule"):
 # -- evidence ------------------------------------------------------------------
 
 
+def test_package_level_snapshot_is_the_evidence_callable():
+    """The evidence snapshot() must keep the package name ``snapshot``.
+
+    ``artifact_snapshot`` is a sibling module; importing it (or the package)
+    must not replace the callable with that module.
+    """
+    import agentdescent
+    from agentdescent.artifact_snapshot import ArtifactSnapshot
+    from agentdescent.evidence import snapshot as evidence_snapshot
+
+    assert agentdescent.snapshot is evidence_snapshot
+    assert callable(agentdescent.snapshot)
+    assert agentdescent.ArtifactSnapshot is ArtifactSnapshot
+
+
 def test_snapshot_composes_slots_ports_and_exam_counts(tmp_path):
     store = ConsolidationStore(str(tmp_path / "archive"))
     # slot A: three rules, mean reward 0.8 over 5 rounds -> rpc 0.16

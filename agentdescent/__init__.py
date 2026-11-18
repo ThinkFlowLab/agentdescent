@@ -476,6 +476,14 @@ from .filetree import (
     tree_summary,
 )
 from .treestrategy import EDIT_PROTOCOL, FileTree, parse_edits, parse_proposal, tree_reflector
+from .artifact_snapshot import (
+    ArtifactSnapshot,
+    SnapshotEvalReport,
+    evaluate_snapshot,
+    evaluate_snapshot_spec,
+    load_snapshot_source,
+)
+from .ledger import read_artifact_lineage
 from .runners import (
     LAYOUTS, PLUGIN_FROZEN, PLUGIN_HOSTS, TEST_FAILURE_MARKER, PluginHost, code_runner,
     gated_reward, plugin_runner, tree_runner,
@@ -1035,6 +1043,12 @@ __all__ = [
     "tree_summary",
     "EDIT_PROTOCOL",
     "FileTree",
+    "ArtifactSnapshot",
+    "SnapshotEvalReport",
+    "evaluate_snapshot",
+    "evaluate_snapshot_spec",
+    "load_snapshot_source",
+    "read_artifact_lineage",
     "parse_edits",
     "parse_proposal",
     "tree_reflector",

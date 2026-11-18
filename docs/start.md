@@ -95,6 +95,26 @@ has. `plan` quotes an estimated call count and starts nothing. On a model-backed
 spec, `plan --probe` makes one minimal call so an expired subscription or a bad
 endpoint is refused before a run is written.
 
+Two more checks are opt-in and answer "is this run worth paying for?". Nothing
+about them is sent by a plain `plan`:
+
+```bash
+agentdescent plan spec.json --baseline-sample 8   # one call per task, quoted first
+```
+
+`--baseline-sample N` scores the **seed** artifact on the first N tasks before
+the run is quoted: the seed is what every round starts from, so its score is the
+ceiling the run has to climb. A seed at or above `--saturation` (default `0.90`)
+prints `no headroom` and the paid run is **not** quoted — it could only report
+`below-threshold` — unless `--force` asks for the estimate anyway. The sample
+itself is priced before its first call (one agent call per task).
+
+`plan` also says when the artifact holds **one key** (a `SingleSlot` prompt, a
+one-file tree): every pair of worker proposals contradicts on that key and
+collapses to one candidate, so `n_workers` buys best-of-N selection, not
+merging. Several keys — several files, `AppendRules` — give the merge something
+to fuse.
+
 A dollar cap needs a per-call price, because the engine counts calls and cannot
 know a tool-using agent's bill in advance:
 

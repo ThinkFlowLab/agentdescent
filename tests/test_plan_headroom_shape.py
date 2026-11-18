@@ -122,6 +122,35 @@ def test_the_sample_costs_one_call_per_task_and_quotes_it_first(tmp_path, endpoi
     assert "headroom" in out
 
 
+def test_the_sample_quote_counts_tasks_not_the_requested_n(tmp_path, endpoint):
+    """A request larger than the task list is quoted for the calls it spends (#1157)."""
+    code, out, err = _run(["plan", _spec(tmp_path, n=4), "--json",
+                           "--baseline-sample", "50",
+                           "--usd-per-call", "0.01"])
+
+    payload = json.loads(out)
+    assert code == 0, (out, err)
+    assert "4 agent call(s)" in err
+    assert "~$0.04" in err
+    assert "50" not in err
+    assert payload["baseline"]["sample"] == 4
+    assert _Handler.hits == 4
+
+
+def test_the_sample_quote_is_unchanged_when_n_fits(tmp_path, endpoint):
+    """N below the task count still quotes N (#1157)."""
+    code, out, err = _run(["plan", _spec(tmp_path, n=4), "--json",
+                           "--baseline-sample", "2",
+                           "--usd-per-call", "0.01"])
+
+    payload = json.loads(out)
+    assert code == 0, (out, err)
+    assert "2 agent call(s)" in err
+    assert "~$0.02" in err
+    assert payload["baseline"]["sample"] == 2
+    assert _Handler.hits == 2
+
+
 def test_a_saturated_seed_refuses_the_paid_quote(tmp_path, endpoint):
     """Baseline 1.0: say "no headroom" and do not quote the run."""
     code, out, err = _run(["plan", _spec(tmp_path, gold="ok"),

@@ -2591,14 +2591,17 @@ def cmd_plan(a: argparse.Namespace) -> int:
     baseline_failed = False
     if (sample is not None and payload.get("ok", True)
             and (probe is None or probe.get("ok", True))):
-        quote = f"{sample} agent call(s)"
+        # Quote the calls the sample can actually spend, not the requested N
+        # (#1157): a 4-task spec asked for 50 must not be priced as 50 calls.
+        effective = min(sample, len(comp.tasks))
+        quote = f"{effective} agent call(s)"
         usd_per_call = getattr(a, "usd_per_call", None)
         if usd_per_call:
-            quote += f" (~${sample * usd_per_call:.2f})"
-        print(f"baseline sample: scoring the seed on up to {sample} task(s) "
+            quote += f" (~${effective * usd_per_call:.2f})"
+        print(f"baseline sample: scoring the seed on up to {effective} task(s) "
               f"costs {quote}", file=sys.stderr)
         try:
-            score, used = _seed_baseline_score(comp, sample)
+            score, used = _seed_baseline_score(comp, effective)
         except Exception as e:  # noqa: BLE001 - a backend or contract failure
             # A provider/subscription/endpoint failure is a config answer, like
             # a refused probe: keep the plan envelope, exit 1, write no run

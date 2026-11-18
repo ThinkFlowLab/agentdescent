@@ -3792,7 +3792,12 @@ def _snapshot_from_args(a: argparse.Namespace):
     path = os.path.abspath(os.path.expanduser(source))
     if not os.path.isfile(path):
         source = resolve_run_id(source, store=a.store) or source
-    return load_snapshot_source(source, store=a.store)
+    try:
+        return load_snapshot_source(source, store=a.store)
+    except (TypeError, ValueError) as e:
+        # A malformed snapshot is bad input, like a malformed spec: the CLI
+        # reports it as exit 2, a traceback is not a verdict (#1150).
+        raise SpecError(f"snapshot {source}: {e}") from None
 
 
 def _print_snapshot(snap, *, as_json: bool) -> None:
@@ -3861,11 +3866,13 @@ def cmd_snapshot_apply(a: argparse.Namespace) -> int:
                     f"snapshot {snap.snapshot_id} is a text artifact and "
                     f"{dest!r} is a directory; pass --to FILE to write it "
                     "to a file")
-            src = os.path.join(tmp, "artifact")
+            src = os.path.join(tmp, "artifact.txt")
             with open(src, "w", encoding="utf-8", newline="") as fh:
                 fh.write(snap.render())
         else:
-            src = os.path.join(tmp, snap.artifact_id or "artifact")
+            # Fixed staging name: the payload's `artifact_id` never reaches a
+            # path, so the staging write cannot leave `tmp` (#1150).
+            src = os.path.join(tmp, "artifact")
             os.makedirs(src, exist_ok=True)
             snap.materialize(src)
         payload = apply_from_payload(

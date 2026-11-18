@@ -45,8 +45,8 @@ cases with known totals and a local program as the agent, then runs the real
 loop — only the model is replaced — and ends with:
 
 ```
-held-out reward: 1.000 outcomes: {'committed': 1}
-what it learned: rules.md -> 'COLUMN: amount'
+held-out reward: 0.000 -> 1.000   outcomes: {'committed': 1}
+what it learned:  rules.md -> 'COLUMN: amount'
 ```
 
 Skill evolution here means a **multi-file skill library**, not a single prompt:

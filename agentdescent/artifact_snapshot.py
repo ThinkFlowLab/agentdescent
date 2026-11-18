@@ -110,7 +110,7 @@ class ArtifactSnapshot:
                 or self.artifact_id.strip() in (".", "..")):
             raise ValueError(
                 "artifact_id must be one path-safe component (no '/', '\\', "
-                "':', NUL, absolute path or '..'), got: "
+                "NUL, absolute path, drive letter or '..'), got: "
                 f"{self.artifact_id!r}")
         object.__setattr__(self, "files", _files(self.files))
         object.__setattr__(self, "editable", _as_patterns(self.editable, ("**",)))

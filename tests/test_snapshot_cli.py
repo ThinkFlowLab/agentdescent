@@ -1,6 +1,7 @@
 """CLI surface for portable snapshots: show, eval, apply — no search."""
 
 import json
+import os
 from pathlib import Path
 
 from agentdescent.cli import main
@@ -59,12 +60,67 @@ def test_snapshot_show_export_eval_and_apply(tmp_path, capsys, monkeypatch):
     assert report["n"] == 1
     assert report["reward"] == 1.0
 
+    # Text apply writes `rendered` as one file (#1149). The previous rows
+    # pinned a hybrid: kind=text but materialising SKILL.md / tests/n.txt
+    # into a directory, which no real text run produces.
+    dest = tmp_path / "missing.txt"
+    assert main(["--json", "snapshot", "apply", str(source), "--to", str(dest),
+                 "--dry-run"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("ok") is not False
+    assert payload["noop"] is False
+    assert not dest.exists()
+    assert main(["--json", "snapshot", "apply", str(source), "--to", str(dest)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["noop"] is False
+    assert payload["written"] == [os.path.abspath(str(dest))]
+    assert dest.read_text(encoding="utf-8") == "always say yes"
+
+    assert main(["--json", "snapshot", "apply", str(source), "--to", str(dest)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["noop"] is True
+    assert payload["written"] == []
+    assert dest.read_text(encoding="utf-8") == "always say yes"
+
+    as_dir = tmp_path / "as-dir"
+    as_dir.mkdir()
+    rc = main(["--json", "snapshot", "apply", str(source), "--to", str(as_dir)])
+    err = json.loads(capsys.readouterr().out)
+    assert rc == 2 and err["ok"] is False
+    assert "is a directory" in err["error"] and "--to FILE" in err["error"]
+    assert list(as_dir.iterdir()) == []
+
+    # An empty-rules text snapshot still applies the seed prompt (render()),
+    # not a no-op with written: [].
+    empty = ArtifactSnapshot(
+        artifact_id="seed.txt", files={}, editable=["**"], frozen=[],
+        kind="text", version=1, id="seed.txt@v1",
+        rendered="You are a terse assistant.\n")
+    empty_src = tmp_path / "empty.json"
+    empty.save(empty_src)
+    seed_dest = tmp_path / "prompt.txt"
+    assert main(["--json", "snapshot", "apply", str(empty_src),
+                 "--to", str(seed_dest)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["noop"] is False
+    assert payload["written"] == [os.path.abspath(str(seed_dest))]
+    assert seed_dest.read_text(encoding="utf-8") == "You are a terse assistant.\n"
+
+    # Tree kinds keep today's materialise behaviour.
+    tree = ArtifactSnapshot.from_filetree(
+        FileTree({"SKILL.md": "always say yes\n", "tests/n.txt": "frozen\n"},
+                 frozen=["tests/**"]),
+        artifact_id="skill", kind="skill_dir",
+        lineage={"version": 2, "id": "skill@v2", "parent": "skill@v1",
+                 "root": "skill@v1"})
+    tree_source = tmp_path / "skill-tree.json"
+    tree.save(tree_source)
     target = tmp_path / "installed"
-    assert main(["--json", "snapshot", "apply", str(source), "--to", str(target),
+    assert main(["--json", "snapshot", "apply", str(tree_source), "--to", str(target),
                  "--dry-run"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload.get("ok") is not False
     assert not target.exists() or not any(target.iterdir())
-    assert main(["--json", "snapshot", "apply", str(source), "--to", str(target)]) == 0
+    assert main(["--json", "snapshot", "apply", str(tree_source), "--to", str(target)]) == 0
     assert (target / "SKILL.md").read_text() == "always say yes\n"
     assert (target / "tests/n.txt").read_text() == "frozen\n"

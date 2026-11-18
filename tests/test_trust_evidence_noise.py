@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from agentdescent.promotion import PromotionAction, promote
-from agentdescent.trust_evidence import build_trust_evidence
+from agentdescent.stats_eval import NoiseCalibration
+from agentdescent.trust_evidence import (_noise_refusal_note,
+                                        build_trust_evidence)
 
 
 def _flat(value=0.5, tasks=8):
@@ -88,3 +90,39 @@ def test_a_passing_zero_spread_gain_has_no_note_and_no_fake_ratio():
     evidence = _evidence(0.2, 0.8, [0.2, 0.2, 0.2], [0.8, 0.8, 0.8])
     assert "not distinguishable" not in evidence.eval_result.detail
     assert evidence.metadata["noise"]["gain_over_noise"] == 0.0
+
+
+def test_a_regression_is_named_as_no_improvement_not_as_noise():
+    """A negative gain is a regression: no floor could make it positive, so
+    the note must say the candidate did not improve, not print a band."""
+    evidence = _evidence(0.5, 0.2, [0.3, 0.5, 0.7], [0.2, 0.2, 0.2])
+    noise = evidence.metadata["noise"]
+    assert noise["gain"] == pytest.approx(-0.3)
+    assert noise["distinguishable"] is False
+    detail = evidence.eval_result.detail
+    assert "not distinguishable from noise" in detail
+    assert "did not improve on the baseline" in detail
+    assert "\u00b1" not in detail
+    assert "noise floor: baseline mean" not in detail
+
+
+def test_an_exact_zero_gain_takes_the_no_improvement_branch():
+    """The guard is ``gain <= 0.0``; exactly 0.0 is no improvement."""
+    noise = NoiseCalibration(
+        noise_floor=(-0.2, 0.2), variance={}, gain_over_noise=0.0,
+        distinguishable=False, gain=0.0, baseline_mean=0.5, repeats=3)
+    note = _noise_refusal_note(noise, min_effect=0.0)
+    assert "not distinguishable from noise" in note
+    assert "did not improve on the baseline" in note
+    assert "\u00b1" not in note
+
+
+def test_a_positive_float_noise_gain_stays_in_the_floor_branch():
+    """The guard is ``<= 0.0``, not a tolerance: +8.327e-16 is not swallowed."""
+    noise = NoiseCalibration(
+        noise_floor=(-0.2, 0.2), variance={}, gain_over_noise=0.0,
+        distinguishable=False, gain=8.327e-16, baseline_mean=0.5, repeats=3)
+    note = _noise_refusal_note(noise, min_effect=0.0)
+    assert "not distinguishable from noise" in note
+    assert "did not improve on the baseline" not in note
+    assert "noise floor: baseline mean +0.500 \u00b1 0.200" in note

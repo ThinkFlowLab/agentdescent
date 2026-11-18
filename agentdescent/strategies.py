@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Dict, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Dict, Optional, Protocol, Sequence, runtime_checkable
 
 from .evolvable import Diff
 
@@ -212,5 +212,39 @@ class KeyedRules:
             return None
         return Diff(diff_id=f"{author}:{key}:{base_version}", target=target,
                     ops={key: value}, author=author)
+
+
+def _one_key_artifact_note(strategy: Any, *, workers: int = 1) -> Optional[str]:
+    """One line: a declared one-key artifact cannot be merged by union (#1113).
+
+    ``plan`` and the pilot report both print this, from here, so the two
+    surfaces cannot drift. Only a strategy that **declares** its key space can be
+    one-key: :class:`SingleSlot`, :class:`KeyedRules` with one category, a
+    ``FileTree`` with one writable file. ``AppendRules``/``SeededAppendRules``
+    content-address every new rule, so a second key is always possible and no
+    note is due.
+
+    Measured, not assumed: on a one-key artifact every pair of proposals
+    contradicts on the same key, conflict resolution collapses them to one, and
+    ``docs/results.md`` records ``fusion.contested == 0`` for exactly that shape
+    -- so the parallelism is per-round best-of-N *selection*.
+    """
+    try:
+        keys = list(strategy.keys())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - no declared key space: nothing to say
+        return None
+    if len(keys) != 1:
+        return None
+    name = type(strategy).__name__
+    body = (f"one-key artifact ({name}): every worker proposal targets "
+            f"{keys[0]!r}, so they contradict and collapse to one candidate -- "
+            "merge cannot fuse")
+    if workers > 1:
+        body += (f", and n_workers={workers} is best-of-N selection, not "
+                 "merging; parallelism buys throughput only.")
+    else:
+        body += ", and parallelism buys throughput only."
+    return body + (" Split the artifact into several keys (several files, "
+                   "AppendRules) if you want merging.")
 
 

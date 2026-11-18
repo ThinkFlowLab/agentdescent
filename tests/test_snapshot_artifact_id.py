@@ -159,7 +159,12 @@ def test_write_target_stages_a_tree_under_a_fixed_name(tmp_path):
     assert not (tmp_path / "skill").exists()
 
 
-def test_apply_stages_under_a_fixed_name_not_the_id(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("kind,files,expected", [
+    ("text", {"skill": "say yes"}, "artifact.txt"),
+    ("skill_dir", {"SKILL.md": "x"}, "artifact"),
+])
+def test_apply_stages_under_a_fixed_name_not_the_id(
+        tmp_path, capsys, monkeypatch, kind, files, expected):
     captured = {}
 
     def fake_apply(src, *, to, dry_run, backup, check_write):
@@ -167,8 +172,15 @@ def test_apply_stages_under_a_fixed_name_not_the_id(tmp_path, capsys, monkeypatc
         return {"ok": True, "planned": 1}
 
     monkeypatch.setattr("agentdescent.cli.apply_from_payload", fake_apply)
-    source = _snapshot_file(tmp_path / "good.json", "skill")
+    payload = _payload("skill")
+    payload["kind"] = kind
+    payload["files"] = files
+    if kind != "text":
+        payload.pop("rendered", None)
+    source = tmp_path / "good.json"
+    source.write_text(json.dumps(payload))
     code = main(["--json", "snapshot", "apply", str(source),
                  "--to", str(tmp_path / "victim")])
     assert code == 0
-    assert os.path.basename(captured["src"]) == "artifact"
+    assert os.path.basename(captured["src"]) == expected
+    assert not (tmp_path / "victim" / "skill").exists()

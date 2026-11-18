@@ -1,0 +1,691 @@
+"""Population search: how a `SelectionPolicy` runs, single head or many.
+
+:mod:`agentdescent.selection` defines *where the next batch starts*; this module
+is what makes the answer take effect. The candidate pool lives **in the
+aggregator**, and "selection" is a ledger commit that moves the head to the
+chosen candidate.
+
+:class:`PopulationAggregator` subclasses the shipped
+:class:`~agentdescent.aggregator.Aggregator` -- staleness, conflict, fusion,
+statistical acceptance and promotion all run unchanged -- and adds three things
+around it: it archives every distinct committed head with its held-out score and per-task score vector,
+asks the selection policy which archived candidate the next batch should mutate,
+and commits that candidate back to the right branch.
+
+**Single head (the default).** One ``dev`` branch, all workers start from it,
+the selection policy picks one candidate and ``dev`` is rewritten to it. This is
+the serialised population that GEPA and DGM each found on their own, and it is
+what a caller with no ``n_workers`` gets.
+
+**Multiple live heads (``Ledger.fork``).** When the run has several workers,
+``step(n_workers)`` asks the policy for as many candidates as there are workers.
+``chosen[0]`` becomes the primary ``dev`` head; each further candidate is
+committed to its own ``head/<slot>`` fork, and workers are distributed across
+them via :meth:`head_for_worker`. Every branch's head is admitted to the archive
+each round, so a worker's improvement on any fork is visible to the next
+selection. This is a **beam-style** multi-head: each round re-commits the chosen
+candidates to their forks, so a fork's head is reset to its candidate between
+rounds and the archive is what carries exploration forward.
+
+## Why this lives in the engine
+
+It was written in ``examples/_population.py`` and installed by the port runner,
+which meant one `Policies(selection=...)` bundle had three meanings: `evolve()`
+refused it, `async_evolve()` dropped it (fixed separately), and the port runner
+honoured it through `aggregator_factory=`. A field that means three things is
+worse than a field that means nothing, and only one of the three was the
+behaviour the docs described.
+
+## The boundary that used to be here
+
+The parent switch is a **state replacement**, and it used to be written as
+``head.apply(Diff(ops=target_state))``. That only *sets* keys, so a key the head
+had and the target does not survived the switch: on a grow-only key space
+(``AppendRules``) the "switch" was a union, and the run silently hill-climbed
+instead of exploring. It was invisible in the ports because every declared
+policy rode a fixed-key artifact. Moving the layer into the engine makes the
+pairing reachable by any caller, so the switch now carries explicit ``None``
+deletions for the keys the target does not have -- the sentinel
+:meth:`~agentdescent.evolution.EvolvingArtifact.apply` already understood, and
+the one :meth:`~agentdescent.evolution.EvolvingArtifact.diff` already emits.
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import Dict, List, Optional, Set
+
+from .aggregator import Aggregator, MergeReport
+from .evolvable import Diff
+from .ledger import CASConflict, Ledger
+from .selection import (
+    Candidate, MultiHeadUnsupported, SelectionContext, SelectionPolicy,
+)
+
+__all__ = ["PopulationAggregator", "population_factory"]
+
+
+def _state_size(state: Dict[str, str]) -> int:
+    """A candidate's content size, as a deterministic cost proxy.
+
+    The prompt an expansion sends is dominated by the artifact it renders, so
+    content size is a first-order proxy for the input tokens that expansion
+    costs -- and unlike measured tokens it is attributable to a single candidate
+    without racing a shared meter. A cost-aware policy divides its exploration
+    bonus by this, so a cheap candidate gets more speculative looks than an
+    expensive one at the same rank. It is a *proxy* and the policy treats a
+    missing cost as the pool mean, so an imperfect scale cannot turn an
+    unmeasured candidate into a free one.
+    """
+    return sum(len(str(k)) + len(str(v)) for k, v in state.items())
+
+
+def _per_task_scores(verifier, artifact):
+    """Mean held-out score and the per-task vector selection policies need.
+
+    ``ParetoFrontier`` (and any paper parent rule that needs per-instance
+    domination) reads ``Candidate.per_task``. The archive used to keep only the
+    mean, so those policies could not run on the Policies path and authors were
+    forced onto ``aggregator_factory=``. Scoring each held-out task once both
+    fills that map and yields the mean the archive already stored — the same
+    decomposition GEPA's pool uses.
+    """
+    held = list(getattr(verifier, "held_out", ()) or ())
+    eval_fn = getattr(verifier, "eval_fn", None)
+    if not held or not callable(eval_fn):
+        score = float(eval_fn(artifact, held)) if callable(eval_fn) else 0.0
+        return score, {}
+    per_task = {}
+    for task in held:
+        tid = str(getattr(task, "id", task))
+        per_task[tid] = float(eval_fn(artifact, [task]))
+    score = sum(per_task.values()) / len(per_task)
+    return score, per_task
+
+
+
+class PopulationAggregator(Aggregator):
+    """The shipped merge pipeline plus an archive and a selection policy."""
+
+    def __init__(self, ledger, verifier, audit, config, staleness_policy=None,
+                 *, selection: SelectionPolicy, artifact_id: str, meter=None,
+                 conflict=None, fusion=None, acceptance=None, promotion=None,
+                 screen=None, island_count: int = 0):
+        super().__init__(ledger, verifier, audit, config,
+                         staleness_policy=staleness_policy, meter=meter,
+                         conflict=conflict, fusion=fusion, acceptance=acceptance,
+                         promotion=promotion, screen=screen)
+        if not (isinstance(island_count, int) and island_count >= 0):
+            raise ValueError("island_count must be an int >= 0")
+        self.selection = selection
+        self.population_artifact = artifact_id
+        #: How many **persistent** head-islands the population explores in
+        #: parallel, on top of ``dev``. ``0`` (the default) keeps the old
+        #: behaviour exactly: forks are created per step and discarded at
+        #: ``finalize``, so a selection policy's lineage resets every step.
+        #: Above zero, ``island_count`` forks survive across steps and each
+        #: keeps its own ``_branch_parent`` lineage, so tree-shaped policies
+        #: (CladeThompson, FlatPuct) score *clades* -- a lineage that
+        #: accumulates is what metaproductivity means.
+        self.island_count = int(island_count)
+        self._archive: List[Dict[str, object]] = []
+        #: Rendered candidates already in the archive, for `_admit`'s dedup.
+        #:
+        #: **Not** `Aggregator._seen`, which this used to shadow. That set is
+        #: the aggregator's record of *artifact ids*: `_known_artifacts` unions
+        #: it into the promotion table and `finalize` promotes every member.
+        #: Feeding it `artifact.render()` meant `finalize` called
+        #: `_promote("# Playbook\n- change-t2\n...")` -- a whole rendered
+        #: artifact passed off as an id -- once per distinct candidate. Two
+        #: different questions ("which artifacts do I own" and "have I archived
+        #: this text") had been sharing one set because both are sets of str.
+        self._keys: Set[str] = set()
+        self._archive_lock = threading.Lock()
+        #: Selections made, i.e. the ``round`` handed to the policy. Not under
+        #: the archive lock: `step()` is the merger's, one thread, while the
+        #: lock guards the archive against the workers that `ingest`.
+        self._selections = 0
+        #: Fraction of the run's budget still unspent, in ``[0, 1]``, for the
+        #: ``SelectionContext`` a budget-aware policy anneals on. The engine sets
+        #: it each round (from its governor); ``1.0`` is the no-budget default,
+        #: which is what a run without a token ceiling should report -- it never
+        #: runs short of one.
+        self.budget_remaining: float = 1.0
+        #: The fork names this aggregator has created, in creation order.
+        #: ``head_for_worker`` cycles through them.
+        self._forks: List[str] = []
+        #: Every fork name seen this run, including islands reaped by
+        #: `finalize`; the read-only lineage report outlives the branches.
+        self._all_forks: Set[str] = set()
+        #: Per-branch lineage tip: the ``Candidate.version`` last selected onto
+        #: that branch. The next *new* state admitted from the branch's head is
+        #: recorded as a child of that tip (#275). Absent / ``None`` means the
+        #: branch has never had a selection, so the next admit stays a root.
+        self._branch_parent: Dict[str, Optional[int]] = {}
+
+    def head_for_worker(self, worker_id: int = 0) -> str:
+        """The branch a worker should snapshot.
+
+        Worker 0 always gets ``dev`` (the primary head, chosen[0]). The rest
+        cycle through the forks (``head/0``, ``head/1``, ...), so a batch of N
+        workers explores up to ``1 + len(self._forks)`` candidates in parallel.
+        With no forks created yet, every worker gets ``dev`` (the old
+        behaviour)."""
+        if worker_id == 0 or not self._forks:
+            return Ledger.DEV
+        return self._forks[(worker_id - 1) % len(self._forks)]
+    # -- the archive ---------------------------------------------------------
+
+    def _admit(self, artifact, version: int,
+               branch: str = Ledger.DEV) -> None:
+        key = artifact.render()
+        with self._archive_lock:
+            if key in self._keys:
+                return
+            self._keys.add(key)
+            # Lineage tip for this branch: the version last selected onto it.
+            # Seed / pre-selection admits keep parent=None; a later mutation of
+            # a selected parent records that tip (#275).
+            parent = self._branch_parent.get(branch)
+        # Per-task rows first: ParetoFrontier and lineage policies need them,
+        # and the mean the archive already stored is exactly their average
+        # under a decomposable eval_fn (the GEPA pool's assumption too).
+        score, per_task = _per_task_scores(self.verifier, artifact)
+        with self._archive_lock:
+            # ``version`` is the archive's node id, and every lineage lookup
+            # (``parent``, ``_branch_parent``, ``_bump_selected``, FlatPuct's
+            # ``by_version``) keys on it, so it must be unique. The ledger
+            # version alone is not: forks taken from one snapshot each count
+            # up from the same base, so ``head/0`` and ``head/1`` can both
+            # commit a *different* state at version 5. Keep the ledger version
+            # when it is free (the common, single-head case) and otherwise
+            # take a fresh id past every id in use, so selecting one fork's
+            # candidate can never bump or parent the other's.
+            node = int(version)
+            used = {int(e["version"]) for e in self._archive}
+            if node in used:
+                node = max(used) + 1
+            self._archive.append({
+                "state": dict(getattr(artifact, "state", {}) or {}),
+                "score": float(score),
+                "per_task": dict(per_task),
+                "version": node,
+                "selected": 0,
+                "parent": (int(parent) if parent is not None else None),
+                "branch": branch,
+            })
+
+    def lineage_report(self) -> List[Dict[str, object]]:
+        """A read-only per-branch view for a population run (#150, semantics C).
+
+        One row per live branch -- ``dev`` plus every persistent island -- with
+        the archive's best candidate on it, how many candidates it holds, the
+        selections that landed there and the lineage tip it was last selected
+        from. Nothing is scored here: the archive already holds the held-out
+        score the gate paid for. Older checkpoints have no ``branch`` on their
+        entries and are read as ``dev``, which is what they were.
+        """
+        with self._archive_lock:
+            entries = [dict(entry) for entry in self._archive]
+            forks = sorted(self._all_forks)
+            tips = dict(self._branch_parent)
+        out: List[Dict[str, object]] = []
+        for name in [Ledger.DEV, *forks]:
+            rows = [entry for entry in entries
+                    if str(entry.get("branch", Ledger.DEV)) == name]
+            if not rows and name != Ledger.DEV:
+                continue
+            best = max(rows, key=lambda entry: (float(entry["score"]),
+                                                -int(entry["version"])),
+                       default=None)
+            out.append({
+                "branch": name,
+                "tip": tips.get(name),
+                "candidates": len(rows),
+                "selected": sum(int(entry.get("selected", 0)) for entry in rows),
+                "best_version": int(best["version"]) if best else None,
+                "best_score": float(best["score"]) if best else None,
+            })
+        return out
+
+    def _candidates(self) -> List[Candidate]:
+        with self._archive_lock:
+            return [
+                Candidate(artifact_id=self.population_artifact,
+                          version=int(entry["version"]),
+                          state=dict(entry["state"]),
+                          score=float(entry["score"]),
+                          per_task=dict(entry.get("per_task") or {}),
+                          selected=int(entry["selected"]),
+                          parent=(int(entry["parent"])
+                                  if entry.get("parent") is not None
+                                  else None),
+                          # A deterministic cost proxy: the artifact's rendered
+                          # content size, which dominates the prompt and so the
+                          # input tokens of expanding it. It is not the measured
+                          # token spend -- that is not attributable to a single
+                          # parent from a shared meter under concurrency -- and
+                          # the policy treats an unmeasured cost as the pool
+                          # mean rather than zero, so a proxy that is wrong in
+                          # scale is far less harmful than one that is wrong in
+                          # *presence*.
+                          cost=float(_state_size(entry["state"])))
+                for entry in self._archive
+            ]
+
+    def _best_state(self) -> Optional[Dict[str, str]]:
+        with self._archive_lock:
+            if not self._archive:
+                return None
+            best = max(self._archive, key=lambda entry: entry["score"])
+            return dict(best["state"])
+
+    def _commit_state(self, state: Dict[str, str], message: str,
+                      branch: str = Ledger.DEV) -> Optional[int]:
+        """Replace the head's state outright, deletions included.
+
+        ``ops`` carries ``None`` for every key the head has and the target does
+        not. Without that half the switch is a *union*: `apply` only sets the
+        keys it is given, so on a grow-only key space the head kept everything
+        it had ever accumulated and "start from candidate C" quietly meant
+        "start from C plus the incumbent". See the module docstring.
+        """
+        snap = self.ledger.snapshot(branch)
+        head = snap.get(self.population_artifact)
+        if head is None or dict(head.state) == state:
+            return None
+        ops: Dict[str, Optional[str]] = dict(state)
+        ops.update({k: None for k in head.state if k not in state})
+        base_vv = {self.population_artifact:
+                   snap.version.get(self.population_artifact, 0)}
+        candidate = head.apply(Diff(
+            diff_id=f"population:{message}", target=self.population_artifact,
+            ops=ops, author="population"))
+        try:
+            _, version = self.ledger.commit(candidate, base_vv,
+                                            branch=branch, message=message)
+            return version
+        except CASConflict:
+            return None
+
+    def _offered(self, chosen: Candidate, candidates: List[Candidate]) -> None:
+        """Refuse a candidate the archive never offered.
+
+        The engine's own `_check_selection` guards the *no-population* path by
+        refusing anything but the head; this is the same rule where the menu is
+        longer. Both raise `MultiHeadUnsupported` because both mean the one
+        thing: the policy named a starting point this run cannot start from.
+        Committing it anyway would write a state no rollout ever produced and no
+        gate ever scored.
+        """
+        target = dict(chosen.state)
+        if any(dict(c.state) == target for c in candidates):
+            return
+        raise MultiHeadUnsupported(
+            f"{type(self.selection).__name__}.select() returned a candidate that "
+            f"is not in the archive it was given ({len(candidates)} entries). A "
+            "selection policy chooses among the candidates in "
+            "SelectionContext.candidates; it cannot invent one, because a state "
+            "that was never a committed head has never been scored by the gate.")
+
+    def _bump_selected(self, version: int) -> None:
+        """Increment ``selected`` on ``version`` and every ancestor.
+
+        FlatPuct / CostEfficient require subtree visit counts: upstream
+        backpropagates every expansion up the parent chain. A cycle or a
+        dangling parent stops the walk (same guard FlatPuct.select uses).
+        """
+        with self._archive_lock:
+            by_version = {int(e["version"]): e for e in self._archive}
+            seen: Set[int] = set()
+            node: Optional[int] = int(version)
+            while node is not None and node not in seen:
+                seen.add(node)
+                entry = by_version.get(node)
+                if entry is None:
+                    break
+                entry["selected"] = int(entry["selected"]) + 1
+                parent = entry.get("parent")
+                node = int(parent) if parent is not None else None
+
+    # -- AggregatorProtocol --------------------------------------------------
+
+    def step(self, n_workers: int = 1) -> List[MergeReport]:
+        # Admit the pre-merge head first: on the first step that is the seed,
+        # which a post-merge-only admit would lose the moment anything commits
+        # over it -- and a population that forgot its seed cannot fall back.
+        before = self.ledger.snapshot(Ledger.DEV)
+        pre_head = before.get(self.population_artifact)
+        if pre_head is not None:
+            self._admit(pre_head,
+                        before.version.get(self.population_artifact, 0),
+                        branch=Ledger.DEV)
+        reports = super().step()
+        # Admit the head of **every** live branch, not just dev. In a multi-head
+        # run, workers commit their proposals back to their own fork, so the
+        # fork heads are where new candidates appear. Admitting only dev would
+        # throw every fork's exploration away -- the archive would never see a
+        # candidate a worker improved, and selection could never choose it.
+        # ``dev`` is in ``live_heads()``, so this covers it too; the per-branch
+        # admit below is gone.
+        any_head = False
+        for branch_name in self.ledger.live_heads():
+            snap = self.ledger.snapshot(branch_name)
+            branch_head = snap.get(self.population_artifact)
+            if branch_head is not None:
+                self._admit(branch_head,
+                            snap.version.get(self.population_artifact, 0),
+                            branch=branch_name)
+                any_head = True
+        if not any_head:
+            return reports
+        candidates = self._candidates()
+        if len(candidates) < 2:
+            return reports
+        head = self.ledger.snapshot(Ledger.DEV).get(self.population_artifact)
+        if head is None:
+            return reports
+        head_candidate = next(
+            (c for c in candidates if dict(c.state) == dict(head.state)),
+            candidates[0])
+        # ``n=1``: the ledger holds one live head, so a batch has one starting
+        # point no matter how many workers are under it. This is the seam that
+        # widens when the ledger can hold several -- the policy is already
+        # written to answer for ``n``.
+        #
+        # ``round`` is *which selection this is*, not the engine's round, and it
+        # is counted here because only this method knows: `step()` also runs on
+        # sweeps that never reach a choice (fewer than two candidates), and
+        # counting those would have a beam skip slots it never expanded.
+        #
+        # It used to be left at its default of 0, and that single omission is
+        # what made width inert. A policy asked for one starting point can only
+        # rotate on something that changes between calls; the archive and the
+        # `selected` counts are two such things, and `MCTS` and `Archive` read
+        # them -- but `Beam` and `ParetoFrontier` rank a pool and have no
+        # per-candidate state to read, so with a constant round they returned
+        # the same entry forever. `Beam(4)` was `Beam(1)`, and `ParetoFrontier`
+        # sat on whichever front member was admitted first, usually the seed.
+        ctx = SelectionContext(head=head_candidate, candidates=tuple(candidates),
+                               round=self._selections, n_workers=n_workers,
+                               budget_remaining=self.budget_remaining)
+        self._selections += 1
+        # Ask for as many starting points as the run explores in parallel: with
+        # persistent islands that is exactly ``island_count + 1`` (dev + each
+        # island); without them it is the worker count, the old behaviour. The
+        # ledger's fork mechanism (``head/<slot>``) holds each one as its own
+        # branch.
+        if self.island_count > 0:
+            n_heads = min(len(candidates), self.island_count + 1)
+        else:
+            n_heads = min(len(candidates), n_workers if n_workers else 1)
+        chosen = list(self.selection.select(ctx, n_heads))
+        if not chosen:
+            return reports
+        # chosen[0] is the primary head -> dev. The rest become forks. In a
+        # **persistent-island** run the forks already exist (``head/<slot-1>``
+        # from a previous step) and are *reused*, so each island keeps its own
+        # lineage and tree-shaped policies score real clades; a missing island
+        # is created before the candidate is committed to it, so a worker that
+        # starts from head/1 mid-step never sees a half-written fork.
+        prev_forks = list(self._forks)
+        self._forks = []
+        self._offered(chosen[0], candidates)
+        for slot, cand in enumerate(chosen):
+            target = dict(cand.state)
+            self._bump_selected(int(cand.version))
+            if slot == 0:
+                branch_name = Ledger.DEV
+                version = self._commit_state(target, "population: select parent")
+            else:
+                idx = slot - 1
+                if self.island_count > 0 and idx < len(prev_forks):
+                    fork_name = prev_forks[idx]        # keep the island's lineage
+                    # A clean finalize deletes these branches without rewriting
+                    # the on-disk checkpoint (#339). Reuse the name only when
+                    # the head still exists; otherwise recreate before commit.
+                    if fork_name not in self.ledger.live_heads():
+                        self.ledger.fork(fork_name, from_branch=Ledger.DEV)
+                else:
+                    # Canonical slot name, unless a surviving island (e.g. only
+                    # ``head/1`` after a partial loss) already owns it: two
+                    # slots must never share one branch.
+                    # (Ephemeral ``island_count == 0`` runs reset ``head/<idx>``
+                    # every step, so only persistent islands need the check.)
+                    taken = (set(prev_forks) | set(self._forks)
+                             if self.island_count > 0 else set())
+                    k = idx
+                    while f"head/{k}" in taken:
+                        k += 1
+                    fork_name = f"head/{k}"
+                    self.ledger.fork(fork_name, from_branch=Ledger.DEV)
+                self._commit_state(target, f"population: head/{idx}",
+                                   branch=fork_name)
+                self._forks.append(fork_name)
+                self._all_forks.add(fork_name)
+                branch_name = fork_name
+            self._branch_parent[branch_name] = int(cand.version)
+        if version is not None:
+            reports.append(MergeReport(
+                self.population_artifact, None, False, 0, 0, 0, 0, 0.0, version,
+                reason=f"population: parent switched (archive={len(candidates)}, "
+                       f"heads={len(self._forks)})",
+                category="population-select"))
+        return reports
+
+    def finalize(self) -> None:
+        """Leave the best-scoring candidate on the head, then promote.
+
+        Multi-head cleanup: discard all forks so the ledger ends with one
+        ``dev`` branch holding the best candidate. A fork that scored higher
+        than ``dev`` is committed to ``dev`` first."""
+        best = self._best_state()
+        if best is not None:
+            self._commit_state(best, "population: final best")
+        # Discard forks
+        for fork_name in list(self._forks):
+            try:
+                self.ledger.discard_head(fork_name)
+            except Exception:  # noqa: BLE001
+                pass
+        self._forks = []
+        super().finalize()
+
+    # -- checkpointing -------------------------------------------------------
+
+    def checkpoint(self) -> Optional[dict]:
+        """Serialise the archive and the selection counter.
+
+        The archive is the whole point of a population run: it holds every
+        committed candidate with its held-out score and its ``selected``
+        count — the novelty term ``Archive(sampling='novelty')`` reads, the
+        rotation index ``Beam`` needs. Without this, a resumed run starts an
+        archive of one (the head) and every selection policy degenerates:
+        ``Beam(4)`` is ``Beam(1)`` again, ``Archive``'s novelty term is gone,
+        and ``ParetoFrontier`` has a front of one to sit on.
+
+        The parent ``Aggregator`` state (Beta posteriors, promotion counters,
+        the artifact ids in ``_seen``) is merged in via ``super().checkpoint()``.
+        ``keys`` is this layer's own: the rendered form of every archived
+        candidate, which ``_admit`` dedups on. It is kept separate from the
+        parent's ``seen`` because the two answer different questions — see
+        ``_keys`` — and folding them together would restore a run whose
+        ``finalize`` then promotes rendered artifacts as if they were ids.
+        """
+        parent = super().checkpoint()
+        with self._archive_lock:
+            own = {
+                "archive": [dict(entry) for entry in self._archive],
+                "keys": sorted(self._keys),
+                "selections": self._selections,
+                "branch_parent": {
+                    str(k): (int(v) if v is not None else None)
+                    for k, v in getattr(self, "_branch_parent", {}).items()
+                },
+                # Persistent islands survive a restart: the ledger's fork
+                # branches persist in the repo, so a resumed run keeps them and
+                # the lineages accumulated on them.
+                "forks": list(getattr(self, "_forks", [])),
+                "all_forks": sorted(getattr(self, "_all_forks", set())),
+                "island_count": getattr(self, "island_count", 0),
+            }
+        if parent is not None:
+            own.update(parent)
+        return own
+
+    def restore(self, state: dict) -> None:
+        """Restore the archive written by :meth:`checkpoint`.
+
+        Entries are validated shape-wise; a malformed entry is skipped rather
+        than raised (a partially restored archive still beats an empty one,
+        and one bad row must not cost the whole history). The restored
+        ``state`` dicts are the candidates' *key spaces* — they are only ever
+        compared and committed, never executed, so trusting their shape is
+        enough.
+
+        The parent ``Aggregator`` state (Beta posteriors, promotion counters,
+        seen artifact ids) is restored via ``super().restore()`` first, so the
+        acceptance prior is in place before the population archive is loaded
+        on top of it.
+        """
+        # Restore the parent's state first (posteriors, promoted_at, seen).
+        # The parent's ``restore`` reads ``posteriors`` / ``promoted_at`` /
+        # ``seen`` keys, which ``checkpoint`` merged in from ``super()``.
+        super().restore(state)
+
+        archive = state.get("archive")
+        if not isinstance(archive, list):
+            return
+        restored: List[Dict[str, object]] = []
+        for entry in archive:
+            if not isinstance(entry, dict):
+                continue
+            st = entry.get("state")
+            if not isinstance(st, dict):
+                continue
+            try:
+                parent_raw = entry.get("parent", None)
+                raw_pt = entry.get("per_task") or {}
+                per_task = {}
+                if isinstance(raw_pt, dict):
+                    for tk, tv in raw_pt.items():
+                        try:
+                            per_task[str(tk)] = float(tv)
+                        except (TypeError, ValueError):
+                            continue
+                restored.append({
+                    "state": dict(st),
+                    "score": float(entry.get("score", 0.0)),
+                    # Pre-#806 checkpoints have no per_task → empty map; Pareto
+                    # then refuses honestly rather than inventing scores.
+                    "per_task": per_task,
+                    "version": int(entry.get("version", 0)),
+                    "selected": int(entry.get("selected", 0)),
+                    # Pre-#275 checkpoints have no parent field → roots.
+                    "parent": (int(parent_raw)
+                               if parent_raw is not None else None),
+                    # Pre-#483 checkpoints have no branch field → dev.
+                    "branch": str(entry.get("branch", Ledger.DEV)),
+                })
+            except (TypeError, ValueError):
+                continue
+        # ``version`` is the archive's node id and must be unique (see
+        # ``_admit``). A checkpoint written before ids were de-duplicated can
+        # hold two distinct fork states that share one ledger version; restored
+        # verbatim, ``_bump_selected`` / ``by_version`` would only ever reach
+        # one of them. Migration policy, applied in saved order: the first row
+        # with a given id keeps it, every later duplicate gets a fresh id past
+        # all ids in use. Saved ``parent`` / ``branch_parent`` references were
+        # written against the ambiguous id, so they keep resolving to the row
+        # that kept it (first claimant) -- the same first-wins rule the tree
+        # policies' ``by_version`` lookups already apply.
+        used: Set[int] = set()
+        duplicates: List[Dict[str, object]] = []
+        for entry in restored:
+            node = int(entry["version"])
+            if node in used:
+                duplicates.append(entry)
+            else:
+                used.add(node)
+        for entry in duplicates:
+            fresh_id = max(used) + 1
+            entry["version"] = fresh_id
+            used.add(fresh_id)
+        with self._archive_lock:
+            self._archive = restored
+            branch_parent = state.get("branch_parent")
+            restored_bp: Dict[str, Optional[int]] = {}
+            if isinstance(branch_parent, dict):
+                for k, v in branch_parent.items():
+                    try:
+                        restored_bp[str(k)] = (
+                            int(v) if v is not None else None)
+                    except (TypeError, ValueError):
+                        continue
+            self._branch_parent = restored_bp
+            # The dedup keys `_admit` reserves on. `seen_keys` is read as a
+            # fallback for a checkpoint written before this layer had a set of
+            # its own. Absent both, `_keys` stays empty and the archive can
+            # gain a duplicate row for a candidate committed again after the
+            # resume -- the keys are `artifact.render()`, which needs the
+            # strategy, and the aggregator does not hold one, so they cannot be
+            # rebuilt from the archive's states.
+            keys = state.get("keys")
+            if not isinstance(keys, list):
+                keys = state.get("seen_keys")
+            if isinstance(keys, list):
+                self._keys = {str(k) for k in keys}
+            try:
+                self._selections = int(state.get("selections", 0))
+            except (TypeError, ValueError):
+                self._selections = 0
+            # Persistent islands survive a restart when the ledger still holds
+            # their branches. A clean finalize deletes those forks without
+            # rewriting the checkpoint (#339), so restore must drop names
+            # whose heads are gone -- otherwise head_for_worker routes to a
+            # missing branch and step() skips recreation. step() recreates
+            # any missing islands on the next selection.
+            forks = state.get("forks")
+            if isinstance(forks, list):
+                names = [str(f) for f in forks if isinstance(f, str)]
+                try:
+                    live = set(self.ledger.live_heads())
+                except Exception:  # noqa: BLE001 - a closed/missing ledger
+                    live = set()
+                self._forks = [f for f in names if f in live]
+                all_names = state.get("all_forks")
+                self._all_forks = (set(str(f) for f in all_names)
+                                   if isinstance(all_names, list) else set(names))
+            try:
+                self.island_count = int(state.get(
+                    "island_count", getattr(self, "island_count", 0)))
+            except (TypeError, ValueError):
+                pass
+
+
+def population_factory(selection: SelectionPolicy, artifact_id: str, *,
+                       meter=None, conflict=None, fusion=None, acceptance=None,
+                       promotion=None, screen=None, island_count: int = 0):
+    """The ``aggregator_factory=`` adapter for one run.
+
+    The factory path bypasses the engine's default-aggregator construction, so
+    the decision policies that would normally arrive through the ``Policies``
+    bundle must travel through here instead -- passing them in the bundle *and*
+    a factory would silently drop them, which is the exact failure
+    ``require_supported`` exists to prevent on the other path.
+
+    ``island_count`` is the number of **persistent** head-islands the
+    population explores in parallel (see :class:`PopulationAggregator`); ``0``
+    keeps the old per-step-fork behaviour exactly.
+    """
+    if not (isinstance(island_count, int) and island_count >= 0):
+        raise ValueError("island_count must be an int >= 0")
+
+    def build(ledger, verifier, audit, config, staleness_policy=None):
+        return PopulationAggregator(
+            ledger, verifier, audit, config, staleness_policy,
+            selection=selection, artifact_id=artifact_id, meter=meter,
+            conflict=conflict, fusion=fusion, acceptance=acceptance,
+            promotion=promotion, screen=screen, island_count=island_count)
+
+    return build

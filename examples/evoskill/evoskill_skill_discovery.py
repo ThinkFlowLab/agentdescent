@@ -1,0 +1,719 @@
+"""Skill self-evolution, faithful port: **EvoSkill** (Automated Skill Discovery).
+
+Paper : "EvoSkill: Automated Skill Discovery for Coding Agents / Multi-Agent
+        Systems", Salaheddin Alzubi et al., 2026 (arXiv:2603.02766).
+Repo  : https://github.com/sentient-agi/EvoSkill
+Dataset: **OfficeQA** (grounded reasoning over U.S. Treasury Bulletins) -- the
+        repo's flagship, with a deterministic offline numeric scorer.
+
+This port is faithful to what the **code actually does** (traced from
+`src/loop/runner.py`, `src/registry/manager.py`, `src/evaluation/reward.py`),
+which differs from some paper-level claims -- flagged inline:
+
+  * **Failure-driven skill induction.** Each iteration samples train items, runs
+    the base agent, and collects failures (an item is a FAILURE when its
+    multi-tolerance score < 0.8, `src/loop/runner.py:319`). A **Skill Proposer** analyses
+    the failure *patterns* ("a GENERAL improvement, not a fix for any single
+    case") and a **Skill Generator** writes/edits one `SKILL.md` skill file.
+  * **Bounded top-K aggregate frontier (NOT per-instance Pareto).** Despite the
+    paper's framing, `src/registry/manager.py:update_frontier` keeps a bounded
+    leaderboard on a single scalar (mean validation accuracy): admit if the
+    frontier has room, else replace the worst member iff strictly greater. The
+    parent for the next iteration is selected from it (default: `best`).
+  * **Skill = a folder of Markdown files** with YAML frontmatter; the active skill
+    set is injected into the agent by concatenation.
+
+It runs **through `evolve()`** like ACE/GEPA: a `SkillLibraryTree` turns a
+proposed `SKILL.md` into a `Diff`, and a custom `aggregator_factory`
+(`TopKFrontierAggregator`) is the bounded top-K frontier. A skill is an **L2**
+artifact -> `blast_radius=0.2` (via `classify`).
+
+    python -m examples.evoskill.evoskill_skill_discovery --dry-run     # plan only, zero network
+    python -m examples.evoskill.evoskill_skill_discovery --model claude-haiku-4-5
+
+Dataset caveat (you asked to use the real OfficeQA): the full set is HF-**gated**
+(`databricks/officeqa`, needs `HF_TOKEN`); absent that this loads the repo's
+**bundled 12-row sample** from GitHub. EvoSkill's agent uses Read/Grep tools over
+the Treasury `.txt` docs; here a dependency-free keyword line-retriever stands in
+for those tools. With one non-tool LLM on 272 KB bulletins accuracy is low -- the
+value is the faithful *loop*, not a leaderboard number.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import threading
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+from agentdescent.aggregator import AggregatorProtocol, MergeReport
+from agentdescent.dataloader import (Dataset, fetch_text, hf_rows,
+                                     load_gated_hf, split_dataset)
+from agentdescent.evolvable import Diff, EvidenceCard
+from agentdescent.evolution import EvolvingArtifact, Task, evolve
+from agentdescent.filetree import parse_tree
+from agentdescent.treestrategy import FileTree
+from agentdescent.governance import classify
+from agentdescent.ledger import CASConflict, Ledger
+from agentdescent.staleness import get_policy
+from examples._common import (add_standard_args, completion_for, confirm,
+                              is_openai_compatible, worker_count,
+                              budget_kwargs, report_engine)
+
+RAW = "https://raw.githubusercontent.com/sentient-agi/EvoSkill/main/examples/officeqa/data"
+Completion = Callable[[str], str]
+
+# src/loop/runner.py:79 -- the exact tolerance ladder and the 0.8 pass threshold.
+TOLERANCE_LEVELS = [0.05, 0.01, 0.1, 0.0, 0.025]
+PASS_THRESHOLD = 0.8
+UNITS = {"trillion": 1e12, "billion": 1e9, "million": 1e6, "thousand": 1e3}
+
+
+# ===========================================================================
+# Faithful numeric scorer (src/evaluation/reward.py + src/loop/runner.py:_score_multi_tolerance)
+# ===========================================================================
+
+
+def extract_numbers(text: str) -> List[float]:
+    """Numbers with unit-aware scaling (million/billion/...), commas stripped."""
+    out: List[float] = []
+    for m in re.finditer(r"(-?\d[\d,]*\.?\d*)\s*(trillion|billion|million|thousand)?",
+                         text, re.IGNORECASE):
+        raw = m.group(1).replace(",", "")
+        if raw in ("", "-", "."):
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        unit = (m.group(2) or "").lower()
+        out.append(val * UNITS.get(unit, 1.0))
+        if unit:                      # also keep the bare figure (unit ambiguity)
+            out.append(val)
+    return out
+
+
+def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float) -> bool:
+    """Unit-aware numeric tolerance match (single- and multi-number answers)."""
+    if not (ground_truth and predicted):
+        return False
+    gt = extract_numbers(ground_truth)
+    pred = extract_numbers(predicted)
+    if not gt:
+        return _norm(ground_truth) in _norm(predicted)      # text fallback
+    if not pred:
+        return False
+
+    def close(a: float, b: float) -> bool:
+        if a == 0:
+            return b == 0
+        return abs(a - b) / abs(a) <= tolerance
+
+    gt_singles = _dedup(gt)
+    if len(_primary_numbers(ground_truth)) > 1:             # multi-number list
+        return all(any(close(g, p) for p in pred) for g in _primary_numbers(ground_truth))
+    return any(close(gt_singles[0], p) for p in pred)
+
+
+def _primary_numbers(text: str) -> List[float]:
+    """Numbers as written (no unit duplication) -- for the multi-number check."""
+    return [float(m.replace(",", "")) for m in re.findall(r"-?\d[\d,]*\.?\d*", text)
+            if m not in ("", "-", ".")]
+
+
+def _dedup(xs: List[float]) -> List[float]:
+    seen, out = set(), []
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def score_multi_tolerance(predicted: str, ground_truth: str) -> float:
+    """Weighted average over the tolerance ladder (runner._score_multi_tolerance).
+
+    weight = 1 / (1 + 20 * tolerance): stricter tolerances dominate."""
+    if not str(predicted or "").strip():
+        return 0.0
+    weighted, total = 0.0, 0.0
+    for tol in TOLERANCE_LEVELS:
+        w = 1.0 / (1.0 + 20.0 * tol)
+        weighted += w * (1.0 if fuzzy_match_answer(ground_truth, predicted, tol) else 0.0)
+        total += w
+    return weighted / total
+
+
+# ===========================================================================
+# Base agent: skills + retrieved doc context -> answer
+# ===========================================================================
+
+
+def retrieve_context(doc: str, question: str, n_lines: int = 40) -> str:
+    """Keyword line-retriever standing in for EvoSkill's Read/Grep tools."""
+    keys = set(re.findall(r"[a-z]{4,}", question.lower()))
+    lines = doc.splitlines()
+    scored = sorted(range(len(lines)),
+                    key=lambda i: -len(keys & set(re.findall(r"[a-z]{4,}", lines[i].lower()))))
+    keep = sorted(scored[:n_lines])
+    return "\n".join(lines[i] for i in keep if lines[i].strip())
+
+
+def render_skills(skills: Dict[str, str]) -> str:
+    if not skills:
+        return "(no learned skills yet)"
+    return "\n\n".join(f"### skill: {name}\n{body}" for name, body in sorted(skills.items()))
+
+
+_AGENT_TMPL = (
+    "You are a financial-analysis agent answering questions from U.S. Treasury "
+    "Bulletin excerpts.\n\nLearned skills:\n{skills}\n\n"
+    "Document excerpt:\n{context}\n\nQuestion: {question}\n\n"
+    "Reason carefully, then end with `Answer: <value>`.")
+# (the base agent that consumes the skills is `agent_answer`, defined with the
+# evolve() wiring below.)
+
+
+# ===========================================================================
+# Skill Proposer + Skill Generator (two-role, faithful to agent_profiles/*)
+# ===========================================================================
+
+_PROPOSER_TMPL = """You are the Skill Proposer. The agent failed these cases. \
+Analyse the patterns ACROSS them and identify ONE general improvement (not a fix \
+for a single case).
+
+Existing skills: {skill_names}
+
+Failures:
+{failures}
+{feedback}
+Reply with ONE line: `create <skill-name>` for a new skill, or `edit <skill-name>` \
+to revise an existing one. Then, on the next lines, a one-sentence justification."""
+
+_GENERATOR_TMPL = """You are the Skill Generator. Write ONE reusable skill file \
+for the agent, addressing this improvement:
+
+{justification}
+
+{existing}
+Output a SKILL.md body: a short imperative title line, then 2-5 concise, GENERAL \
+bullet rules for answering U.S. Treasury Bulletin questions. Output only the skill \
+text (no code fences)."""
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "skill"
+
+
+def propose_and_generate(complete: Completion, skills: Dict[str, str],
+                         failures: List[Tuple[str, str, str]],
+                         feedback: List[str]) -> Optional[Tuple[str, str]]:
+    """Returns (skill_name, skill_md) or None. Two LLM calls (proposer, generator)."""
+    fail_block = "\n".join(                       # analyse the whole failure BATCH's shared pattern
+        f"[{i}] Q: {q[:160]}\n    agent: {p[:100]}\n    gold: {g}"
+        for i, (q, p, g) in enumerate(failures))
+    fb = ("\nPreviously DISCARDED proposals (do not repeat):\n" +
+          "\n".join(f"- {x}" for x in feedback[-5:]) + "\n") if feedback else ""
+    decision = complete(_PROPOSER_TMPL.format(
+        skill_names=", ".join(sorted(skills)) or "(none)",
+        failures=fail_block, feedback=fb)).strip()
+    m = re.match(r"\s*(create|edit)\s+([\w\- ]+)", decision, re.IGNORECASE)
+    action = (m.group(1).lower() if m else "create")
+    name = _slug(m.group(2)) if m else _slug(decision.split("\n")[0])
+    justification = decision
+
+    existing = (f"You are EDITING the existing skill (preserve its intent):\n"
+                f"{skills.get(name,'')}\n" if action == "edit" and name in skills else "")
+    body = complete(_GENERATOR_TMPL.format(
+        justification=justification, existing=existing)).strip()
+    return (name, body) if body else None
+
+
+# ===========================================================================
+# Bounded top-K frontier (registry/manager.py:update_frontier)
+# ===========================================================================
+
+
+# ===========================================================================
+# Dataset: OfficeQA (real, HF-gated) with a bundled-sample fallback
+# ===========================================================================
+
+
+def _load_bundled_sample() -> List[dict]:
+    text = fetch_text(f"{RAW}/officeqa_sample.csv", cache_subdir="officeqa",
+                      filename="officeqa_sample.csv")
+    return list(csv.DictReader(text.splitlines()))
+
+
+# FinQA (ungated) stands in when OfficeQA's gate is shut. Same shape -- a financial
+# document plus a numeric answer that has to be found and computed -- and the
+# documents are ~4 KB rather than ~272 KB, so a non-tool model can actually read
+# them. It is a *substitute*, not the paper's dataset, and the run says so.
+FINQA = "dreamerdeo/finqa"
+
+
+def load_finqa(limit: int = 60) -> Tuple[List[dict], Dict[str, str]]:
+    """Ungated financial numeric QA, in OfficeQA's item/doc shape."""
+    rows = hf_rows(FINQA, "train", limit=limit)
+    items, docs = [], {}
+    for r in rows:
+        uid = str(r.get("id") or len(items))
+        docs[uid] = "\n".join(str(r.get(k, "")) for k in
+                               ("pre_text", "table", "post_text"))
+        items.append({"uid": uid, "question": str(r["question"]),
+                      "answer": str(r["answer"]), "source_files": uid,
+                      # FinQA carries no difficulty label; the split is stratified
+                      # on it, so one bucket keeps that code path honest.
+                      "difficulty": "medium"})
+    return items, docs
+
+
+def load_officeqa() -> List[dict]:
+    """Full OfficeQA if HF_TOKEN grants access; else the bundled 12-row sample."""
+    rows = load_gated_hf("databricks/officeqa", "test") or _load_bundled_sample()
+    # normalise the fields the loop needs.
+    out = []
+    for r in rows:
+        out.append({"uid": r.get("uid", ""), "question": r["question"],
+                    "answer": str(r["answer"]),
+                    "source_files": r.get("source_files", ""),
+                    "difficulty": r.get("difficulty", "easy")})
+    return out
+
+
+def fetch_docs(items: List[dict]) -> Dict[str, str]:
+    docs: Dict[str, str] = {}
+    for name in sorted({it["source_files"] for it in items if it["source_files"]}):
+        try:
+            docs[name] = fetch_text(f"{RAW}/treasury_bulletins/{name}",
+                                    cache_subdir="officeqa", filename=name)
+        except Exception:  # noqa: BLE001 - a missing doc shouldn't abort loading
+            continue
+    return docs
+
+
+def stratified_split(items: List[dict], train_ratio: float = 0.5,
+                     seed: int = 42) -> Tuple[List[dict], List[dict]]:
+    """Category-stratified train/val split (data_utils.stratified_split)."""
+    import random
+    by_cat: Dict[str, List[dict]] = {}
+    for it in items:
+        by_cat.setdefault(it["difficulty"], []).append(it)
+    rng = random.Random(seed)
+    train, val = [], []
+    for cat, group in by_cat.items():
+        rng.shuffle(group)
+        cut = max(1, int(len(group) * train_ratio))
+        train.extend(group[:cut])
+        val.extend(group[cut:] or group[:1])
+    return train, val
+
+
+# ===========================================================================
+# Running EvoSkill THROUGH evolve() -- skill-library strategy + top-K frontier
+# ===========================================================================
+#
+# Like ACE/GEPA, EvoSkill plugs into `evolve()`: a `Strategy` turns a proposed
+# `SKILL.md` into a `Diff` on the skill library, and a custom `aggregator_factory`
+# is the bounded top-K frontier (parent = the best member, which the aggregator
+# makes the dev head so the next round extends it). Shared state (frontier,
+# feedback history, recent failures, docs) lives in one `EvoSkillContext`.
+
+
+def agent_answer(complete: Completion, docs: Dict[str, str],
+                 rendered_skills: str, task: Task) -> str:
+    doc = docs.get(task.meta["source_files"], "")
+    context = retrieve_context(doc, task.prompt) if doc else "(document unavailable)"
+    text = complete(_AGENT_TMPL.format(skills=rendered_skills, context=context,
+                                       question=task.prompt))
+    m = re.search(r"answer\s*[:=]\s*(.+)", text, re.IGNORECASE)
+    return (m.group(1) if m else text).strip()
+
+
+# The frontier, context and optimizer live in the package registry, so a spec
+# can name `"algorithm": "evoskill"` and run the same implementation (#384).
+from agentdescent.algorithms.evoskill import (  # noqa: E402
+    EvoSkillContext,
+    Frontier,
+    FrontierBest,
+    SkillLibraryTree,
+    TopKFrontierAggregator,
+    make_propose,
+    skill_name,
+    skill_path,
+    skills_from_rendered,
+    skills_of,
+)
+
+@dataclass
+class EvoResult:
+    #: The skills on the ledger head -- i.e. those belonging to the frontier's
+    #: best member. Empty whenever nothing beat the seed, which is *not* the
+    #: same as nothing having been induced: see :attr:`frontier`.
+    skills: Dict[str, str]
+    #: ``None`` when the base agent was never measured, which happens when no
+    #: card ever reached the merger (``step()`` does the seeding). Printing 0.0
+    #: there claimed a measurement that was never taken.
+    seed_score: Optional[float]
+    best_score: Optional[float]
+    iterations: int
+    #: Every member the bounded top-K frontier holds, best-first: what induction
+    #: actually produced, whether or not it displaced the seed.
+    frontier: List[Tuple[Dict[str, str], float]] = field(default_factory=list)
+    #: The same library as a file tree (`{path: body}`) -- what
+    #: :func:`agentdescent.filetree.materialize` or
+    #: :meth:`~agentdescent.evolution.EvolutionResult.write_to` install.
+    tree: Dict[str, str] = field(default_factory=dict)
+    #: Carried straight through from the underlying
+    #: :class:`~agentdescent.evolution.EvolutionResult`. Dropping them made a run
+    #: that died on a rate limit print the same confident "seed -> best" line as
+    #: one that converged, on the longest and most expensive path in the repo.
+    error: Optional[str] = None
+    stop_reason: str = "rounds"
+
+
+def run_evoskill(complete: Completion, docs: Dict[str, str],
+                 train: List[dict], val: List[dict], iterations: int = 6,
+                 max_frontier: int = 5, seed: int = 0, asynchronous: bool = False,
+                 async_ratio: int = 3, max_seconds: float = 30.0, backend=None,
+                 eval_concurrency: int = 8, batch_size: int = 4,
+                 eval_at_end: bool = False, max_workers: int = 3,
+                 max_rollouts: Optional[int] = None, staleness: str = "guarded",
+                 merge_round=None, verbose: bool = False) -> EvoResult:
+    """Drive EvoSkill through `evolve()` (`val` is the held-out frontier metric).
+
+    ``backend`` (an :class:`~agentdescent.backends.AgentBackend`) replaces the passive
+    keyword-retriever base agent with a tool-using one (OpenHands / grep-loop) so
+    the agent can actually navigate the source documents; ``None`` keeps the
+    dependency-free retriever. ``eval_at_end`` is retained for CLI compatibility;
+    the card frontier always validates on admit (``val_every`` was removed, #844).
+    """
+    def to_task(i, it):
+        return Task(id=f"oqa{i}", prompt=it["question"],
+                    meta={"answer": it["answer"], "source_files": it["source_files"]})
+
+    tasks = [to_task(i, it) for i, it in enumerate(list(train) + list(val))]
+    _ = eval_at_end  # CLI flag retained; frontier admit path does not use it
+    ctx = EvoSkillContext(docs=docs, frontier=Frontier(max_size=max_frontier),
+                          eval_concurrency=eval_concurrency, batch_size=batch_size)
+
+    def run(rendered, task):
+        # `rendered` is now the artifact's lossless serialisation (a file tree), not
+        # the prompt text -- so this is where it becomes a prompt again. The
+        # framework never injects an artifact into a prompt; `run` does, and that
+        # is what keeps the retriever path's prompt byte-identical to before the
+        # library moved to a path-keyed state.
+        tree = parse_tree(rendered)
+        rendered_skills = render_skills(skills_of(tree))
+        if backend is not None:                    # tool-using base agent (OpenHands / grep-loop)
+            return backend.answer(task.prompt, ctx.docs.get(task.meta["source_files"], ""),
+                                  skills=rendered_skills, skill_files=tree)
+        return agent_answer(complete, ctx.docs, rendered_skills, task)
+
+    def reward(task, output):
+        return score_multi_tolerance(output, task.meta["answer"])
+
+    def factory(ledger, verifier, audit, config, policy):
+        # The frontier is the algorithm, on every path. `update_frontier` plus
+        # `select_from_frontier` *is* EvoSkill: a bounded top-K leaderboard on
+        # mean validation accuracy, admitting when there is room and otherwise
+        # replacing the worst member only if strictly greater, with the next
+        # parent drawn from it. Upstream evaluates each child on the full
+        # validation split before that admission decision -- so a barrier-free
+        # schedule changes *when* those evaluations happen, not whether they do.
+        #
+        # This used to swap in `SgdSkillAggregator` whenever `asynchronous=True`,
+        # which is not a scheduling change: it amortised validation over N
+        # applied updates, kept or rolled back a whole batch instead
+        # of admitting per candidate, and has no frontier at all -- one
+        # checkpoint in its place. The async cell then measured a different
+        # optimizer that happened to run asynchronously, which is exactly what
+        # the matrix's "semantics changed" column exists to refuse.
+        return TopKFrontierAggregator(ledger, verifier, ctx,
+                                      artifact_id="skill_library",
+                                      merge_round=merge_round)
+
+    # `max_workers` is the ceiling `--serial` lowers to 1; the shard size is
+    # still bounded by the data, because a worker with an empty shard is not a
+    # worker.
+    workers = min(max_workers, len(train))
+    # #809: async no longer reinterprets rounds; name the rollout budget.
+    async_rollouts = max_rollouts
+    if asynchronous and async_rollouts is None:
+        async_rollouts = iterations * max(1, workers)
+    result = evolve(tasks, reward, run=run, propose=make_propose(ctx, complete, propose_and_generate),
+                    strategy=SkillLibraryTree(), blast_radius=0.2,
+                    artifact_id="skill_library", rounds=iterations,
+                    n_workers=workers,
+                    # sync-path knob: under asynchronous=True concurrency is n_workers
+                    max_concurrency=1 if asynchronous else workers,
+                    asynchronous=asynchronous, async_ratio=async_ratio,
+                    max_seconds=max_seconds if asynchronous else None,
+                    held_out_frac=len(val) / max(1, len(tasks)),
+                    self_verify=False,   # repo evaluates the child on val only -- no per-trajectory re-run
+                    # A discarded card is an induction batch thrown away -- four
+                    # failures collected, a Proposer and a Generator call spent,
+                    # and nothing offered to the frontier. Measured at
+                    # `--async-ratio 3` under `guarded`: 12 of 12 discarded, and
+                    # the frontier filled 3 of its 5 slots. Skills are separate
+                    # files, so a card that lands late rarely conflicts with what
+                    # committed meanwhile and the rebase holds.
+                    staleness_policy=get_policy(staleness),
+                    aggregator_factory=factory, verbose=verbose,
+                    max_rollouts=async_rollouts)
+    if verbose:
+        report_engine(result)
+
+    best = ctx.best_score
+    if eval_at_end and val:
+        # single held-out eval of the FINAL accumulated skill library (concurrent).
+        val_tasks = tasks[len(train):]
+        # `run` takes the artifact's serialisation and turns it into a prompt
+        # itself, so hand it the rendered *tree*, not the rendered skills.
+        rendered = SkillLibraryTree().render(dict(result.state))
+        from concurrent.futures import ThreadPoolExecutor
+        n = max(1, min(eval_concurrency, len(val_tasks)))
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            scores = list(pool.map(lambda t: reward(t, run(rendered, t)), val_tasks))
+        best = sum(scores) / len(scores)
+        if verbose:
+            print(f"\n[eval-at-end] final held-out score over {len(val_tasks)} items: {best:.3f}")
+    # the artifact is path-keyed; the algorithm's own vocabulary is names.
+    #
+    # `result.state` is the ledger head, and the head only moves when the
+    # frontier's *best* member changes. A run whose candidates all score below
+    # the seed leaves it empty, and reporting that as `skills discovered: 0`
+    # said "the Proposer produced nothing" about a run that produced six
+    # candidates and admitted every one of them -- opposite diagnoses, and the
+    # measured case: 43 rollouts, 6 cards, an empty head. The frontier's own
+    # membership is the count that answers "did induction happen"; the head
+    # answers "did anything beat the baseline", and both are now carried.
+    return EvoResult(skills_of(dict(result.state)), ctx.seed_score, best,
+                     iterations, tree=dict(result.state),
+                     frontier=[(skills_of(state), score)
+                               for state, score in ctx.frontier.members],
+                     error=result.error, stop_reason=result.stop_reason)
+
+
+# ===========================================================================
+# Dataset + test evaluation
+# ===========================================================================
+
+
+def load_dataset(seed: int = 0, ratios=(0.5, 0.25, 0.25),
+                 dataset: str = "auto") -> Tuple[Dataset, Dict[str, str], str]:
+    """Items split train/val/test, plus the documents and a label for the source.
+
+    ``auto`` prefers the paper's OfficeQA and falls back to FinQA when the gate is
+    shut. The old fallback was a bundled 12-row sample, which splits into 5 train /
+    3 val / 2 test -- too small to measure anything, so every run reported 0.000
+    and looked like a broken algorithm rather than a missing dataset.
+    """
+    if dataset in ("auto", "officeqa"):
+        items = load_officeqa()
+        if len(items) > 12:                     # the gate opened: real OfficeQA
+            docs = fetch_docs(items)
+            return (split_dataset(items, ratios=ratios, seed=seed,
+                                  stratify_key=lambda it: it["difficulty"],
+                                  name="OfficeQA"), docs, "full HF OfficeQA")
+        if dataset == "officeqa":               # asked for it explicitly
+            docs = fetch_docs(items)
+            return (split_dataset(items, ratios=ratios, seed=seed,
+                                  stratify_key=lambda it: it["difficulty"],
+                                  name="OfficeQA"), docs,
+                    "bundled 12-row sample (HF gated -- too small to measure)")
+    items, docs = load_finqa()
+    return (split_dataset(items, ratios=ratios, seed=seed,
+                          stratify_key=lambda it: it["difficulty"], name="FinQA"),
+            docs, "FinQA (ungated stand-in; OfficeQA needs HF_TOKEN)")
+
+
+def evaluate(complete: Completion, docs: Dict[str, str], skills: Dict[str, str],
+             items: List[dict], backend=None, concurrency: int = 8) -> float:
+    """Mean multi-tolerance score of a skill library on a held-out split.
+
+    Concurrent, and it was not: this is the *reported* metric, so it runs after
+    `evolve()` returns, outside everything the engine parallelises, and
+    `--eval-concurrency` never reached it. On the `claude-code` backend at ~25 s
+    a question that is six silent minutes for a 15-item split -- longer than the
+    frontier work it is reporting on. Concurrency changes no result here: each
+    item is scored independently and the mean is order-independent.
+    """
+    if not items:
+        return 0.0
+    rendered = render_skills(skills)
+
+    def score_one(it: dict) -> float:
+        task = Task(id=it["uid"], prompt=it["question"],
+                    meta={"answer": it["answer"], "source_files": it["source_files"]})
+        pred = (backend.answer(it["question"], docs.get(it["source_files"], ""), skills=rendered)
+                if backend is not None else agent_answer(complete, docs, rendered, task))
+        return score_multi_tolerance(pred, it["answer"])
+
+    if len(items) < 2 or concurrency < 2:
+        return sum(score_one(it) for it in items) / len(items)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(items))) as pool:
+        return sum(pool.map(score_one, items)) / len(items)
+
+
+# ===========================================================================
+# main
+# ===========================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    add_standard_args(p, max_seconds_default=40.0)
+    p.add_argument("--iterations", type=int, default=6)
+    p.add_argument("--workers", type=int, default=3,
+                   help="failure-analysis workers per round; the upstream loop "
+                        "is serial, so this is the AgentDescent-added width")
+    p.add_argument("--staleness", default="guarded",
+                   choices=["guarded", "reflective", "full"],
+                   help=("what to do with a skill proposed against a head the "
+                         "merger has since moved: `guarded` rebases inside the "
+                         "--async-ratio band and discards beyond it, "
+                         "`reflective` rebases regardless"))
+    p.add_argument("--frontier", type=int, default=5,
+                   help="bounded top-K frontier size "
+                        "(src/registry/manager.py:update_frontier uses 5)")
+    p.add_argument("--dataset", default="auto", choices=["auto", "officeqa", "finqa"],
+                   help="auto: the paper's OfficeQA when HF_TOKEN grants access, "
+                        "else FinQA (ungated, same shape, ~4KB documents)")
+    p.add_argument("--backend", default="retrieval",
+                   choices=["retrieval", "toolloop", "openhands", "claude-code", "codex"],
+                   help="base agent: passive keyword retriever (default), a local "
+                        "grep/read ReAct loop, or a real tool-using agent "
+                        "(OpenHands SDK, Claude Code CLI, Codex CLI) -- all of which "
+                        "are the same Completion contract, staged into a workspace "
+                        "by backends.document_agent")
+    return p
+
+
+def main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
+    # --serial collapses this to the upstream algorithm's own semantics:
+    # one worker, nothing to merge. Applied to args so the printed plan,
+    # the cost estimate and the run cannot disagree about what ran.
+    args.workers = worker_count(args, args.workers)
+
+    print("Algorithm: EvoSkill -- failure-driven skill discovery (top-K frontier)")
+    print(f"Dataset  : selection={args.dataset} (OfficeQA preferred; FinQA fallback)")
+    print(f"\nPlan     : model={args.model}, iterations={args.iterations}, "
+          f"frontier={args.frontier}")
+    if args.asynchronous:
+        print(f"Async    : up to {args.workers} workers, barrier-free "
+              f"(async_ratio={args.async_ratio}, "
+              f"max {args.max_seconds:.0f}s); the frontier rebases/discards stale skills")
+    else:
+        print(f"Parallel : up to {args.workers} worker(s) run concurrently each "
+              "round (synchronous DP; the frontier merge is the barrier)")
+    if args.dry_run:
+        print("Data     : deferred (dry-run performs no network access)")
+        print("\n[dry-run] plan only; no dataset or model API was accessed.")
+        return
+
+    ds, docs, src = load_dataset(seed=args.seed, dataset=args.dataset)
+    print(f"Dataset  : {ds.name} (financial documents, deterministic numeric scorer)")
+    art = EvolvingArtifact("skill_library", blast_radius=0.2)
+    ntr, nva, nte = ds.sizes()
+    print(f"Governance: skill library blast_radius={art.blast_radius} -> {classify(art).name}")
+    print(f"Loaded   : {len(ds)} items ({src}); {ntr} train / {nva} val / {nte} test; "
+          f"{len(docs)} docs")
+    print("\nExample problem:")
+    print("  Q:", ds.train[0]["question"][:150])
+    print("  A:", ds.train[0]["answer"], f"(difficulty={ds.train[0]['difficulty']})")
+
+    calls = args.iterations * (3 + 2 + nva) + nte
+    print(f"Workers  : dataset provides {min(args.workers, ntr)} active workers")
+    print(f"Budget   : up to ~{calls} model calls")
+
+    if not confirm(args):
+        return
+
+    completion = completion_for(args)
+    try:
+        completion("Reply with the single word: ok")
+    except Exception as e:  # noqa: BLE001
+        print(f"\nCould not reach the model ({type(e).__name__}: {e}).")
+        return
+
+    # base agent: passive retriever (default), a local grep/read loop, or OpenHands.
+    backend = None
+    if args.backend == "openhands":
+        from agentdescent.backends import openhands_backend
+        oh_model = args.model if args.model.startswith("openai/") else f"openai/{args.model}"
+        base = ("https://api.deepseek.com" if is_openai_compatible(args)
+                else os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+        backend = openhands_backend(model=oh_model, base_url=base)
+        print(f"Backend  : real OpenHands agent (terminal + file_editor) on {oh_model}")
+    elif args.backend in ("claude-code", "codex"):
+        # Same document task, a different tool-using agent -- possible because every
+        # backend is a Completion and document_agent stages a workspace for any of
+        # them (see docs/agents.md).
+        from agentdescent.agents import claude_code, codex as codex_agent
+        from agentdescent.backends import document_agent
+        cli = claude_code() if args.backend == "claude-code" else codex_agent()
+        backend = document_agent(cli)
+        print(f"Backend  : {args.backend} CLI agent (workspace-staged document)")
+    elif args.backend == "toolloop":
+        from agentdescent.backends import tool_loop_backend
+        backend = tool_loop_backend(completion)
+        print("Backend  : local grep/read ReAct loop")
+
+    # `--reflective-merge` was declared by `add_standard_args` and never read by
+    # this port -- the flag parsed, printed nothing, and changed nothing. It could
+    # not have worked by the usual route either: `TopKFrontierAggregator`
+    # implements `AggregatorProtocol` itself, so the engine's conflict/fusion
+    # policies never reach it. GEPA hands its aggregator the merger explicitly;
+    # so does this one now.
+    merge_round = None
+    if args.reflective_merge:
+        from agentdescent.fusion import ReflectiveFusion
+        merge_round = ReflectiveFusion(completion)
+        print("NOTE: --reflective-merge offers the frontier ONE fused candidate "
+              "per sweep instead of one per worker. update_frontier and the "
+              "parent draw are unchanged; the number of children they see is not.")
+
+    print("\nDiscovering skills (failure analysis + top-K frontier, L2)...\n")
+    result = run_evoskill(completion, docs, ds.train, ds.val, iterations=args.iterations,
+                          max_frontier=args.frontier, seed=args.seed,
+                          asynchronous=args.asynchronous, async_ratio=args.async_ratio,
+                          max_seconds=args.max_seconds, backend=backend,
+                          max_workers=args.workers,
+                          eval_concurrency=args.eval_concurrency,
+                          merge_round=merge_round, staleness=args.staleness,
+                          verbose=True,
+                          **budget_kwargs(args))
+
+    test_score = evaluate(completion, docs, result.skills, ds.test, backend=backend,
+                          concurrency=args.eval_concurrency)
+    print("\n=== discovered skill library ===")
+    print(render_skills(result.skills))
+    seed = ("not measured (no card reached the frontier)"
+            if result.seed_score is None else f"{result.seed_score:.3f}")
+    best = "—" if result.best_score is None else f"{result.best_score:.3f}"
+    print(f"\nval score : {seed} -> {best}")
+    print(f"test score: {test_score:.3f}  (held out, never seen by the frontier)")
+    # Two counts, because they answer different questions and used to be one.
+    # `frontier` is what induction produced; `skills` is what displaced the seed.
+    print(f"frontier  : {len(result.frontier)}/{args.frontier} member(s) "
+          + (", ".join(f"{s:.3f}" for _, s in
+                       sorted(result.frontier, key=lambda m: -m[1])) or "—"))
+    print(f"on head   : {len(result.skills)} skill(s) "
+          f"({'nothing beat the seed' if not result.skills else 'best frontier member'})")
+    print(f"stopped   : {result.stop_reason}")
+    if result.error:
+        print(f"WARNING: the run did not finish cleanly -- {result.error}")
+
+
+if __name__ == "__main__":
+    main()

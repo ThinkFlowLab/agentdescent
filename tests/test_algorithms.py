@@ -1,0 +1,1167 @@
+"""The algorithm registry and ``EvolveSpec.algorithm`` (#384)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import warnings
+
+import pytest
+
+from agentdescent import algorithms, cli
+from agentdescent.algorithms import (Algorithm, AlgorithmError, Overrides, Param,
+                                     resolve_params)
+from agentdescent.algorithms.rrsi.rrsi_policies import (RRsiAcceptance, RRsiConfig,
+                                                         RRsiCritic, RRsiProposalPolicy)
+from agentdescent.evolvespec import EvolveSpec, SpecError, compose
+from agentdescent.selection import Archive
+
+ROWS = [{"prompt": f"what is {i}", "gold": f"zzz{i}"} for i in range(8)]
+
+
+def _spec(**kw):
+    base = dict(kind="text", target="Be helpful.", data={"inline": ROWS}, agent="echo",
+                evolve={"rounds": 2, "n_workers": 2, "seed": 0})
+    base.update(kw)
+    return EvolveSpec(**base)
+
+
+def _write(tmp_path, spec):
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(spec.to_dict()))
+    return str(path)
+
+
+# -- the registry ----------------------------------------------------------------
+
+
+def test_builtin_algorithms_are_registered_with_declared_fidelity():
+    assert algorithms.names() == ["ace", "archive_selection", "dgm", "evoskill", "gepa", "rrsi", "skillopt"]
+    assert algorithms.names(builtin_only=True) == ["ace", "archive_selection", "dgm", "evoskill", "gepa", "rrsi", "skillopt"]
+    for alg in algorithms.listing():
+        assert alg.fidelity in algorithms.FIDELITY
+        assert alg.summary and alg.kinds
+
+
+def test_listing_filters_by_kind():
+    assert [a.name for a in algorithms.listing("text")] == ["ace", "archive_selection", "dgm", "gepa", "rrsi", "skillopt"]
+    assert [a.name for a in algorithms.listing("skill_dir")] == ["archive_selection", "evoskill"]
+    assert [a.name for a in algorithms.listing("plugin")] == ["archive_selection", "evoskill"]
+    assert [a.name for a in algorithms.listing("agent_dir")] == ["archive_selection", "evoskill"]
+    assert algorithms.listing("policy_slot") == []
+
+
+def test_get_unknown_names_the_available_ones():
+    with pytest.raises(AlgorithmError, match=r"unknown algorithm 'nope'.*rrsi"):
+        algorithms.get("nope")
+
+
+def test_get_unknown_examples_port_names_the_checkout_tip():
+    # #801: a documented examples/ port is not a typo — tip the docs + checkout path.
+    with pytest.raises(AlgorithmError, match=r"examples/ research port \(docs/algo-reflexion\.md\)"):
+        algorithms.get("reflexion", where="show")
+    with pytest.raises(AlgorithmError, match=r"python -m examples\.textgrad"):
+        algorithms.get("TextGrad", where="run")  # case fold
+    with pytest.raises(AlgorithmError, match=r"docs/algo-self-refine\.md"):
+        algorithms.get("self-refine", where="show")  # hyphen fold
+    # Junk names stay tip-free so the available list is the whole answer.
+    with pytest.raises(AlgorithmError) as ei:
+        algorithms.get("nope")
+    assert "examples/ research port" not in str(ei.value)
+
+
+def test_mcp_describe_tips_examples_only_ports():
+    from agentdescent.mcp import Tools
+
+    err = Tools(None).describe_algorithm("self-refine")["error"]
+    assert "docs/algo-self-refine.md" in err and "examples/ research port" in err
+    assert "examples/ research port" not in Tools(None).describe_algorithm("nope")["error"]
+
+
+def test_duplicate_registration_is_refused():
+    with pytest.raises(ValueError, match="already registered"):
+        algorithms.register(algorithms.get("rrsi"))
+
+
+@pytest.mark.parametrize("params, message", [
+    ({"nope": 1}, r"no parameter\(s\) \['nope'\].*b_max"),
+    ({"b_max": "3"}, r"algorithm\.params\.b_max: expected int, got '3'"),
+    ({"b_max": True}, r"expected int"),
+    ({"b_max": 2.5}, r"expected int"),
+    ({"b_max": 0}, r"must be >= 1"),
+    ({"noise_band": 2}, r"noise_band: must be <= 1"),
+    ({"noise_band": -0.1}, r"noise_band: must be >= 0"),
+    ({"protected": "t3"}, r"protected: expected list\[str\]"),
+    ({"protected": [1]}, r"expected list\[str\]"),
+])
+def test_resolve_params_rejects_what_it_cannot_honour(params, message):
+    with pytest.raises(AlgorithmError, match=message):
+        resolve_params(algorithms.get("rrsi"), params)
+
+
+def test_resolve_params_fills_defaults_and_widens_int_to_float():
+    out = resolve_params(algorithms.get("rrsi"), {"w_s": 2, "b_max": 3})
+    assert out["w_s"] == 2.0 and isinstance(out["w_s"], float)
+    assert out["b_max"] == 3 and out["T"] == RRsiConfig().T and out["protected"] == []
+
+
+def test_resolve_params_folds_hyphen_and_case_aliases():
+    """#876: `batch-size` / `NOISE_BAND` resolve like algorithm-name aliases."""
+    evoskill = resolve_params(algorithms.get("evoskill"), {"batch-size": 2})
+    assert evoskill["batch_size"] == 2
+    rrsi = resolve_params(algorithms.get("rrsi"), {"NOISE_BAND": 0.25})
+    assert rrsi["noise_band"] == 0.25
+
+
+def test_resolve_params_refuses_duplicate_after_folding():
+    with pytest.raises(AlgorithmError, match=r"batch-size.*batch_size.*both refer"):
+        resolve_params(algorithms.get("evoskill"), {"batch_size": 1, "batch-size": 2})
+
+
+@pytest.mark.parametrize("typo, meant", [
+    ("bacth_size", "batch_size"),
+    ("maxlr", "max_lr"),
+    ("noize_band", "noise_band"),
+])
+def test_unknown_parameter_names_the_near_miss(typo, meant):
+    alg = {"bacth_size": "evoskill", "maxlr": "skillopt", "noize_band": "rrsi"}[typo]
+    with pytest.raises(AlgorithmError, match=rf"did you mean '{meant}'\?$"):
+        resolve_params(algorithms.get(alg), {typo: 1})
+
+
+def test_unknown_parameter_without_near_miss_has_no_guess():
+    with pytest.raises(AlgorithmError) as e:
+        resolve_params(algorithms.get("rrsi"), {"nope": 1})
+    assert "did you mean" not in str(e.value)
+
+
+def test_a_zero_temperature_is_refused_by_the_schema_not_deep_in_build():
+    with pytest.raises(AlgorithmError, match=r"temperature: must be >="):
+        resolve_params(algorithms.get("archive_selection"), {"temperature": 0})
+
+
+def test_rrsi_with_no_protected_strings_warns_that_the_screen_is_vacuous():
+    note = " ".join(compose(_spec(algorithm="rrsi")).notes)
+    assert "`protected` is empty" in note and "never reject" in note
+    quiet = compose(_spec(algorithm={"name": "rrsi", "params": {"protected": ["zzz1"]}}))
+    assert "protected` is empty" not in " ".join(quiet.notes)
+
+
+def test_a_failed_builtin_load_keeps_its_original_error(monkeypatch):
+    monkeypatch.setattr(algorithms, "_loaded", False)
+    monkeypatch.setattr(algorithms, "_load_error", None)
+    monkeypatch.delattr(algorithms, "builtin", raising=False)
+    monkeypatch.setitem(sys.modules, "agentdescent.algorithms.builtin", None)
+    with pytest.raises(ImportError) as first:
+        algorithms.names()
+    with pytest.raises(ImportError) as second:
+        algorithms.names()
+    assert second.value is first.value          # not "already registered"
+
+
+def test_choices_are_enforced():
+    with pytest.raises(AlgorithmError, match=r"sampling: must be one of \[.*'best'"):
+        resolve_params(algorithms.get("archive_selection"), {"sampling": "greedy"})
+    with pytest.raises(AlgorithmError) as e:
+        resolve_params(algorithms.get("archive_selection"), {"sampling": "greedy"})
+    assert "did you mean" not in str(e.value)
+
+
+def test_resolve_params_folds_choice_value_aliases():
+    """#888: `sigmoid-novelty` / `KEEP_ALL` resolve like parameter-name aliases."""
+    arch = resolve_params(algorithms.get("archive_selection"),
+                          {"sampling": "sigmoid-novelty"})
+    assert arch["sampling"] == "sigmoid_novelty"
+    assert resolve_params(
+        algorithms.get("archive_selection"),
+        {"sampling": "SIGMOID_NOVELTY"},
+    )["sampling"] == "sigmoid_novelty"
+    assert resolve_params(
+        algorithms.get("dgm"), {"archive_mode": "keep-all"},
+    )["archive_mode"] == "keep_all"
+    assert resolve_params(
+        algorithms.get("dgm"), {"archive_mode": "KEEP_ALL"},
+    )["archive_mode"] == "keep_all"
+    assert resolve_params(
+        algorithms.get("skillopt"), {"mode": "Linear"},
+    )["mode"] == "linear"
+
+
+@pytest.mark.parametrize("alg,param,typo,meant", [
+    ("archive_selection", "sampling", "novlty", "novelty"),
+    ("dgm", "archive_mode", "keep_al", "keep_all"),
+    ("skillopt", "mode", "cosin", "cosine"),
+])
+def test_invalid_choice_names_the_near_miss(alg, param, typo, meant):
+    with pytest.raises(AlgorithmError, match=rf"did you mean '{meant}'\?$"):
+        resolve_params(algorithms.get(alg), {param: typo})
+
+
+def test_the_registry_works_from_a_wheel_without_examples():
+    """``examples/`` is not shipped; list and show must not need it."""
+    code = ("import sys; sys.modules['examples'] = None\n"
+            "from agentdescent.cli import main\n"
+            "assert main(['algorithms', 'list']) == 0\n"
+            "assert main(['algorithms', 'show', 'rrsi']) == 0\n")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert "rrsi" in done.stdout and "archive_selection" in done.stdout
+
+
+def test_the_examples_rrsi_modules_are_aliases_of_the_packaged_ones():
+    import agentdescent.algorithms.rrsi.rrsi_policies as moved
+    import examples.rrsi.rrsi_policies as alias
+    from examples.rrsi import selection as alias_selection
+    from agentdescent.algorithms.rrsi import selection
+
+    assert alias is moved and alias_selection is selection
+
+
+# -- EvolveSpec.algorithm --------------------------------------------------------
+
+
+def test_the_spec_round_trips_an_algorithm():
+    spec = _spec(algorithm={"name": "rrsi", "params": {"b_max": 3}})
+    again = EvolveSpec.from_dict(json.loads(json.dumps(spec.to_dict())))
+    assert again.algorithm == {"name": "rrsi", "params": {"b_max": 3}}
+    assert EvolveSpec.from_dict(_spec(algorithm="rrsi").to_dict()).algorithm == "rrsi"
+
+
+@pytest.mark.parametrize("spec_kw, message", [
+    (dict(algorithm="nope"), r"algorithm: unknown algorithm 'nope'; available: \['ace', 'archive_selection', 'dgm', 'evoskill', 'gepa', 'rrsi', 'skillopt'\]"),
+    (dict(algorithm={"name": "rrsi", "params": {"nope": 1}}),
+     r"algorithm\.params: 'rrsi' has no parameter\(s\) \['nope'\]"),
+    (dict(algorithm={"name": "rrsi", "params": {"b_max": "x"}}),
+     r"algorithm\.params\.b_max: expected int"),
+    (dict(algorithm={"name": "rrsi", "params": {"b_min": 4, "b_max": 2}}),
+     r"b_min \(4\) must not exceed b_max \(2\)"),
+    (dict(algorithm={"params": {}}), r"algorithm: expected a name or"),
+    (dict(algorithm={"name": "rrsi", "param": {}}), r"unexpected key\(s\) \['param'\]"),
+    (dict(algorithm={"name": "rrsi", "params": [1]}), r"algorithm\.params: expected an object"),
+    (dict(algorithm={"name": "rrsi", "params": []}), r"algorithm\.params: expected an object"),
+    (dict(algorithm={"name": "rrsi", "params": ""}), r"algorithm\.params: expected an object"),
+    (dict(algorithm={"name": "rrsi", "params": 0}), r"algorithm\.params: expected an object"),
+    (dict(algorithm={"name": "rrsi", "params": False}), r"algorithm\.params: expected an object"),
+    (dict(algorithm=3), r"algorithm: expected a name or"),
+])
+def test_a_bad_algorithm_fails_in_compose_naming_the_field(spec_kw, message):
+    with pytest.raises(SpecError, match=message):
+        compose(_spec(**spec_kw))
+
+
+def test_null_algorithm_params_means_defaults():
+    compose(_spec(algorithm={"name": "rrsi", "params": None}))
+
+
+def test_noise_band_at_the_bound_is_accepted():
+    assert resolve_params(algorithms.get("rrsi"), {"noise_band": 1})["noise_band"] == 1.0
+
+
+def test_an_algorithm_that_does_not_apply_to_the_kind_names_the_ones_that_do(tmp_path):
+    (tmp_path / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\nbody\n")
+    spec = _spec(kind="skill_dir", target=str(tmp_path), agent="opencode",
+                 algorithm="rrsi")
+    with pytest.raises(SpecError,
+                       match=r"'rrsi' applies to kind \['text'\], not 'skill_dir'; "
+                             r"'rrsi' is text-only: it reads a single text file, "
+                             r"not a skill_dir target; "
+                             r"for kind 'skill_dir': \['archive_selection', 'evoskill'\]"):
+        compose(spec)
+
+
+def test_policy_slot_refuses_an_algorithm():
+    spec = EvolveSpec(kind="policy_slot", target="selection", data={}, agent="echo",
+                      algorithm="rrsi")
+    with pytest.raises(SpecError, match=r"algorithm: not available for kind='policy_slot'"):
+        compose(spec)
+
+
+def test_rrsi_composes_into_the_three_policies_and_keeps_the_default_merge():
+    comp = compose(_spec(algorithm={"name": "rrsi", "params": {"protected": ["zzz3"]}}))
+    pol = comp.kwargs["policies"]
+    assert isinstance(pol.screen, RRsiCritic)
+    assert isinstance(pol.proposal, RRsiProposalPolicy)
+    assert isinstance(pol.acceptance, RRsiAcceptance)
+    assert pol.conflict is not None and pol.fusion is not None
+    assert comp.algorithm["name"] == "rrsi" and comp.algorithm["params"]["b_max"] == 5
+
+
+def test_the_specs_own_policy_overrides_the_algorithms_and_plan_says_so():
+    spec = _spec(algorithm="archive_selection", policies={"selection": "Beam"})
+    comp = compose(spec)
+    assert type(comp.kwargs["policies"].selection).__name__ == "Beam"
+    assert comp.algorithm["overridden_by_spec"] == ["policies.selection"]
+    assert compose(_spec(algorithm="archive_selection")).algorithm["overridden_by_spec"] == []
+
+
+def test_an_algorithms_defaults_sit_between_the_kind_and_the_spec():
+    calls = []
+
+    def build(ctx, p):
+        calls.append(p)
+        return Overrides(knobs={"rounds": 9, "patience": 7},
+                         agg_config={"batch_trigger": 5, "max_wait_rounds": 4},
+                         notes=["hello"])
+
+    algorithms.register(Algorithm(
+        name="_probe", summary="s", kinds=("text",), fidelity="preset", params=(
+            Param("x", "int", 1),), build=build), replace=True)
+    try:
+        comp = compose(_spec(algorithm={"name": "_probe", "params": {"x": 2}},
+                             evolve={"rounds": 3, "n_workers": 2, "seed": 0},
+                             agg_config={"max_wait_rounds": 1}))
+    finally:
+        algorithms._REGISTRY.pop("_probe")
+    k = comp.kwargs
+    assert calls == [{"x": 2}]
+    assert k["rounds"] == 3          # spec.evolve beats the algorithm
+    assert k["patience"] == 7        # the algorithm beats the kind's default (3)
+    assert k["agg_config"].batch_trigger == 5      # the algorithm
+    assert k["agg_config"].max_wait_rounds == 1    # the spec beats it
+    assert "hello" in comp.notes
+    assert comp.algorithm["overridden_by_spec"] == ["agg_config.max_wait_rounds",
+                                                    "evolve.rounds"]
+
+
+def test_a_directory_kind_composes_with_a_selection_algorithm(tmp_path):
+    (tmp_path / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\nbody\n")
+    spec = EvolveSpec(kind="skill_dir", target=str(tmp_path), agent="opencode",
+                      data={"inline": ROWS}, algorithm="archive_selection")
+    assert isinstance(compose(spec).kwargs["policies"].selection, Archive)
+
+
+def test_no_algorithm_changes_nothing():
+    comp = compose(_spec())
+    assert comp.algorithm is None
+    assert comp.kwargs["policies"].screen is None
+
+
+# -- plan ------------------------------------------------------------------------
+
+
+def test_plan_echoes_the_resolved_algorithm(tmp_path, capsys):
+    path = _write(tmp_path, _spec(algorithm={"name": "rrsi", "params": {"b_max": 3}}))
+    assert cli.main(["--json", "plan", path]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    alg = out["algorithm"]
+    assert alg["name"] == "rrsi" and alg["fidelity"] == "mechanism_microport"
+    assert alg["params"]["b_max"] == 3 and alg["params"]["T"] == RRsiConfig().T
+    assert "extra_calls" in alg and alg["overridden_by_spec"] == []
+
+
+def test_plan_without_an_algorithm_has_no_algorithm_key(tmp_path, capsys):
+    assert cli.main(["--json", "plan", _write(tmp_path, _spec())]) == 0
+    assert "algorithm" not in json.loads(capsys.readouterr().out)
+
+
+def test_plan_fails_closed_for_a_bad_algorithm(tmp_path, capsys):
+    path = _write(tmp_path, _spec(algorithm={"name": "rrsi", "params": {"b_max": "x"}}))
+    assert cli.main(["--json", "plan", path]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False and "algorithm.params.b_max" in out["error"]
+
+
+# -- running ---------------------------------------------------------------------
+
+
+def _run(spec, tmp_path):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = compose(spec, repo_path=str(tmp_path / "repo")).run()
+    stopped = [str(w.message) for w in caught if "stopped early" in str(w.message)]
+    assert not stopped, stopped
+    return result
+
+
+def test_rrsi_runs_an_offline_evolve_round(tmp_path):
+    """The screen and the acceptance floor are live in the loop, not just composed."""
+    result = _run(_spec(algorithm="rrsi"), tmp_path)
+    assert result.critic_checked >= 1
+    assert sum(result.outcomes().values()) >= 1
+
+
+def test_rrsi_screens_a_leaking_candidate_before_measurement(tmp_path):
+    """``protected`` reaches the screen: the echo reflector reproduces the task
+    prompt, which carries the protected string, so it is refused unmeasured."""
+    spec = _spec(algorithm={"name": "rrsi", "params": {"protected": ["what is"]}})
+    result = _run(spec, tmp_path)
+    assert result.critic_rejected >= 1
+    assert result.outcomes().get("critic-rejected", 0) >= 1
+
+
+def test_archive_selection_runs_an_offline_evolve_round(tmp_path):
+    spec = _spec(algorithm={"name": "archive_selection", "params": {"seed": 1}},
+                 evolve={"rounds": 3, "n_workers": 2, "seed": 0})
+    result = _run(spec, tmp_path)
+    assert result.outcomes().get("population-select", 0) >= 1
+
+
+# -- the CLI ---------------------------------------------------------------------
+
+
+def test_cli_list_text_and_json(capsys):
+    assert cli.main(["algorithms", "list"]) == 0
+    text = capsys.readouterr().out
+    assert "rrsi" in text and "mechanism_microport" in text and "archive_selection" in text
+    for argv in (["--json", "algorithms", "list"], ["algorithms", "list", "--json"]):
+        assert cli.main(argv) == 0
+        rows = json.loads(capsys.readouterr().out)
+        assert [r["name"] for r in rows] == ["ace", "archive_selection", "dgm", "evoskill", "gepa", "rrsi", "skillopt"]
+        rrsi = next(r for r in rows if r["name"] == "rrsi")
+        assert {p["name"] for p in rrsi["params"]} >= {"b_max", "protected"}
+
+
+def test_cli_list_filters_by_kind_and_rejects_an_unknown_one(capsys):
+    assert cli.main(["algorithms", "list", "--kind", "plugin", "--json"]) == 0
+    assert [r["name"] for r in json.loads(capsys.readouterr().out)] == ["archive_selection", "evoskill"]
+    assert cli.main(["algorithms", "list", "--kind", "bogus"]) == 2
+    assert "--kind must be one of" in capsys.readouterr().err
+
+
+def test_cli_show_prints_the_card_and_fails_for_an_unknown_name(capsys):
+    assert cli.main(["algorithms", "show", "rrsi"]) == 0
+    text = capsys.readouterr().out
+    assert "mechanism_microport" in text and "b_max: int = 5" in text and "docs/algo-rrsi.md" in text
+    assert cli.main(["algorithms", "show", "rrsi", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["name"] == "rrsi"
+    assert cli.main(["algorithms", "show", "nope"]) == 2
+    assert "unknown algorithm 'nope'" in capsys.readouterr().err
+
+
+def test_ace_registers_the_grow_and_refine_playbook():
+    alg = algorithms.get("ace")
+    assert alg.kinds == ("text",) and alg.fidelity == "mechanism_microport"
+    assert {p.name for p in alg.params} == {"title", "dedup_threshold"}
+    comp = compose(_spec(algorithm={"name": "ace",
+                                    "params": {"dedup_threshold": 0.7}}))
+    from agentdescent.algorithms.ace import ACEPlaybook, GrowAndRefine
+    assert isinstance(comp.kwargs["strategy"], ACEPlaybook)
+    assert comp.kwargs["strategy"].dedup_threshold == 0.7
+    assert isinstance(comp.kwargs["policies"].acceptance, GrowAndRefine)
+def test_gepa_registers_the_pareto_optimizer():
+    alg = algorithms.get("gepa")
+    assert alg.kinds == ("text",) and alg.fidelity == "mechanism_microport"
+    assert {p.name for p in alg.params} == {"seed", "eval_concurrency"}
+    comp = compose(_spec(algorithm={"name": "gepa", "params": {"seed": 3}}))
+    assert "aggregator_factory" in comp.kwargs
+    factory = comp.kwargs["aggregator_factory"]
+    assert callable(factory) and factory.holder == {}
+
+
+def test_gepa_spec_run_returns_the_best_average_candidate(tmp_path):
+    spec = _spec(algorithm="gepa",
+                 evolve={"rounds": 3, "n_workers": 2, "seed": 0})
+    comp = compose(spec, repo_path=str(tmp_path / "repo"))
+    holder = comp.kwargs["aggregator_factory"].holder
+    result = comp.run()
+    agg = holder["agg"]
+    assert agg.states
+    # finalize() leaves GEPA's best-average candidate on dev, not the last
+    # win-frequency sample the step loop committed.
+    assert result.state == agg.best_state
+    assert "gepa-select" in result.outcomes()
+# -- the plugin surface: init, CLI overrides, MCP, docs (#384 slice 3) ----------
+
+
+def test_init_writes_the_algorithm_and_only_the_params_given(tmp_path, capsys):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("be terse\n")
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "spec.json"),
+                     "--algorithm", "rrsi", "--param", 'protected=["secret"]',
+                     "--model", "m"]) == 0
+    spec = json.loads((tmp_path / "spec.json").read_text())
+    assert spec["algorithm"] == {"name": "rrsi", "params": {"protected": ["secret"]}}
+    assert "wrote" in capsys.readouterr().out
+
+
+def test_init_writes_the_registered_name_for_an_alias(tmp_path, capsys):
+    # #894: `init --algorithm GEPA` / `archive-selection` validated but wrote
+    # the alias verbatim into the spec.
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("be terse\n")
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "a.json"),
+                     "--algorithm", "GEPA", "--model", "m"]) == 0
+    assert json.loads((tmp_path / "a.json").read_text())["algorithm"] == "gepa"
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "b.json"),
+                     "--algorithm", "RRSI", "--param", 'protected=["s"]',
+                     "--model", "m"]) == 0
+    assert json.loads((tmp_path / "b.json").read_text())["algorithm"] == {
+        "name": "rrsi", "params": {"protected": ["s"]}}
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\nbody\n")
+    assert cli.main(["init", str(skill), "--out", str(tmp_path / "c.json"),
+                     "--algorithm", "archive-selection", "--agent", "opencode"]) == 0
+    assert json.loads((tmp_path / "c.json").read_text())["algorithm"] == "archive_selection"
+
+
+def test_init_refuses_an_unknown_algorithm_or_wrong_kind(tmp_path, capsys):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("be terse\n")
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "a.json"),
+                     "--algorithm", "nope"]) == 2
+    assert "unknown algorithm" in capsys.readouterr().err
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\nbody\n")
+    assert cli.main(["init", str(skill), "--out", str(tmp_path / "b.json"),
+                     "--algorithm", "rrsi", "--agent", "opencode"]) == 2
+    assert "applies to kind" in capsys.readouterr().err
+
+
+def test_init_refuses_params_without_an_algorithm(tmp_path, capsys):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("be terse\n")
+    assert cli.main(["init", str(prompt), "--out", str(tmp_path / "a.json"),
+                     "--param", "b_max=3"]) == 2
+    assert "--param needs --algorithm" in capsys.readouterr().err
+
+
+def test_plan_can_override_the_spec_algorithm(tmp_path, capsys):
+    path = _write(tmp_path, _spec())
+    assert cli.main(["--json", "plan", path, "--algorithm", "rrsi",
+                     "--param", "b_max=3"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["algorithm"]["name"] == "rrsi"
+    assert out["algorithm"]["params"]["b_max"] == 3
+    assert json.loads(open(path).read()).get("algorithm") is None   # not written
+
+
+def test_plan_override_fails_closed(tmp_path, capsys):
+    path = _write(tmp_path, _spec())
+    assert cli.main(["--json", "plan", path, "--algorithm", "nope"]) == 2
+    assert "unknown algorithm" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_mcp_lists_and_describes_the_registry():
+    from agentdescent.mcp import Tools
+
+    t = Tools(None)
+    listed = t.list_algorithms()
+    assert [a["name"] for a in listed["algorithms"]] == algorithms.names()
+    assert [a["name"] for a in t.list_algorithms("skill_dir")["algorithms"]] == \
+        ["archive_selection", "evoskill"]
+    assert [a["name"] for a in t.list_algorithms("agent_dir")["algorithms"]] == \
+        ["archive_selection", "evoskill"]
+    assert [a["name"] for a in t.list_algorithms("skill-library")["algorithms"]] == \
+        [a["name"] for a in t.list_algorithms("skill_library")["algorithms"]]
+    assert "unknown kind" in t.list_algorithms("nope")["error"]
+    err = t.list_algorithms("skil_library")["error"]
+    assert "unknown kind" in err and "did you mean 'skill_library'?" in err
+    card = t.describe_algorithm("rrsi")
+    assert card["name"] == "rrsi" and any(p["name"] == "b_max" for p in card["params"])
+    assert "unknown algorithm" in t.describe_algorithm("nope")["error"]
+
+
+def test_the_docs_catalog_is_generated_from_the_registry():
+    from tools import gen_algorithms_docs as gen
+
+    current = open(gen.OUT, encoding="utf-8").read()
+    assert current == gen.render()
+    for name in algorithms.names():
+        assert f"## `{name}`" in current
+
+
+def test_a_same_name_override_merges_params(tmp_path, capsys):
+    path = _write(tmp_path, _spec(algorithm={"name": "rrsi", "params": {"b_max": 3}}))
+    assert cli.main(["--json", "plan", path, "--algorithm", "rrsi",
+                     "--param", "b_min=2"]) == 0
+    alg = json.loads(capsys.readouterr().out)["algorithm"]
+    assert alg["params"]["b_max"] == 3 and alg["params"]["b_min"] == 2
+
+
+def test_param_without_flag_tweaks_the_specs_algorithm(tmp_path, capsys):
+    path = _write(tmp_path, _spec(algorithm={"name": "rrsi", "params": {"b_max": 3}}))
+    assert cli.main(["--json", "plan", path, "--param", "b_min=2"]) == 0
+    alg = json.loads(capsys.readouterr().out)["algorithm"]
+    assert alg["params"]["b_max"] == 3 and alg["params"]["b_min"] == 2
+
+
+def test_mcp_explains_that_policy_slot_has_no_algorithms():
+    from agentdescent.mcp import Tools
+
+    out = Tools(None).list_algorithms("policy_slot")
+    assert out["algorithms"] == [] and "no algorithm applies" in out["note"]
+
+
+def test_cli_list_explains_that_policy_slot_has_no_algorithms(capsys):
+    # #799: CLI matches the MCP note so an empty list is actionable.
+    assert cli.main(["algorithms", "list", "--kind", "policy_slot"]) == 0
+    out = capsys.readouterr().out
+    assert "no algorithm applies to kind 'policy_slot'" in out
+    assert "`plan` refuses an algorithm for it" in out
+    assert "no algorithms for kind" not in out
+    assert cli.main(["algorithms", "list", "--kind", "policy_slot", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+    assert "no algorithm applies to kind 'policy_slot'" in captured.err
+
+
+def test_dgm_registers_the_keep_all_archive():
+    alg = algorithms.get("dgm")
+    assert alg.kinds == ("text",) and alg.fidelity == "mechanism_microport"
+    assert {p.name for p in alg.params} == {
+        "seed", "archive_mode", "failure_threshold"}
+    comp = compose(_spec(algorithm={"name": "dgm",
+                                    "params": {"archive_mode": "keep_better"}}))
+    from agentdescent.algorithms.dgm import HarnessStrategy
+    assert isinstance(comp.kwargs["strategy"], HarnessStrategy)
+    assert callable(comp.kwargs["aggregator_factory"])
+
+
+def test_dgm_runs_an_offline_evolve_round(tmp_path):
+    spec = _spec(
+        algorithm="dgm",
+        reflect={"ref": "tests.test_algorithms:_dgm_reflect", "call": False},
+        allow=["tests."],
+        evolve={"rounds": 2, "n_workers": 1, "seed": 0})
+    comp = compose(spec, repo_path=str(tmp_path / "repo"))
+    holder = comp.kwargs["aggregator_factory"].holder
+    result = comp.run()
+    agg = holder["agg"]
+    assert agg.ctx.archive                      # seeded
+    # seed starts with no capabilities; reflection adds at least one
+    assert any(len(a.capabilities) >= 1 for a in agg.ctx.archive)
+    best = max(agg.ctx.archive, key=lambda a: a.score)
+    assert result.state["capabilities"] == ",".join(sorted(best.capabilities))
+
+
+def _dgm_reflect(prompt):
+    return "plan-first"
+
+
+def test_ace_and_dgm_preserve_a_prose_seed_with_commas(tmp_path):
+    """User prompt text is the seed; lessons/capabilities only append (#731)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+    from agentdescent.algorithms.dgm import CAPABILITIES_HEADER, HarnessStrategy
+    from agentdescent.cli import _text_plan
+
+    prose = ("You are a terse assistant. For every question, however simple, "
+             "reply in ALL CAPS, with no punctuation.\n")
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text(prose)
+
+    pb = ACEPlaybook(seed=prose)
+    assert pb.render({}) == prose
+    assert _text_plan(str(prompt), pb.render({}))["noop"] is True
+    diff = pb.to_diff({}, "general :: always shout the answer", "w0", 1, "a")
+    assert diff is not None
+    ace_out = pb.render(dict(diff.ops))
+    assert ace_out.startswith(prose.rstrip("\n"))
+    assert "# Playbook (ACE)" in ace_out
+    assert "always shout the answer" in ace_out
+    assert "question, however simple," in ace_out.split("# Playbook (ACE)")[0]
+
+    hs = HarnessStrategy(seed=prose)
+    assert hs.render(hs.initial()) == prose
+    assert _text_plan(str(prompt), hs.render(hs.initial()))["noop"] is True
+    diff = hs.to_diff(hs.initial(), "FOLLOW EXPLICIT FORMATTING INSTRUCTIONS",
+                      "w0", 1, "a")
+    assert diff is not None
+    state = {**hs.initial(), **diff.ops}
+    dgm_out = hs.render(state)
+    assert dgm_out.startswith(prose.rstrip("\n"))
+    assert CAPABILITIES_HEADER in dgm_out
+    assert "- FOLLOW EXPLICIT FORMATTING INSTRUCTIONS" in dgm_out
+    head, _, _ = dgm_out.partition(CAPABILITIES_HEADER)
+    assert "question, however simple," in head
+    assert "FOLLOW EXPLICIT FORMATTING INSTRUCTIONS,You are" not in dgm_out
+
+
+_SEEN_PROMPTS: list = []
+
+
+def _record_prompt(prompt):
+    _SEEN_PROMPTS.append(prompt)
+    return "NOPE"
+
+
+def test_dgm_make_propose_includes_expected_answers_when_available():
+    from types import SimpleNamespace
+
+    from agentdescent.algorithms.dgm import make_propose
+
+    seen = []
+
+    def complete(prompt):
+        seen.append(prompt)
+        return "format dates with dots"
+
+    propose = make_propose(complete)
+
+    successful_task = SimpleNamespace(prompt="already solved", meta={"gold": "answer"})
+    assert propose("seed", successful_task, "answer", 0.8) is None
+    assert seen == []
+
+    task = SimpleNamespace(prompt="Date: June 8, 2004",
+                           meta={"gold": "08.06.2004"})
+
+    assert propose("seed", task, "06/08/2004", 0.0) == "format dates with dots"
+    assert "Expected answer(s):\n08.06.2004\n" in seen[-1]
+
+    multi_answer_task = SimpleNamespace(
+        prompt="Date: June 8, 2004",
+        meta={"answers": ["08.06.2004", "08.06.04"]},
+    )
+
+    propose("seed", multi_answer_task, "06/08/2004", 0.0)
+    assert "08.06.2004\n08.06.04" in seen[-1]
+
+    no_answer_task = SimpleNamespace(prompt="q", meta={})
+
+    propose("seed", no_answer_task, "wrong", 0.0)
+    assert "Expected answer(s):" not in seen[-1]
+
+    null_gold_task = SimpleNamespace(prompt="q", meta={"gold": None})
+
+    propose("seed", null_gold_task, "wrong", 0.0)
+    assert "Expected answer(s):" not in seen[-1]
+
+
+
+def test_ace_and_dgm_reparse_an_applied_artifact_without_duplicating_headers():
+    """Second evolve on an applied target keeps one header and prior items (#741)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+    from agentdescent.algorithms.dgm import CAPABILITIES_HEADER, HarnessStrategy
+
+    prose = "Solve carefully.\n"
+    pb = ACEPlaybook(seed=prose)
+    st = {**pb.initial(), **pb.to_diff(pb.initial(),
+                                       "revenue :: tag deferred revenue",
+                                       "w0", 1, "a").ops}
+    applied = pb.render(st)
+    pb2 = ACEPlaybook(seed=applied)
+    assert pb2.seed == prose
+    assert pb2.initial()  # prior bullet recovered
+    assert pb2.render(pb2.initial()) == applied
+    st2 = {**pb2.initial(), **pb2.to_diff(pb2.initial(),
+                                          "debt :: notes are LTD",
+                                          "w1", 1, "a").ops}
+    out = pb2.render(st2)
+    assert out.count("# Playbook (ACE)") == 1
+    assert "tag deferred revenue" in out and "notes are LTD" in out
+    # de-dup still sees the recovered bullet
+    assert pb2.to_diff(st2, "revenue :: tag deferred revenue", "w2", 1, "a") is None
+
+    hs = HarnessStrategy(seed=prose)
+    st = {**hs.initial(), **hs.to_diff(hs.initial(), "use chain of thought",
+                                       "w0", 1, "a").ops}
+    applied = hs.render(st)
+    hs2 = HarnessStrategy(seed=applied)
+    assert hs2.seed == prose
+    assert "use chain of thought" in hs2.initial()["capabilities"]
+    assert hs2.render(hs2.initial()) == applied
+    st2 = {**hs2.initial(), **hs2.to_diff(hs2.initial(), "check units",
+                                          "w1", 1, "a").ops}
+    out = hs2.render(st2)
+    assert out.count(CAPABILITIES_HEADER) == 1
+    assert "use chain of thought" in out and "check units" in out
+    # a mid-prose mention of the header is not peeled
+    noisy = "See " + CAPABILITIES_HEADER + " in the docs.\n"
+    hs3 = HarnessStrategy(seed=noisy)
+    assert hs3.initial() == {"capabilities": ""}
+    assert CAPABILITIES_HEADER in hs3.seed
+
+
+def test_ace_and_dgm_compose_seed_reaches_the_first_rollout(tmp_path):
+    """First rollout prompt must contain the target prose, not an empty playbook (#731)."""
+    import json
+    from agentdescent.cli import _text_plan
+
+    prose = ("Whatever the user asks, reply with exactly the single word BANANA "
+             "and nothing else.\n")
+    (tmp_path / "prompt.md").write_text(prose)
+    rows = [{"prompt": f"q{i}", "gold": "BANANA"} for i in range(8)]
+    cases = tmp_path / "cases.jsonl"
+    cases.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    for name in ("ace", "dgm"):
+        _SEEN_PROMPTS.clear()
+        spec = EvolveSpec(
+            kind="text", target=str(tmp_path / "prompt.md"),
+            data={"path": str(cases)},
+            agent={"ref": "tests.test_algorithms:_record_prompt", "call": False},
+            reflect={"ref": "tests.test_algorithms:_dgm_reflect", "call": False},
+            allow=["tests."],
+            algorithm=name,
+            evolve={"rounds": 1, "n_workers": 1, "seed": 0, "patience": 1})
+        result = compose(spec, repo_path=str(tmp_path / f"repo-{name}")).run()
+        assert any(prose.rstrip("\n") in p for p in _SEEN_PROMPTS), (name, _SEEN_PROMPTS[:1])
+        if ("# Playbook (ACE)" not in result.rendered
+                and "## Capabilities" not in result.rendered):
+            assert _text_plan(str(tmp_path / "prompt.md"), result.rendered)["noop"] is True
+def test_evoskill_registers_the_skill_library_frontier(tmp_path):
+    (tmp_path / "AGENT.md").write_text("# agent\n")
+    spec = EvolveSpec(kind="agent_dir", target=str(tmp_path),
+                      data={"inline": ROWS}, agent="opencode",
+                      editable=["SKILL.md"], frozen=["skip/**"],
+                      algorithm={"name": "evoskill",
+                                 "params": {"max_frontier": 3}})
+    comp = compose(spec)
+    from agentdescent.algorithms.evoskill import SkillLibraryTree
+    strategy = comp.kwargs["strategy"]
+    assert isinstance(strategy, SkillLibraryTree)
+    assert strategy.editable == ("SKILL.md",)
+    assert strategy.frozen == ("skip/**",)
+    assert not strategy.writable("skills/new/SKILL.md")   # guardrail honoured
+    assert callable(comp.kwargs["aggregator_factory"])
+    assert comp.algorithm["params"]["max_frontier"] == 3
+
+
+def test_evoskill_make_propose_offers_a_skill_path():
+    from agentdescent.algorithms.evoskill import (EvoSkillContext, Frontier,
+                                                   make_propose)
+    from agentdescent.filetree import canonical
+
+    ctx = EvoSkillContext(docs={}, frontier=Frontier(), batch_size=1)
+
+    def complete(prompt):
+        return "create careful" if "Skill Proposer" in prompt else "Read the task."
+
+    propose = make_propose(ctx, complete)
+    class T:
+        prompt = "q"
+        meta = {"gold": "a"}
+    assert propose(canonical({"SKILL.md": "seed"}), T(), "wrong", 0.0) == \
+        "careful :: Read the task."
+
+
+def test_evoskill_runs_an_offline_evolve_round(tmp_path):
+    from tests.test_evolvespec import _dir_spec
+
+    spec = _dir_spec(
+        str(tmp_path), kind="agent_dir",
+        reflect={"ref": "tests.test_algorithms:_evoskill_reflect", "call": False},
+        algorithm={"name": "evoskill", "params": {"batch_size": 1}},
+        evolve={"rounds": 2, "n_workers": 1, "seed": 0})
+    comp = compose(spec, repo_path=str(tmp_path / "repo"))
+    holder = comp.kwargs["aggregator_factory"].holder
+    result = comp.run()
+    agg = holder["agg"]
+    assert result.state is not None
+    assert agg.ctx.frontier.members            # seeded, even if nothing was admitted
+    assert any(
+        any(path.startswith("skills/") and path.endswith("SKILL.md")
+            for path in state)
+        for state, _ in agg.ctx.frontier.members
+    ), "the frontier never saw an induced skills/<name>/SKILL.md"
+
+
+def _evoskill_reflect(prompt):
+    if "Skill Proposer" in prompt:
+        return "create careful\nreason"
+    return "Read the task carefully."
+
+
+def test_evoskill_frontier_reports_evoskill_select_category(tmp_path):
+    """Frontier merge reports must not tally as unknown (#765)."""
+    from tests.test_evolvespec import _dir_spec
+
+    spec = _dir_spec(
+        str(tmp_path), kind="agent_dir",
+        reflect={"ref": "tests.test_algorithms:_evoskill_reflect", "call": False},
+        algorithm={"name": "evoskill", "params": {"batch_size": 1}},
+        evolve={"rounds": 1, "n_workers": 1, "seed": 0})
+    result = compose(spec, repo_path=str(tmp_path / "repo")).run()
+    outcomes = result.outcomes()
+    assert "unknown" not in outcomes, outcomes
+    assert outcomes.get("evoskill-select", 0) >= 1, outcomes
+
+
+def test_skillopt_registers_the_strict_gate_optimizer():
+    alg = algorithms.get("skillopt")
+    assert alg.kinds == ("text",) and alg.fidelity == "mechanism_microport"
+    assert {p.name for p in alg.params} == {"max_lr", "min_lr", "total_steps", "mode"}
+    comp = compose(_spec(algorithm={"name": "skillopt",
+                                    "params": {"max_lr": 3, "min_lr": 1}}))
+    from agentdescent.algorithms.skillopt import SkillDocStrategy
+    assert isinstance(comp.kwargs["strategy"], SkillDocStrategy)
+    assert comp.kwargs["strategy"].seed
+    assert callable(comp.kwargs["aggregator_factory"])
+    assert isinstance(comp.kwargs["initial_state"], dict)
+
+
+def test_skillopt_runs_an_offline_evolve_round(tmp_path):
+    result = _run(_spec(algorithm="skillopt"), tmp_path)
+    assert sum(result.outcomes().values()) >= 1
+    assert "unknown" not in result.outcomes()
+
+
+# -- an algorithm that brings its own aggregator gets no default merge pair (#504) --
+
+_REFLECT = {"ref": "tests.test_algorithms:_dgm_reflect", "call": False}
+
+
+@pytest.mark.parametrize("name", ["gepa", "skillopt", "dgm"])
+def test_factory_algorithms_do_not_get_the_default_merge_pair(name, tmp_path):
+    comp = compose(_spec(algorithm=name, reflect=_REFLECT, allow=["tests."]),
+                   repo_path=str(tmp_path / "repo"))
+    assert comp.kwargs["aggregator_factory"] is not None
+    pol = comp.kwargs.get("policies")
+    assert pol is None or (pol.conflict is None and pol.fusion is None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        comp.run()
+    assert not [w for w in caught if "aggregator_factory= replaces" in str(w.message)]
+
+
+def test_plain_text_spec_still_merges_by_default():
+    pol = compose(_spec(reflect=_REFLECT, allow=["tests."])).kwargs["policies"]
+    assert pol.conflict is not None and pol.fusion is not None
+
+
+def test_plan_names_merge_policies_a_factory_algorithm_replaces():
+    spec = _spec(algorithm="gepa", reflect=_REFLECT, allow=["tests."],
+                 policies={"reflective_merge": {"ref": "reflective_merge",
+                                                "complete": _REFLECT}})
+    payload = cli.plan_payload(spec)
+    joined = " ".join(payload["warnings"])
+    assert "['conflict', 'fusion']" in joined and "'gepa'" in joined
+    assert "aggregator_factory path" in joined and "#807" in joined
+    assert not [w for w in cli.plan_payload(_spec(algorithm="gepa", reflect=_REFLECT,
+                                                  allow=["tests."]))["warnings"]
+                if "aggregator_factory path" in w]
+
+
+def test_plan_warns_when_acceptance_is_ignored_on_factory_path():
+    """#805: acceptance (not only conflict/fusion) must not be a silent drop."""
+    spec = _spec(algorithm="gepa", reflect=_REFLECT, allow=["tests."],
+                 policies={"acceptance": "AdvantageAcceptance"})
+    joined = " ".join(cli.plan_payload(spec)["warnings"])
+    assert "acceptance" in joined and "aggregator_factory path" in joined
+    assert "algorithm-decision-tree" in joined
+
+
+def _skill_dir(tmp_path):
+    skill = tmp_path / "sk"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\nbody\n")
+    return skill
+
+
+def test_kind_mismatch_names_usable_algorithms_and_text_route(tmp_path, capsys):
+    skill = _skill_dir(tmp_path)
+    assert cli.main(["init", str(skill), "--out", str(tmp_path / "s.json"),
+                     "--algorithm", "gepa", "--agent", "opencode"]) == 2
+    err = capsys.readouterr().err
+    assert "archive_selection" in err and "evoskill" in err
+    assert "algorithms list --kind skill_dir" in err
+    assert "--kind text" in err and str(skill / "SKILL.md") in err
+
+
+def test_kind_mismatch_on_text_lists_text_algorithms_without_text_route():
+    msg = algorithms.kind_mismatch_message(algorithms.get("evoskill"), "text",
+                                           target="Be helpful.")
+    assert "gepa" in msg and "rrsi" in msg
+    assert "target it as text" not in msg
+    # A tree card is not text-only, so it never carries that sentence (#846).
+    assert "is text-only" not in msg
+    with pytest.raises(SpecError, match="for kind 'text'"):
+        compose(_spec(algorithm="evoskill"))
+
+
+def test_kind_mismatch_list_comes_from_the_registry(tmp_path):
+    def build(ctx, params):
+        return Overrides()
+
+    algorithms.register(Algorithm(name="_agent_only", summary="s", kinds=("agent_code",),
+                                  fidelity="preset", params=(), build=build),
+                        replace=True)
+    try:
+        msg = algorithms.kind_mismatch_message(algorithms.get("gepa"), "agent_code")
+        assert "_agent_only" in msg
+    finally:
+        algorithms._REGISTRY.pop("_agent_only")
+
+
+def test_kind_mismatch_with_no_usable_algorithm_points_to_default_loop():
+    msg = algorithms.kind_mismatch_message(algorithms.get("gepa"), "no_such_kind")
+    assert "no named algorithm applies to kind 'no_such_kind'" in msg
+    assert "omit --algorithm" in msg
+
+
+def test_algorithm_names_ignore_case_and_hyphens(capsys):
+    # #696: `algorithms show GEPA` / `archive-selection` failed as unknown.
+    assert algorithms.get("GEPA").name == "gepa"
+    assert algorithms.get(" Archive-Selection ").name == "archive_selection"
+    with pytest.raises(algorithms.AlgorithmError, match="unknown algorithm 'nope'"):
+        algorithms.get("nope")
+    for name in ("GEPA", "archive-selection"):
+        assert cli.main(["algorithms", "show", name, "--json"]) == 0
+        canonical = json.loads(capsys.readouterr().out)["name"]
+        assert canonical == name.lower().replace("-", "_")
+    # A spec naming the algorithm in another case composes the same algorithm.
+    pol = compose(_spec(algorithm="RRSI")).kwargs["policies"]
+    assert isinstance(pol.acceptance, RRsiAcceptance)
+
+
+def test_an_ambiguous_folded_name_stays_unknown():
+    algorithms.register(Algorithm(name="_Probe_Case", summary="s", kinds=("text",),
+                                  fidelity="preset", params=(), build=lambda p: None))
+    algorithms.register(Algorithm(name="_probe-case", summary="s", kinds=("text",),
+                                  fidelity="preset", params=(), build=lambda p: None))
+    try:
+        assert algorithms.get("_Probe_Case").name == "_Probe_Case"   # exact wins
+        with pytest.raises(algorithms.AlgorithmError, match="unknown algorithm"):
+            algorithms.get("_PROBE_CASE")
+    finally:
+        algorithms._REGISTRY.pop("_Probe_Case")
+        algorithms._REGISTRY.pop("_probe-case")
+
+
+def test_ace_and_dgm_reparse_keeps_user_text_after_the_block():
+    """User prose after the playbook / ## Capabilities survives reparse (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+    from agentdescent.algorithms.dgm import CAPABILITIES_HEADER, HarnessStrategy
+
+    prose = "Solve carefully.\n"
+    tail = "## Notes\nAlways cite the 10-K page.\n"
+
+    pb = ACEPlaybook(seed=prose)
+    st = {**pb.initial(), **pb.to_diff(pb.initial(),
+                                       "revenue :: tag deferred revenue",
+                                       "w0", 1, "a").ops}
+    edited = pb.render(st) + "\n" + tail
+    pb2 = ACEPlaybook(seed=edited)
+    assert pb2.seed == prose
+    assert len(pb2.initial()) == 1
+    assert pb2.render(pb2.initial()) == edited  # unchanged run is a noop
+    st2 = {**pb2.initial(), **pb2.to_diff(pb2.initial(), "debt :: notes are LTD",
+                                          "w1", 1, "a").ops}
+    out = pb2.render(st2)
+    assert out.count("# Playbook (ACE)") == 1
+    assert "notes are LTD" in out and out.endswith(tail)
+    pb3 = ACEPlaybook(seed=out)
+    assert len(pb3.initial()) == 2 and pb3.render(st2).endswith(tail)
+
+    hs = HarnessStrategy(seed=prose)
+    st = {**hs.initial(), **hs.to_diff(hs.initial(), "use chain of thought",
+                                       "w0", 1, "a").ops}
+    edited = hs.render(st) + "\nKeep answers short.\n"
+    hs2 = HarnessStrategy(seed=edited)
+    assert hs2.seed == prose
+    assert hs2.initial()["capabilities"] == "use chain of thought"
+    assert hs2.render(hs2.initial()) == edited
+    st2 = {**hs2.initial(), **hs2.to_diff(hs2.initial(), "check units",
+                                          "w1", 1, "a").ops}
+    out = hs2.render(st2)
+    assert out.count(CAPABILITIES_HEADER) == 1
+    assert "check units" in out and out.endswith("Keep answers short.\n")
+
+
+def test_ace_multiline_lesson_round_trips():
+    """A multi-line lesson keeps its continuation lines through reparse (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(),
+                                       "revenue :: first line\nsecond line",
+                                       "w0", 1, "a").ops}
+    applied = pb.render(st)
+    pb2 = ACEPlaybook(seed=applied)
+    assert pb2.initial() == st
+    assert pb2.render(st) == applied
+
+
+def test_ace_reparse_keeps_an_indented_tail_block_out_of_lessons():
+    """An indented user block after a blank line is tail, not a lesson (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(), "general :: one", "w0", 1, "a").ops}
+    edited = pb.render(st) + "\n    code example\n"
+    pb2 = ACEPlaybook(seed=edited)
+    assert pb2.initial() == st
+    st2 = {**st, **pb2.to_diff(st, "general :: two different", "w1", 1, "a").ops}
+    assert pb2.render(st2).endswith("\n\n    code example\n")
+
+
+def test_ace_and_dgm_reparse_keeps_bulleted_user_sections_as_tail():
+    """A user ## section with bullets after the block stays user text (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+    from agentdescent.algorithms.dgm import HarnessStrategy
+
+    hs = HarnessStrategy(seed="Solve.\n")
+    st = {**hs.initial(), **hs.to_diff(hs.initial(), "use cot", "w", 1, "a").ops}
+    notes = "## Notes\n- cite the 10-K page\n"
+    hs2 = HarnessStrategy(seed=hs.render(st) + "\n" + notes)
+    assert hs2.initial() == {"capabilities": "use cot"}
+    st2 = {**hs2.initial(), **hs2.to_diff(hs2.initial(), "check units", "w", 1, "a").ops}
+    out = hs2.render(st2)
+    assert out.endswith("\n\n" + notes) and "- check units\n- use cot\n" in out
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(), "rev :: a", "w", 1, "a").ops}
+    todo = "## Todo\n- [x] verified\n"
+    for sep in ("\n", ""):
+        pb2 = ACEPlaybook(seed=pb.render(st) + sep + todo)
+        assert pb2.initial() == st
+        st2 = {**st, **pb2.to_diff(st, "x :: y", "w", 1, "a").ops}
+        assert pb2.render(st2).endswith("\n\n" + todo)
+
+
+def test_ace_lesson_with_blank_line_round_trips():
+    """A lesson containing a blank line is not split into tail (#743)."""
+    from agentdescent.algorithms.ace import ACEPlaybook
+
+    pb = ACEPlaybook(seed="Base.\n")
+    st = {**pb.initial(), **pb.to_diff(pb.initial(), "rev :: a\n\nc", "w", 1, "a").ops}
+    applied = pb.render(st)
+    pb2 = ACEPlaybook(seed=applied)
+    assert pb2.initial() == st
+    st2 = {**st, **pb2.to_diff(st, "x :: y", "w", 1, "a").ops}
+    out = pb2.render(st2)
+    assert ACEPlaybook(seed=out).initial() == st2
+    assert out.rstrip("\n").endswith("y")
+
+
+def test_card_vs_research_port_fidelity_fields():
+    """#384 addendum: same-name cards declare surface + research_port honestly."""
+    gepa = algorithms.get("gepa").describe()
+    assert gepa["surface"] == "card"
+    assert gepa["research_port"] == "examples/gepa/"
+    assert "mechanism_microport" in gepa["fidelity_note"]
+    assert "examples/gepa/" in gepa["fidelity_note"]
+    for name in ("ace", "dgm", "skillopt", "evoskill"):
+        card = algorithms.get(name).describe()
+        assert card["surface"] == "card"
+        assert card["research_port"] == f"examples/{name}/"
+    rrsi = algorithms.get("rrsi").describe()
+    assert rrsi["surface"] == "card"
+    assert "research_port" not in rrsi
+
+
+def test_cli_show_and_plan_echo_card_surface(tmp_path, capsys):
+    assert cli.main(["algorithms", "show", "gepa"]) == 0
+    text = capsys.readouterr().out
+    assert "surface" in text and "examples/gepa/" in text
+    path = _write(tmp_path, _spec(algorithm="gepa"))
+    assert cli.main(["--json", "plan", path]) == 0
+    alg = json.loads(capsys.readouterr().out)["algorithm"]
+    assert alg["surface"] == "card" and alg["research_port"] == "examples/gepa/"
+    assert "fidelity_note" in alg
+
+
+def test_mcp_list_algorithms_carries_cards_vs_ports_note():
+    from agentdescent.mcp import Tools
+    payload = Tools(None).list_algorithms(kind="text")
+    assert payload["surface"] == "card"
+    assert "Algorithm cards" in payload["note"]
+    names = {a["name"] for a in payload["algorithms"]}
+    assert "gepa" in names and "evoskill" not in names  # kind filter
+    assert all(a["surface"] == "card" for a in payload["algorithms"])
+
+
+@pytest.mark.parametrize("typo,meant", [("gepaa", "gepa"), ("evo_skill", "evoskill"),
+                                        ("skilopt", "skillopt")])
+def test_unknown_algorithm_names_the_near_miss(typo, meant):
+    with pytest.raises(AlgorithmError, match=rf"did you mean '{meant}'\?$"):
+        algorithms.get(typo, where="show")
+
+
+def test_unknown_algorithm_without_near_miss_has_no_guess():
+    with pytest.raises(AlgorithmError) as e:
+        algorithms.get("nope", where="show")
+    assert "did you mean" not in str(e.value)

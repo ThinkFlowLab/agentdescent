@@ -1,0 +1,2 @@
+Fixed
+`snapshot apply` on a text snapshot now writes the rendered prompt to the file named by `--to`, with the same backup, no-op, and parent-creation rules as `apply --from`. It previously materialised the strategy's internal rule store (hash-named files) into a directory, and an empty-rules snapshot reported a no-op instead of writing the seed prompt. A directory `--to` is refused. Tree-kind snapshots are unchanged (#1149).

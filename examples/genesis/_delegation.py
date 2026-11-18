@@ -1,0 +1,960 @@
+"""Recursive delegation as a :class:`~agentdescent.policies.ProposalPolicy`.
+
+``(v, p) ⇝ (v, q)`` is the operation the engine has no counterpart for, and the
+reason it fits *inside* a proposal rather than beside it is the paper's own
+distinction: delegation **does not advance the accepted version**. A parent hands
+work to a child at a deeper path, the child returns a candidate, the parent
+accepts or refuses it -- and the project history has not moved. Only the
+accepted event ``(v, p) → (v′, p)`` moves it, and that is the aggregator's
+commit.
+
+So one rollout here is one whole episode tree: a root manager decomposes, children
+are situated deeper, leaf executors write files, each parent judges what came back,
+and the surviving edits are octopus-merged into the single proposal the engine
+consumes. Every version in that tree is the same ``v``; nothing in the middle
+touches the ledger. That is the shape upstream runs, and it is expressible with no
+engine change because ``ProposalPolicy`` is free to do whatever it likes between
+being handed a failure and returning a proposal.
+
+What the engine *does* see is unchanged: one proposal per rollout. The tree is
+recorded in the :class:`~examples.genesis._world.WorldLog` instead, which is where
+the observed depth and the per-episode verdicts come from -- upstream's archive,
+minus the parts that only matter to a desktop app.
+
+The two roles are callables the caller supplies, because that is the seam where a
+domain plugs in:
+
+    manager(brief)  -> [Delegation(path, objective), ...]   empty = do it here
+    executor(brief) -> [Edit(owner, path, content), ...]
+
+An offline rule-based pair and an LLM-backed pair are then the same mechanism run
+with different actors, which is what makes the offline mode a test of *this file*
+rather than a different algorithm.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from agentdescent.filetree import parse_tree
+
+from ._octopus import three_way
+from ._session import ARTIFACT_DIRS
+
+from ._skills import SkillExtractor
+
+from ._world import (CONTEXT_FILE, KNOWN_ISSUES, EpisodeRecord, LocalWorld,
+                     WorldLog, directly_at, looks_like_file, normalise, owns,
+                     resolve_edit_path, routing_entry, shadowed_by_module,
+                     shadows_package, under_heading)
+
+__all__ = ["Brief", "Delegation", "Edit", "RecursiveDelegation", "render_edits"]
+
+
+@dataclass(frozen=True)
+class Delegation:
+    """``(v, p) ⇝ (v, q)``: where a child is situated, and what it is for.
+
+    ``readonly`` marks the delegation as an **investigation** rather than work:
+    upstream's ``subagent_investigator`` is handed a question and answers it, and the
+    only thing it may write is a ``CONTEXT.md``. A manager asks for one by putting
+    ``investigate: true`` on a delegation -- see ``llm_manager`` -- and the answer is
+    persisted at the node so a later agent inherits it.
+    """
+
+    path: str
+    objective: str
+    readonly: bool = False
+
+
+@dataclass(frozen=True)
+class Edit:
+    """One file write by the agent situated at ``owner``. ``content=None`` deletes.
+
+    ``kind`` separates the work from the bookkeeping. Maintaining ``CONTEXT.md``
+    is an obligation upstream puts on every agent, but it must never cost the
+    change it is describing: the trust region is small, and an edit set trimmed
+    to fit should lose its routing note before it loses a source file.
+
+    With one exception, and ``--cold-start`` is what found it. A note that *creates*
+    a node's record is ``"record"``, and it is trimmed **last** -- because then it is
+    not bookkeeping at all. It is the only place the decomposition the system just
+    invented is written down, and nothing else in the accepted version carries it;
+    the source file it would be dropped for is re-proposable next round, the
+    structure is not. While every domain shipped a ``CONTEXT.md`` per node this
+    could not show: the note only ever added a line to a table that already existed.
+    """
+
+    owner: str
+    path: str
+    content: Optional[str]
+    kind: str = "work"          # "record" | "work" | "context" | "skill"
+
+
+@dataclass(frozen=True)
+class Brief:
+    """Everything a finite-lived agent is given when it enters its world.
+
+    Deliberately not "the whole repository": ``context`` is the ``CONTEXT.md``
+    chain from the root down to this node plus a listing of the files this node
+    is responsible for, which is what the path coordinate is *for*. ``state`` is
+    the full tree, because an agent may read anything under ``v`` even though it
+    may only write under ``p`` -- that asymmetry is the paper's, not a shortcut.
+    """
+
+    world: LocalWorld
+    objective: str
+    context: str
+    state: Mapping[str, str]
+    task: Any
+    output: str
+    reward: float
+    depth: int
+
+
+Manager = Callable[[Brief], Sequence[Delegation]]
+Executor = Callable[[Brief], Sequence[Edit]]
+
+#: What the responsible parent does with a returned contribution beyond checking
+#: its scope. Returns ``None`` to accept, or ``(verdict, reason)`` with a verdict
+#: of ``"rejected"`` or ``"rework"``. Two outcomes rather than a complaint string,
+#: because the paper's parent has three: *accepted, rejected, or requires further
+#: work* (3.3), and collapsing the last two loses the one that comes back.
+Review = Callable[[Brief, Sequence[Edit]], Optional[Tuple[str, str]]]
+
+
+def apply_edits(state: Mapping[str, str],
+                edits: Sequence[Edit]) -> Dict[str, str]:
+    """``state`` with ``edits`` applied. What a commit of this episode contains."""
+    out = dict(state)
+    for edit in edits:
+        if edit.content is None:
+            out.pop(edit.path, None)
+        else:
+            out[edit.path] = edit.content
+    return out
+
+
+def render_edits(edits: Sequence[Edit], rationale: str) -> str:
+    """Serialise an edit set into the situated proposal protocol."""
+    return "<EDITS>" + json.dumps({
+        "rationale": rationale,
+        "edits": [
+            {"owner": e.owner, "path": e.path, **(
+                {"delete": True} if e.content is None else {"content": e.content})}
+            for e in edits
+        ],
+    }) + "</EDITS>"
+
+
+@dataclass
+class RecursiveDelegation:
+    """One rollout = one recursive episode tree rooted at ``(v, root_path)``.
+
+    ``max_depth`` bounds the recursion the way upstream's controller limits do.
+    ``max_edits`` bounds what comes back: the strategy drops a proposal that
+    exceeds its own per-diff cap *entirely*, so a tree that returns more edits
+    than the trust region allows would lose all of them rather than the excess.
+    Truncating here, and counting it, is the difference between a bounded
+    proposal and a silently empty round.
+    """
+
+    manager: Manager
+    executor: Executor
+    log: WorldLog
+    max_depth: int = 2
+    max_edits: int = 4
+    #: How many siblings one manager may have in flight at once. 1 is the serial
+    #: walk this port started with; above 1 the children of a node run together and
+    #: are folded in `delegations` order afterwards, so the proposal is unchanged.
+    #: The real bound on load is `_session.set_session_limit`, not this -- this only
+    #: says how wide one level may get.
+    node_workers: int = 1
+    root_path: str = ""
+    #: Human-supplied, read-only files every agent is shown in full, wherever it
+    #: stands -- the specification, the constraints, the validation contract. The
+    #: paper's agent may inspect the whole project; one with no read tool can only
+    #: inspect what the brief carries.
+    contracts: Sequence[str] = ()
+    #: ``() -> Rollout`` (see :mod:`examples.genesis._worktree`) or ``None``. When
+    #: set, every episode commits its work in a worktree of its own and the worktree
+    #: is removed afterwards, which is upstream's scheduling model rather than a
+    #: detail of it: "commit your changes, release your worktree, and wait".
+    rollout_factory: Optional[Callable[[], object]] = None
+    #: Globs that are read-only. Routing must not send a manager into a directory
+    #: where nothing is writable; separate from :attr:`contracts`, which is what
+    #: gets *pushed into the brief*. Upstream an agent pulls files with tools, so
+    #: "what may not be written" and "what is handed over unasked" are two sets.
+    #: Defaults to ``contracts``.
+    readonly: Sequence[str] = ()
+    #: Upstream's review-and-accountability phase: after its children return, a
+    #: manager gets one turn at its own node. Off makes a manager a pure router,
+    #: which is what this port was and why a node's own file never appeared.
+    accountability: bool = True
+    #: ``(path, state) -> a rewritten CONTEXT.md, or None``. Upstream's architect does
+    #: not stop at design: it reviews the implementation and re-spawns refinement
+    #: architects where a node misaligns (`agents/architect.ex`). Called once per
+    #: accountability pass; the callable decides whether the node has drifted at all,
+    #: so this module does not have to know what drift looks like.
+    refine: Optional[Callable[[str, Mapping[str, str]], Optional[str]]] = None
+    #: The parent's judgement beyond scope. Upstream a parent decides "using the
+    #: available tests, constraints and integration evidence" (paper 3.3), which
+    #: is a *test* run on the child's work before it is offered to the version
+    #: history at all -- not the same thing as the acceptance gate, which sees
+    #: only what the whole episode returned. ``None`` runs the scope check alone.
+    review: Optional[Review] = None
+    #: Upstream's ``SkillExtractor``, run at the root episode boundary on the
+    #: contribution the episode just accepted -- see :mod:`examples.genesis._skills`.
+    #: ``None`` is the old behaviour: skills are inherited and never written.
+    skills: Optional[SkillExtractor] = None
+    #: How many skill files may ride in one proposal *on top of* :attr:`max_edits`.
+    #: They are a separate bucket because they are not competing with the work: the
+    #: extractor exists so a later agent inherits what this one learned, and a skill
+    #: trimmed to make room for the work it distils is self-defeating. The caller
+    #: must size ``SpatialContract.max_files_per_diff`` to cover both, or the whole
+    #: diff is dropped rather than truncated.
+    max_skill_edits: int = 2
+    #: Upstream's ``Investigator``: a read-only delegation a manager asked for,
+    #: answered at that node and persisted into its ``CONTEXT.md``. ``None`` means
+    #: every delegation is work. See :mod:`examples.genesis._investigator`.
+    investigator: Optional[Callable[["Brief"], Sequence[Edit]]] = None
+    #: The version the most recent rollout branched from -- the latest accepted state,
+    #: as the engine handed it over. Read by `CompletionJudge`, which has to look at
+    #: the codebase to answer upstream's question and is not given the reward.
+    last_state: Optional[Dict[str, str]] = None
+    truncated: int = 0
+    #: Child nodes opened at a path their parent did not yet route to, and
+    #: therefore written into the parent's routing table.
+    routes_opened: int = 0
+    #: Guards every counter below. They are incremented from sibling threads now,
+    #: and `self.x += 1` is a read and a write with a bytecode boundary between
+    #: them -- two siblings landing there together lose a count. This port's whole
+    #: claim is that its numbers are measured, so the numbers have to survive the
+    #: concurrency it introduced.
+    _tally: threading.Lock = field(default_factory=threading.Lock, repr=False,
+                                   compare=False)
+    #: Delegations refused because the target was a file, not a node.
+    mistaken_nodes: int = 0
+    #: Delegations refused because the directory would shadow a sibling module of
+    #: the same name -- see `_is_node`.
+    shadowed_nodes: int = 0
+    #: Edits dropped because the file would shadow a node directory of the same name,
+    #: which is the same collision arriving from the other side.
+    shadowing_edits: int = 0
+    #: Sibling edits to one path reconciled by three-way merge, and not.
+    sibling_merges: int = 0
+    sibling_conflicts: int = 0
+    #: `CONTEXT.md` lines an agent added at its own node of its own accord -- the
+    #: "long-term memory" half of the mechanism, which upstream's archive shows 62
+    #: times and this port could not show at all until the executor was asked for it.
+    record_updates: int = 0
+    #: Files a manager wrote at its own node in the accountability phase, and
+    #: edits it offered there that belonged to a child and were declined.
+    accountability_edits: int = 0
+    accountability_declined: int = 0
+    #: Review findings carried into a manager's own turn rather than left with the
+    #: child that could not act on them -- see `_accountability_pass`.
+    accountability_findings: int = 0
+    #: Records rewritten because the code moved on. Upstream's archive shows 26
+    #: `CONTEXT.md` creations and **62 later accepted updates**: a record is
+    #: maintained, not written once.
+    records_revised: int = 0
+    #: Edits whose path was written relative to the agent's own node rather than
+    #: to the repository. Counted because the alternative to counting is a file
+    #: appearing somewhere nobody asked for it.
+    resolved_relative: int = 0
+    #: Changes an agent needed outside its own path: raised, handled by an
+    #: ancestor, and left unmet at the top of the chain.
+    requests_raised: int = 0
+    adopted_requests: int = 0
+    unmet_requests: int = 0
+    #: Skill files a root episode distilled from its own contribution, and the edits
+    #: dropped from the return because there was no room -- see :meth:`_bound`.
+    skills_written: int = 0
+    #: Read-only investigations run, the finding records they left, and writes an
+    #: investigator offered that were not a ``CONTEXT.md`` at its own node.
+    investigations: int = 0
+    finding_edits: int = 0
+    investigation_refused: int = 0
+
+    # -- the ProposalPolicy protocol ---------------------------------------
+
+    def _bump(self, name: str, n: int = 1) -> None:
+        """One counter, incremented under the tally lock. See `_tally`."""
+        with self._tally:
+            setattr(self, name, getattr(self, name) + n)
+
+    def propose(self, ctx) -> Sequence[str]:
+        state = _state_of(ctx.rendered)
+        self.last_state = dict(state)
+        root = LocalWorld(version=int(ctx.base_version or 0), path=self.root_path,
+                          readonly=tuple(self.readonly or self.contracts),
+                          # Bodies travel exactly when there is something writing
+                          # them: with the extractor off, a name the agent cannot open
+                          # is what upstream sends, and it costs a run nothing.
+                          skill_bodies=self.skills is not None)
+        # The workspace of a transient agent tree: created for this rollout, gone
+        # with it. `None` when worktrees are off, and every use of it is guarded.
+        rollout = self.rollout_factory() if self.rollout_factory else None
+        try:
+            return self._rollout(ctx, root, state, rollout)
+        finally:
+            if rollout is not None:
+                rollout.close()
+
+    def _rollout(self, ctx, root: LocalWorld, state: Mapping[str, str],
+                 rollout) -> Sequence[str]:
+        # A parent that asked for more work gets it before anything else is
+        # chosen: this is the third verdict, arriving one round later because
+        # `AcceptDecision` cannot carry it (see examples/genesis/_judge.py).
+        pending = self.log.take_rework()
+        if pending is not None and owns(root.path, pending[0]):
+            world, objective = root.delegate(pending[0]), f"rework: {pending[1]}"
+            edits, unmet, _ = self._episode(world, objective, state, ctx, depth=1,
+                                            rollout=rollout)
+            rationale = f"rework at {pending[0] or './'}"
+        else:
+            objective = self._objective(ctx)
+            edits, unmet, _ = self._episode(root, objective, state, ctx,
+                                            depth=0, rollout=rollout)
+            rationale = f"episode at {root.path or './'}"
+            # Upstream's SkillExtractor, at the root episode boundary: the
+            # contribution this episode accepted is the "completed PR" it distils.
+            # It runs after the episode returns rather than inside it because the
+            # upstream extractor is a **separate agent** -- its writes are its own,
+            # not the manager's -- and because here that also covers a root that had
+            # no children and did the work itself. It is not run for a rework
+            # rollout, which is the same contribution being retried, not a new one.
+            if self.skills is not None:
+                edits = self._distil(root, objective, state, edits, ctx, 0)
+        # A need that reached the top of this episode's chain and still fell
+        # outside its root's authority. Counted rather than dropped quietly: it
+        # means the decomposition put work where nobody could do it.
+        self._bump("unmet_requests", len(unmet))
+
+        edits = self._bound(edits)
+        if not edits:
+            return []
+        return [render_edits(edits, rationale)]
+
+    # -- the recursion -----------------------------------------------------
+
+    def _episode(self, world: LocalWorld, objective: str, state: Mapping[str, str],
+                 ctx, *, depth: int, rollout=None,
+                 base: str = "") -> "tuple[List[Edit], List[Edit], EpisodeRecord]":
+        """One finite-lived agent: what it proposes, what it asks for, its record.
+
+        The record travels back with the work because the verdict on an episode
+        is its **parent's**, not its own: an agent that returns something it was
+        pleased with and a parent that refuses it are one episode, not two.
+        """
+        brief = Brief(world=world, objective=objective,
+                      context=world.situate(state, contracts=self.contracts),
+                      state=state, task=ctx.task, output=ctx.output,
+                      reward=ctx.reward, depth=depth)
+
+        delegations: Sequence[Delegation] = ()
+        if depth < self.max_depth:
+            delegations = [d for d in self.manager(brief) or ()
+                           if self._is_node(world, d, state)]
+
+        if not delegations:
+            # A leaf executor: it writes files, it does not delegate. What it
+            # produces outside its own path is not a violation -- upstream an
+            # agent that needs a change it has no authority for "reports the need
+            # back up to the parent agent, which will handle it"
+            # (`agents/executor.ex:64`). So the split here is edits / requests,
+            # and the parent decides what to do with the second list.
+            produced = []
+            for raw in self.executor(brief) or ():
+                # "relative path" means two things to an agent standing in a
+                # subtree, and reading it the wrong way sends real work to the
+                # repository root. Resolve it against the node before anything
+                # else looks at it, and count the ones that needed it.
+                path, relative = resolve_edit_path(state, world.path, raw.path)
+                self._bump("resolved_relative", int(relative))
+                if raw.content is not None and shadows_package(state, path):
+                    # A file written beside a node directory of the same name makes
+                    # that node unreachable from every import -- see `shadows_package`.
+                    self._bump("shadowing_edits", 1)
+                    continue
+                produced.append(Edit(owner=world.path, path=path,
+                                     content=raw.content, kind=raw.kind))
+            produced += self._refresh_record(world, state)
+            for edit in produced:
+                if edit.path.endswith(CONTEXT_FILE) and state.get(edit.path) != edit.content:
+                    self._bump("record_updates", 1)
+            edits = [e for e in produced if owns(world.path, e.path)]
+            requests = [e for e in produced if not owns(world.path, e.path)]
+            self._bump("requests_raised", len(requests))
+            record = self.log.record(EpisodeRecord(
+                agent_id=self.log.next_id("executor"), role="executor",
+                path=world.path, depth=depth, version=world.version,
+                objective=objective, n_edits=len(edits)))
+            # "Commit Your Work: Once the objective is satisfied, commit your
+            # changes" -- `agents/executor.ex`. In its own worktree, off its
+            # parent's commit, and the worktree is released when it returns.
+            record.commit = self._commit(rollout, record, state, edits, base)
+            return edits, requests, record
+
+        record = self.log.record(EpisodeRecord(
+            agent_id=self.log.next_id("manager"), role="manager", path=world.path,
+            depth=depth, version=world.version, objective=objective))
+
+        held: Dict[str, Edit] = {}            # path -> what the parent holds so far
+        owner_of: Dict[str, str] = {}         # path -> the child that wrote it
+        notes: List[Edit] = []
+        pending: List[Edit] = []              # needs this node cannot meet either
+        routed = world.routing(state)
+        opened = [d for d in delegations if normalise(d.path) not in routed]
+
+        # Upstream's order, from the architect's Phase 1: "Create `/backend` and
+        # `/frontend` directories with CONTEXT.md via `make_dir` (**auto-commits**),
+        # **then** spawn `subagent_architect` for each child." So a node this manager
+        # is opening is recorded *before* its child is briefed -- otherwise the child
+        # arrives at a node its own parent's routing table does not mention -- and
+        # that record is what the children branch from. "If you don't commit, your
+        # changes are invisible to subagents."
+        routing = self._routing_note(world, state, opened)
+        if routing is not None:
+            state = dict(state, **{routing.path: routing.content or ""})
+        child_base = base
+        if routing is not None or not base:
+            child_base = self._commit(rollout, record, state, (), base) or base
+
+        children: List[EpisodeRecord] = []
+        #: What this episode's review returned work over, carried into the manager's
+        #: own turn below -- see `_accountability_pass`.
+        findings: List[Tuple[str, str, str]] = []
+        # Siblings run **concurrently**, and are folded **in order**.
+        #
+        # What made this serial was not the contract; it was a `for` loop. The
+        # contract is the reason it does not have to be: a child may write only
+        # under its own subtree, so two siblings cannot touch the same path, and
+        # each gets its own throwaway worktree branched from the same `child_base`.
+        # What the parent then does with the results -- the octopus fold, the
+        # conflict check, the pending requests -- is left exactly as it was, in
+        # `delegations` order, so the merge stays deterministic and a rerun with the
+        # same results produces the same proposal.
+        #
+        # The cost of not doing this, measured on an 8-node tree: one rollout is a
+        # depth-first walk with one Claude Code session per node, at five to fifteen
+        # minutes each, so a rollout took about an hour -- and four workers each
+        # walked the *same* tree, two of them landing on `src/brain/navigation` at
+        # the same moment to do the same node's work, of which only one result could
+        # ever survive. After 75 minutes `py-spy` showed all four workers still
+        # inside their first `propose()`. Nothing was being rejected; nothing had
+        # finished.
+        #
+        # `_session.set_session_limit` is what keeps this from becoming a flood --
+        # the bound is on sessions, not on this pool, because sessions are the
+        # scarce thing and a pool per level would multiply.
+        #
+        # Read-only investigator delegations stay serial: they only write a
+        # CONTEXT.md finding and have nothing to judge or rework.
+        work: List = []
+        for delegation in delegations:
+            child = world.delegate(delegation.path)
+            if delegation.readonly and self.investigator is not None:
+                # Upstream's `subagent_investigator`: handed a question, read-only
+                # over the code, its one write a `CONTEXT.md`. Nothing to judge and
+                # nothing to rework -- the record it leaves is the deliverable.
+                records = self._investigate(child, delegation.objective, state, ctx,
+                                            depth + 1)
+                if records:
+                    self._fold(held, owner_of, records, child, state)
+                    self.finding_edits += len(records)
+                children.append(self.log.record(EpisodeRecord(
+                    agent_id=self.log.next_id("investigator"), role="investigator",
+                    path=child.path, depth=depth + 1, version=child.version,
+                    objective=delegation.objective, n_edits=len(records))))
+                continue
+            work.append((delegation, child))
+        pairs = work
+        if self.node_workers > 1 and len(pairs) > 1:
+            with ThreadPoolExecutor(max_workers=min(self.node_workers, len(pairs)),
+                                    thread_name_prefix="genesis-sibling") as pool:
+                futures = [pool.submit(self._episode, child, d.objective, state, ctx,
+                                       depth=depth + 1, rollout=rollout,
+                                       base=child_base)
+                           for d, child in pairs]
+                outcomes = [f.result() for f in futures]
+        else:
+            outcomes = [self._episode(child, d.objective, state, ctx, depth=depth + 1,
+                                      rollout=rollout, base=child_base)
+                        for d, child in pairs]
+        for (delegation, child), (returned, asked, child_record) in zip(pairs, outcomes):
+            children.append(child_record)
+            child_record.verdict, child_record.reason = self._judge(
+                child, returned, asked, brief)
+            if child_record.verdict != "rejected" and asked:
+                # "Report the need back up to the parent, which will handle it."
+                # This node handles what falls inside its own authority and passes
+                # the rest further up; at the root, authority is the whole world,
+                # so nothing is left unmet.
+                mine = [replace(e, owner=world.path) for e in asked
+                        if owns(world.path, e.path)]
+                if mine:
+                    self._bump("adopted_requests", len(mine))
+                    self._fold(held, owner_of, mine, world, state)
+                pending += [e for e in asked if not owns(world.path, e.path)]
+            if child_record.verdict == "rejected":
+                # The rejected code does not survive; the *reason* can, as a
+                # record at the child's own node. Paper, appendix 1.4: a saved
+                # failure reason is a separate accepted event, and the code it
+                # came from is not.
+                note = self._failure_note(child, state, child_record.reason)
+                if note is not None:
+                    notes.append(note)
+                findings.append((child.path, "refused", child_record.reason))
+                continue
+            if child_record.verdict == "rework":
+                # Not a refusal: the parent wants another attempt, so the node is
+                # queued rather than annotated. Writing a note for every "try
+                # again" would turn CONTEXT.md into a transcript, which is the
+                # one thing upstream says it must not become.
+                self.log.request_rework(child.path, child_record.reason)
+                findings.append((child.path, "sent back", child_record.reason))
+                continue
+            conflicts = self._fold(held, owner_of, returned, child, state)
+            if conflicts:
+                # Upstream's octopus merge returns the conflicting file list to
+                # the parent, which resolves, aborts, or re-plans
+                # (`agent/subagent_processing.ex:527`). Re-planning is the one a
+                # parent here can take: the child's other edits stand, and the
+                # overlapping one goes back to it.
+                child_record.verdict = "rework"
+                child_record.reason = (
+                    f"{conflicts[0]} was also written by a sibling at "
+                    f"{owner_of.get(conflicts[0], '?')}, and the two edits overlap")
+                self.log.request_rework(child.path, child_record.reason)
+                findings.append((child.path, "sent back", child_record.reason))
+        # Upstream's third phase. An Architect works "architecture & design ->
+        # implementation delegation -> **review & accountability**" and is
+        # "ACCOUNTABLE for all code in its node path" (`agents/architect.ex:23`):
+        # delegating does not discharge that, and the files that belong to the
+        # node itself are nobody else's to write. Without this a manager
+        # delegated forever and its own node's file was never written -- measured:
+        # five correct modules and no `src/__init__.py`, so the public surface the
+        # specification names did not exist and every case scored zero.
+        if self.accountability:
+            own = self._accountability_pass(world, objective, state, held, ctx, depth,
+                                            findings)
+            if own:
+                self._fold(held, owner_of, own, world, state)
+
+        merged: List[Edit] = list(held.values()) + notes
+        # A node whose parent does not route to it is a node later agents cannot
+        # find, so the entry travels with the work as well as with the base its
+        # children saw: the base is this episode's, and only an accepted episode
+        # puts it in the version everyone else will see.
+        if routing is not None:
+            merged.append(routing)
+
+        record.n_edits = len(merged)
+        # The parent's merge. Its parents are the base it delegated from and every
+        # child commit it kept, which is what makes this a phylogenetic graph rather
+        # than a list -- `Git.merge_octopus/2` leaves the same shape.
+        kept = [r.commit for r in children if r.commit and r.verdict != "rejected"]
+        record.commit = self._commit(rollout, record, apply_edits(state, merged), (),
+                                     child_base, kept) or record.commit
+        return merged, pending, record
+
+    def _distil(self, world: LocalWorld, objective: str, state: Mapping[str, str],
+                merged: Sequence[Edit], ctx, depth: int) -> List[Edit]:
+        """Upstream's ``SkillExtractor`` on this episode's accepted contribution.
+
+        Only the **work** is offered for distillation. A routing entry or a refusal
+        note is bookkeeping *about* the contribution, not the contribution; upstream
+        extracts from the PR diff, and the diff is the work.
+
+        The extractor is handed a brief over the **post-merge** tree, so a skill about
+        what was just written can read what was just written. Its own failure is
+        swallowed: a dead model call must cost a skill, never the contribution the
+        episode already produced.
+        """
+        contributed = [e for e in merged if e.kind == "work" and e.content is not None]
+        if not contributed:
+            return list(merged)
+        post = apply_edits(state, merged)
+        brief = Brief(world=world, objective=objective,
+                      context=world.situate(post, contracts=self.contracts),
+                      state=post, task=ctx.task, output=ctx.output,
+                      reward=ctx.reward, depth=depth)
+        try:
+            written = list(self.skills(brief, contributed) or ())
+        except Exception:  # noqa: BLE001 - extraction must not cost the contribution
+            return list(merged)
+        self.skills_written += len(written)
+        return list(merged) + written
+
+    def _investigate(self, child: LocalWorld, objective: str,
+                     state: Mapping[str, str], ctx, depth: int) -> List[Edit]:
+        """One read-only investigation at ``child``; one record may come back.
+
+        The investigator is shown the node's own files because this port's agents
+        have no read tool -- that is the whole reason the role is worth porting here.
+        A returned edit that is not a ``CONTEXT.md`` at the investigated node is
+        refused and counted: source edits are not an investigation, and a write to an
+        ancestor's record is the ancestor's own business.
+        """
+        brief = Brief(world=child, objective=objective,
+                      context=child.situate(state, contracts=self.contracts),
+                      state=state, task=ctx.task, output=ctx.output,
+                      reward=ctx.reward, depth=depth)
+        try:
+            offered = list(self.investigator(brief) or ())
+        except Exception:  # noqa: BLE001 - a dead investigator is not a failed run
+            return []
+        self.investigations += 1
+        key = f"{child.path}/{CONTEXT_FILE}" if child.path else CONTEXT_FILE
+        out: List[Edit] = []
+        for edit in offered:
+            if normalise(edit.path) == normalise(key):
+                out.append(replace(edit, owner=child.path))
+            else:
+                self.investigation_refused += 1
+        return out
+
+    def _accountability_pass(self, world: LocalWorld, objective: str,
+                             state: Mapping[str, str], held: Mapping[str, Edit],
+                             ctx, depth: int,
+                             findings: Sequence[Tuple[str, str, str]] = ()) -> List[Edit]:
+        """One turn for the manager at its own node, after its children return.
+
+        It sees the tree **as its children just left it**, because what the node
+        still needs depends on what came back. Restricted to files directly at the
+        node: a manager is accountable for its whole subtree but a child's files
+        are the child's to write, and a manager free to rewrite them would make
+        the decomposition decorative.
+
+        And it is told **what its own review just returned work over**, which it was
+        not, and that omission cost a whole run. `--mode a` over a repository whose
+        `src/observe/rdf.py` was a zero stub shadowing the real implementation at
+        `src/observe/rdf/rdf.py`: the parent review diagnosed it exactly -- "the
+        actual file src/observe/rdf/rdf.py defines a function named rdf, not
+        histogram, so this import will fail at runtime" -- and rejected the child
+        over it. But `rdf.py` and `__init__.py` belong to the *parent*; no child may
+        write them. So the finding went into the child's `## Known Issues`, the node
+        sat in `open rework` for 10 003 rollouts across two samplers, and the
+        repository never moved off 0.812 -- while rewriting that one parent-owned
+        file takes it to 65/65.
+
+        Upstream this cannot happen, because review and accountability are one phase
+        and the agent running it is "ACCOUNTABLE for all code in its node path"
+        (`agents/architect.ex:23`). A finding it cannot delegate is its own to act
+        on, and now it is holding the finding when its turn comes.
+        """
+        amended = dict(state)
+        for edit in held.values():
+            if edit.content is None:
+                amended.pop(edit.path, None)
+            else:
+                amended[edit.path] = edit.content
+        if findings:
+            self._bump("accountability_findings", len(findings))
+        brief = Brief(world=world,
+                      objective=_with_findings(f"review and accountability: {objective}",
+                                               world.path, findings),
+                      context=world.situate(amended, contracts=self.contracts),
+                      state=amended, task=ctx.task, output=ctx.output,
+                      reward=ctx.reward, depth=depth)
+        out: List[Edit] = list(self._refresh_record(world, amended))
+        for raw in self.executor(brief) or ():
+            path, relative = resolve_edit_path(amended, world.path, raw.path)
+            self._bump("resolved_relative", int(relative))
+            if raw.content is not None and shadows_package(amended, path):
+                # The accountability turn is where this actually happened: the manager
+                # at `src/potentials/kernels` delegated `lennard_jones/` to a child and
+                # then wrote `lennard_jones.py` beside it.
+                self._bump("shadowing_edits", 1)
+            elif directly_at(world.path, path):
+                out.append(Edit(owner=world.path, path=path, content=raw.content,
+                                kind=raw.kind))
+            else:
+                self._bump("accountability_declined", 1)
+        self._bump("accountability_edits", len(out))
+        return out
+
+    def _refresh_record(self, world: LocalWorld,
+                        state: Mapping[str, str]) -> List[Edit]:
+        """Re-spawn an architect on this node if its record no longer fits it.
+
+        Both paths need it and the leaf path needs it more: a manager's record drifts
+        when a child goes somewhere unplanned, but a **leaf** is where the code actually
+        lands, so its `## API Surface` is the one that goes stale first. Hooking only
+        the accountability pass would have missed every leaf in the tree.
+        """
+        if self.refine is None:
+            return []
+        key = f"{world.path}/{CONTEXT_FILE}" if world.path else CONTEXT_FILE
+        revised = self.refine(world.path, state)
+        if not revised or revised == state.get(key):
+            return []
+        self._bump("records_revised", 1)
+        return [Edit(owner=world.path, path=key, content=revised, kind="context")]
+
+    def _fold(self, held: Dict[str, Edit], owner_of: Dict[str, str],
+              returned: Sequence[Edit], child: LocalWorld,
+              state: Mapping[str, str]) -> List[str]:
+        """Octopus-merge one child's edits into what the parent already holds.
+
+        Two children can legally write the same path when one is situated inside
+        the other's subtree, and upstream does not treat that as a fault: the
+        parent runs ``git merge --octopus`` over what came back and only a real
+        overlap becomes a conflict. Rejecting on a bare path collision -- which is
+        what this used to do -- discards a whole contribution for touching a file
+        a sibling also touched, which is exactly the merge the system is for.
+        """
+        conflicts: List[str] = []
+        for edit in returned:
+            mine = held.get(edit.path)
+            if mine is None:
+                held[edit.path] = edit
+                owner_of[edit.path] = child.path
+                continue
+            if mine.content == edit.content:
+                continue                      # the two agreed; nothing to merge
+            if mine.content is None or edit.content is None:
+                conflicts.append(edit.path)   # a delete against an edit
+                self._bump("sibling_conflicts", 1)
+                continue
+            fused = three_way(state.get(edit.path, ""), mine.content, edit.content)
+            if fused is None:
+                conflicts.append(edit.path)
+                self._bump("sibling_conflicts", 1)
+                continue
+            held[edit.path] = replace(mine, content=fused)
+            self._bump("sibling_merges", 1)
+        return conflicts
+
+    def _is_node(self, world: LocalWorld, delegation: Delegation,
+                 state: Mapping[str, str]) -> bool:
+        """May a child be situated here at all?
+
+        Inside the parent's subtree, not the parent itself, and **not an existing
+        file**. A node is a directory: upstream a path is a node when it holds at
+        least one tracked file, and delegating to `lexer.py` as though it were one
+        makes every write land *inside* a file. A real run did exactly that.
+
+        Nor may it **shadow a sibling module**. Opening `rdf/` next to an existing
+        `rdf.py` creates two importable things with one name, and the module wins:
+        the directory the child then fills is unreachable from every import in the
+        repository. One run did exactly this and could not undo it. The parent
+        review found the mismatch and said so precisely; the accountable manager
+        rewrote its own `rdf.py` to forward to `src.observe.rdf.rdf` -- and that
+        raises `'src.observe.rdf' is not a package`, because the name resolves back
+        to the very file doing the forwarding. Every repair is self-referential
+        while both exist, so the collision has to be refused where it is created.
+        """
+        path = normalise(delegation.path)
+        if not owns(world.path, path) or path == world.path:
+            return False
+        if path in state or looks_like_file(path):
+            # `in state` catches a file that exists; the shape catches one that does
+            # not yet, which is every file in a formation run until someone writes it.
+            self._bump("mistaken_nodes", 1)
+            return False
+        if any(part.startswith(".") or part in ARTIFACT_DIRS
+               for part in path.split("/")):
+            # A node is a *source* directory. A tool's own directory is not one even
+            # when it looks like one from here, and `_session.ARTIFACT_DIRS` keeping
+            # them out of the accepted version is the first fence, not the only one:
+            # in one run `.pytest_cache` reached the state anyway and the managers
+            # delegated into it 21 times, nesting three deep --
+            # `src/brain/central_complex/.pytest_cache/.pytest_cache/.pytest_cache`.
+            # Each of those was an episode spent on a cache. Counted as mistaken
+            # because that is exactly what it is: a directory read as a node.
+            self._bump("mistaken_nodes", 1)
+            return False
+        if shadowed_by_module(state, path):
+            self._bump("shadowed_nodes", 1)
+            return False
+        return True
+
+    def _judge(self, child: LocalWorld, returned: Sequence[Edit],
+               asked: Sequence[Edit], parent: Brief) -> "tuple[str, str]":
+        """The responsible parent's verdict on one child's returned work.
+
+        Two things are deliberately *not* judged here. A change the child wanted
+        outside its own path is a **request**, not an overstep -- upstream an
+        agent reports such a need upward and the ancestor with authority handles
+        it. And an overlap with a sibling is a **merge**, handled in
+        :meth:`_fold`. What is left is the question the paper's parent actually
+        answers: is this contribution good, on the tests, constraints and
+        integration evidence available (3.3)?
+        """
+        if not returned:
+            if asked:
+                return "rework", (f"the child did no work at its own path; it asked "
+                                  f"for {len(asked)} change(s) elsewhere, starting "
+                                  f"with {asked[0].path}")
+            return "rework", "the child returned no change"
+        if self.review is not None:
+            verdict = self.review(parent, returned)
+            if verdict is not None:
+                return verdict
+        return "accepted", ""
+
+    def _routing_note(self, world: LocalWorld, state: Mapping[str, str],
+                      opened: Sequence[Delegation]) -> Optional[Edit]:
+        """Add every newly opened child to this node's routing table, once.
+
+        One edit for all of them rather than one each: the trust region counts
+        files, and a node's table is one file.
+        """
+        if not opened:
+            return None
+        key = world.context_key()
+        body = state.get(key, f"# {world.path or './'}\n")
+        changed = False
+        for delegation in opened:
+            updated = routing_entry(body, delegation.path,
+                                    delegation.objective.strip() or "delegated work")
+            if updated is not None:
+                body, changed = updated, True
+        if not changed:
+            return None
+        self._bump("routes_opened", len(opened))
+        # Creating the record outranks the work; adding a line to one does not.
+        return Edit(owner=world.path, path=key, content=body,
+                    kind="context" if key in state else "record")
+
+    def _failure_note(self, child: LocalWorld, state: Mapping[str, str],
+                      reason: str) -> Optional[Edit]:
+        """Write the refusal into the child's ``CONTEXT.md``, if it is new.
+
+        Under ``## Known Issues``, which is upstream's own heading for exactly this:
+        "findings worth preserving belong in CONTEXT.md... `## Known Issues`
+        (problems to avoid re-discovering)" (``agents/manager.ex``). A refusal is the
+        cheapest such finding there is -- the next agent at this node would otherwise
+        rediscover it by being refused again.
+
+        Appending unboundedly would make the note the artifact; upstream's guidance is
+        that ``CONTEXT.md`` records current state and is pruned when it grows. So one
+        line, and only when it is not already there.
+        """
+        if not child.path:
+            return None
+        key = f"{child.path}/{CONTEXT_FILE}"
+        line = f"- refused: {reason}"
+        body = state.get(key, f"# {child.path}\n")
+        if line in body:
+            return None
+        return Edit(owner=child.path, path=key, kind="context",
+                    content=under_heading(body, KNOWN_ISSUES, line))
+
+    # -- the workspace -----------------------------------------------------
+
+    def _commit(self, rollout, record: EpisodeRecord, state: Mapping[str, str],
+                edits: Sequence[Edit], base: str,
+                parents: Sequence[str] = ()) -> str:
+        """Commit what this episode produced, in a worktree of its own.
+
+        Returns the sha, or ``""`` when the run is not using worktrees. Never raises:
+        a git failure costs the history of one episode, not the episode.
+        """
+        if rollout is None:
+            return ""
+        from ._worktree import edited
+        lineage = [p for p in ([base] + list(parents)) if p]
+        try:
+            return rollout.commit(record.agent_id, edited(state, edits),
+                                  f"{record.role} {record.agent_id} at "
+                                  f"{record.path or './'}: {record.objective[:60]}",
+                                  lineage)
+        except Exception:  # noqa: BLE001 - the work stands even if git does not
+            ledger = getattr(rollout, "_ledger", None)
+            if ledger is not None:
+                ledger.failures += 1
+            return ""
+
+    # -- bounds ------------------------------------------------------------
+
+    def _bound(self, edits: Sequence[Edit]) -> List[Edit]:
+        """Last write per path wins, then the trust region, counted.
+
+        Work before bookkeeping, so a trimmed edit set loses a routing note before
+        it loses a source file -- and a record that brings a node into existence
+        before either, because nothing else in the accepted version says the node
+        exists. See :class:`Edit`.
+
+        Skills are a bucket of their own (:attr:`max_skill_edits`), because they are
+        not bookkeeping for this work and they are not the work: they are what a
+        later agent inherits. Letting them compete with the contribution they were
+        distilled from would let a trimmed episode keep the source file and throw
+        away the lesson, which is the one ordering this mechanism cannot have.
+        """
+        by_path: Dict[str, Edit] = {}
+        for edit in edits:
+            by_path[edit.path] = edit
+        skills = [by_path[p] for p in sorted(by_path)
+                  if by_path[p].kind == "skill"][:self.max_skill_edits]
+        rest = {p: e for p, e in by_path.items() if e.kind != "skill"}
+        order = {"record": 0, "work": 1}
+        ordered = [rest[p] for p in
+                   sorted(rest, key=lambda p: (order.get(rest[p].kind, 2), p))]
+        if len(ordered) > self.max_edits:
+            self._bump("truncated", len(ordered) - self.max_edits)
+            ordered = ordered[:self.max_edits]
+        return ordered + skills
+
+    def _objective(self, ctx) -> str:
+        return (f"validation case {getattr(ctx.task, 'id', '?')} scored "
+                f"{ctx.reward:.2f}: {getattr(ctx.task, 'prompt', '')}")
+
+    def stats(self) -> str:
+        return (f"delegation: {self.log.summary()} truncated_edits={self.truncated} "
+                f"routes_opened={self.routes_opened} "
+                f"mistaken_nodes={self.mistaken_nodes} "
+                f"shadowed_nodes={self.shadowed_nodes} "
+                f"shadowing_edits={self.shadowing_edits} "
+                f"sibling_merges={self.sibling_merges} "
+                f"sibling_conflicts={self.sibling_conflicts} "
+                f"requests={self.requests_raised}/"
+                f"{self.adopted_requests}/{self.unmet_requests} "
+                f"node_relative_paths={self.resolved_relative} "
+                f"accountability={self.accountability_edits}/"
+                f"{self.accountability_declined} "
+                f"findings_carried={self.accountability_findings} "
+                f"records_revised={self.records_revised}"
+                + ("" if self.skills is None else
+                   f" skills_written={self.skills_written} "
+                   f"skill_extraction=[{self.skills.stats()}]")
+                + ("" if self.investigator is None else
+                   f" investigations={self.investigations} "
+                   f"finding_edits={self.finding_edits}/"
+                   f"{self.investigation_refused} refused "
+                   f"[{self.investigator.stats()}]"))
+
+
+def _with_findings(objective: str, path: str,
+                   findings: Sequence[Tuple[str, str, str]]) -> str:
+    """Append this episode's review findings to the manager's own objective.
+
+    Short, and phrased as what it *is*: the node's own accountability, not a list of
+    complaints about the children. A finding whose fix lies in a file at this node is
+    the only kind the children cannot act on, and it is exactly the kind that
+    otherwise disappears into a `## Known Issues` line nobody is accountable for.
+    """
+    if not findings:
+        return objective
+    lines = "\n".join(f"- `{child or './'}` ({verdict}): {reason}"
+                       for child, verdict, reason in findings)
+    return (f"{objective}\n\nYour review returned work to "
+            f"{len(findings)} child node(s) this episode:\n{lines}\n"
+            f"You are accountable for every file at `{path or './'}` and a child may "
+            f"not write them. If a finding above is really about a file here, fix it "
+            f"here, now -- sending it down again cannot work.")
+
+
+def _state_of(rendered: str) -> Dict[str, str]:
+    """The tree behind a rendered artifact. ``{}`` when it has not been built yet."""
+    try:
+        return dict(parse_tree(rendered))
+    except Exception:  # noqa: BLE001 - an empty or not-yet-a-tree render
+        return {}

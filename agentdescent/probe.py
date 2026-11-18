@@ -65,7 +65,7 @@ def _block(spec: Any, field: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _next_step(error: BaseException) -> str:
+def _next_step(error: BaseException, *, retry: str = "plan --probe") -> str:
     """The sentence a reader can act on, matching the class of refusal (#1006)."""
     if isinstance(error, SubscriptionInactive):
         return ("renew the subscription at the provider, or point api_key_env / "
@@ -75,8 +75,8 @@ def _next_step(error: BaseException) -> str:
                 "model at another plan")
     if isinstance(error, ProviderConfigError):
         return ("fix the hint in the error (model name, base URL, or API key "
-                "variable) and re-run plan --probe")
-    return "run `agentdescent doctor`, then re-run plan --probe"
+                f"variable) and re-run {retry}")
+    return f"run `agentdescent doctor`, then re-run {retry}"
 
 
 def _completion(ref: str, block: Mapping[str, Any]) -> Completion:

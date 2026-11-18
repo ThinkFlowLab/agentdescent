@@ -407,10 +407,18 @@ def _cost(usage: Usage) -> Dict[str, Any]:
             "failures": usage.failures}
 
 
-def _next_actions(decision: Optional[PromotionDecision]) -> Tuple[str, ...]:
+def _next_actions(decision: Optional[PromotionDecision], *,
+                  artifacts_agree: Optional[bool] = None) -> Tuple[str, ...]:
     if decision is None:
         return ("fix the report's error and rerun",)
     if decision.action == PromotionAction.PROMOTE:
+        if artifacts_agree is False:
+            # The report names no artifact, so the steps must not name one
+            # either (#1141): point at the per-seed rows it does publish.
+            return ("pick one seed's artifact from `run.per_seed` and review "
+                    "that diff",
+                    "apply the chosen artifact as a separate, explicit step",
+                    "keep the manifest and this report for audit")
         return ("review the artifact diff", "apply it as a separate, explicit step",
                 "keep the manifest and this report for audit")
     if decision.action == PromotionAction.DEFER:
@@ -682,7 +690,8 @@ def pilot(policy: PilotPolicy,
         return PilotReport(
             artifact_id=artifact_id, status="error", decision=decision,
             before=before_all, after=after_all, manifest=manifest,
-            run=run_report, cost=cost, next=_next_actions(decision),
+            run=run_report, cost=cost,
+            next=_next_actions(decision, artifacts_agree=artifacts_agree),
             notes=notes, alpha=config.alpha, error=reason)
 
     health = RunHealth(
@@ -699,7 +708,8 @@ def pilot(policy: PilotPolicy,
     return PilotReport(
         artifact_id=artifact_id, status="decided", decision=decision,
         before=before_all, after=after_all, evidence=evidence, manifest=manifest,
-        run=run_report, cost=cost, next=_next_actions(decision),
+        run=run_report, cost=cost,
+        next=_next_actions(decision, artifacts_agree=artifacts_agree),
         notes=_notes(config, evidence, reported_seed=reported_seed,
                      artifacts_agree=artifacts_agree, strategy=policy.strategy),
         alpha=config.alpha)

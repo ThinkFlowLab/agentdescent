@@ -98,6 +98,38 @@ def test_claim_expiry():
     assert not c.claim_expired(fresh, [], CONFIG, NOW)
 
 
+def test_a_refs_pull_request_keeps_the_claim_alive():
+    claimed = issue(2, ["agent-working"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-working")])
+    for body in ("Refs #2", "refs #2", "Part of #2", "Part of ThinkFlowLab/agentdescent#2",
+                 "Refs #2, #3"):
+        prs = [pr(30, body=body)]
+        linked = c.linked_prs(prs, REPO).get(2, [])
+        assert not c.claim_expired(claimed, linked, CONFIG, NOW), f"{body!r} must keep the claim alive"
+    foreign = c.linked_prs([pr(30, body="Refs other/repo#2")], REPO)
+    assert 2 not in foreign, "a foreign repository reference names another issue"
+
+
+def test_no_reference_still_expires_the_claim():
+    claimed = issue(2, ["agent-working"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-working")])
+    for body in ("", "see #2", "Refs #29", "mentions #2 in prose"):
+        assert c.claim_expired(claimed, c.linked_prs([pr(30, body=body)], REPO).get(2, []), CONFIG, NOW), body
+    stale = [pr(30, body="Refs #2", push="2026-10-19T05:00:00Z")]
+    assert c.claim_expired(claimed, c.linked_prs(stale, REPO).get(2, []), CONFIG, NOW), "a stale push expires"
+
+
+def test_a_refs_pull_request_never_gets_the_agent_pr_label():
+    """The agent-PR rule is retired, so no body shape can bring the label back:
+    a reference-only PR (``Refs``/``Part of``) and one that closes the issue
+    alike get the risk label only (#1163)."""
+    closed = issue(7, ["agent-ready"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-ready")])
+    out = run(issues=[closed],
+              prs=[pr(11, tier="T1", head="agent/x", body="Refs #7"),
+                   pr(12, tier="T2", head="agent/fix-7", body="Part of #7"),
+                   pr(13, tier="T3", head="feat/plain", body="Fixes #7", author="bot-x")])
+    assert [o for o in out["ops"] if o["label"] == "agent-pr"] == []
+    assert not hasattr(c, "is_agent_pr"), "the agent-PR rule is gone, not just unused"
+
+
 def test_plan_issues():
     ready_by_other = issue(3, ["agent-ready", "agent-working"],
                            [ev("labeled", "2026-10-19T01:00:00Z", "HugoXK", "agent-ready")])

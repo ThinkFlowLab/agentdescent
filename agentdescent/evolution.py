@@ -3887,12 +3887,23 @@ def evolve(
              "the barrier-free runtime has no select/test split yet, so a run "
              "would report a select-set reward as if a test split had been "
              "measured -- run synchronously to get a test_reward (#843)"),
+            ("call_limit", call_limit,
+             "the barrier-free runtime has no per-call guard yet, so a cap "
+             "passed here would not be enforced -- run synchronously for "
+             "--max-calls / --max-usd (#1166)"),
         ):
             if value is not None:
                 warnings.warn(
                     f"evolve(asynchronous=True) ignores {name}=: {why}. Use the "
                     f"synchronous path if you need it.", RuntimeWarning,
                     stacklevel=2)
+        if call_limit is not None:
+            # A warning is not enough for a spend cap: an ignored one is an
+            # unbounded run that looks bounded (#1166).
+            raise ValueError(
+                "evolve(asynchronous=True) cannot enforce a run-level call cap: "
+                "the barrier-free runtime has no per-call guard yet. Run "
+                "synchronously (asynchronous=False) or drop max_calls / max_usd.")
         if max_seconds is None:
             raise ValueError(
                 "evolve(asynchronous=True) no longer invents max_seconds=20.0 "

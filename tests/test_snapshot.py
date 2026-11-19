@@ -180,6 +180,62 @@ def test_evaluate_snapshot_spec_uses_dest_tasks_and_rejects_kind_mismatch():
         evaluate_snapshot_spec(snap, other)
 
 
+def test_evaluate_snapshot_spec_puts_a_skill_dir_under_its_artifact_id():
+    """The dest agent reads `.claude/skills/<artifact_id>/`, not `.../artifact/` (#1164).
+
+    Staging still uses the fixed `tmp/artifact` path (#1150). The destination
+    spec's `name` carries the snapshot's id so `artifact_id()` and the
+    `claude_skill` prefix become `.claude/skills/csv-total/`.
+    """
+    from agentdescent.demo import DEMO_SKILL, _SKILL_MD
+    from agentdescent.runners import tree_runner
+
+    csv_body = "id,amount\n1,100\n2,200\n3,21\n"  # amount=321, id=6
+    dest = EvolveSpec(
+        kind="skill_dir",
+        target="ignored-target",
+        data={"inline": [
+            {"id": "t0", "prompt": "What is the total?", "gold": "321",
+             "fixtures": {"data.csv": csv_body}},
+        ]},
+        score="exact",
+        agent={"ref": "agentdescent.demo:offline_agent"},
+        prompt_template="{prompt}",
+    )
+
+    def _snap(rules):
+        return ArtifactSnapshot(
+            artifact_id=DEMO_SKILL, kind="skill_dir",
+            files={"SKILL.md": _SKILL_MD, "references/rules.md": rules},
+        )
+
+    recorded = {}
+    real_tree_runner = tree_runner
+
+    def spy(agent, layout="claude_skill", **kwargs):
+        recorded["name"] = kwargs.get("name")
+        recorded["layout"] = layout
+        return real_tree_runner(agent, layout=layout, **kwargs)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("agentdescent.evolvespec.tree_runner", spy)
+    try:
+        learned = evaluate_snapshot_spec(_snap("COLUMN: amount\n"), dest)
+        seed = evaluate_snapshot_spec(_snap("COLUMN: id\n"), dest)
+    finally:
+        monkey.undo()
+
+    assert recorded["name"] == DEMO_SKILL
+    assert recorded["layout"] == "claude_skill"
+    assert learned.failed == ()
+    assert learned.n == 1 and learned.reward == 1.0
+    assert learned.searched is False
+    assert seed.failed == ()
+    assert seed.n == 1 and seed.reward == 0.0
+    # Staging itself stays under the fixed name; this test only pins the
+    # layout prefix the dest agent sees.
+
+
 def test_plugin_kind_snapshot_is_the_plugin_tree_not_a_host():
     files = {"plugin.py": "print('plugin')\n", "README.md": "a plugin\n"}
     snap = ArtifactSnapshot.from_filetree(

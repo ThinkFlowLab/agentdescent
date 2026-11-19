@@ -5,6 +5,15 @@
   var REPO = 'ThinkFlowLab/agentdescent';
   var ENDPOINT = 'https://mcp.deepwiki.com/mcp';
   var PAGE = 'https://deepwiki.com/' + REPO;
+
+  // GitHub Pages serves this site under /agentdescent/, a local build sits at /,
+  // and only Pages punishes a root-absolute href. Derive the base from this
+  // script's own URL so the in-panel links resolve in both places. With no
+  // script element there is no safe base, so the two anchors are left out
+  // instead of falling back to a literal that 404s on Pages.
+  var SELF = document.currentScript || document.querySelector('script[src$="assets/deepwiki.js"]');
+  var GUIDE = SELF ? new URL('../deepwiki/', SELF.src).href : null;
+
   var icons = {
     chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>',
     logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 4.5A2.5 2.5 0 0 1 7.5 2H20v17H7.5A2.5 2.5 0 0 0 5 21.5z"/><path d="M5 4.5v17"/><path d="M9 7h7M9 10h7"/></svg>',
@@ -36,7 +45,7 @@
     '<div class="dw-brand"><span class="dw-logo">' + icons.logo + '</span>',
     '<div><strong>DeepWiki</strong><span class="dw-repo"><i></i>' + REPO + '</span></div></div>',
     '<div class="dw-head-actions">',
-    '<a class="dw-icon-btn" href="/deepwiki/" title="About DeepWiki and MCP" aria-label="About DeepWiki and MCP">' + icons.info + '</a>',
+    (GUIDE ? '<a class="dw-icon-btn" href="' + GUIDE + '" title="About DeepWiki and MCP" aria-label="About DeepWiki and MCP">' + icons.info + '</a>' : ''),
     '<button type="button" class="dw-icon-btn" id="dw-new" aria-label="New chat" title="New chat">' + icons.refresh + '</button>',
     '<button type="button" class="dw-icon-btn" id="dw-close" aria-label="Close" title="Close">' + icons.close + '</button>',
     '</div></header>',
@@ -59,7 +68,7 @@
     '<textarea id="dw-input" rows="1" placeholder="Ask about the code\u2026" aria-label="Your question"></textarea>',
     '<button type="submit" class="dw-send" id="dw-send" aria-label="Send">' + icons.send + '</button>',
     '</div>',
-    '<div class="dw-hint"><span>DeepWiki is third-party and model-generated. Verify load-bearing answers against the source.</span><a href="/deepwiki/">Caveats</a></div>',
+    '<div class="dw-hint"><span>DeepWiki is third-party and model-generated. Verify load-bearing answers against the source.</span>' + (GUIDE ? '<a href="' + GUIDE + '">Caveats</a>' : '') + '</div>',
     '</form>'
   ].join('');
 

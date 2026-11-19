@@ -77,6 +77,15 @@ def test_closing_refs_reads_this_repository_only():
     assert c.closing_refs(body, REPO) == [12, 13, 14]
 
 
+def test_is_agent_pr():
+    cfg = dict(CONFIG, agentAuthors=["bot-x"])
+    assert c.is_agent_pr(pr(1, author="bot-x", same=False), cfg, REPO, set())
+    assert c.is_agent_pr(pr(1, head="agent/fix-3"), cfg, REPO, set())
+    assert not c.is_agent_pr(pr(1, head="agent/fix-3", same=False), cfg, REPO, set()), "fork: by author only"
+    assert c.is_agent_pr(pr(1, body="Fixes #7"), cfg, REPO, {7})
+    assert not c.is_agent_pr(pr(1, body="Fixes #8"), cfg, REPO, {7})
+
+
 def test_judge_ready():
     ok = issue(1, ["agent-ready"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-ready")])
     assert c.judge_ready(ok, CONFIG)["demote"] is None
@@ -98,6 +107,32 @@ def test_claim_expiry():
     assert not c.claim_expired(fresh, [], CONFIG, NOW)
 
 
+def test_a_refs_pull_request_keeps_the_claim_alive():
+    claimed = issue(2, ["agent-working"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-working")])
+    for body in ("Refs #2", "refs #2", "Part of #2", "Part of ThinkFlowLab/agentdescent#2",
+                 "Refs #2, #3"):
+        prs = [pr(30, body=body)]
+        linked = c.linked_prs(prs, REPO).get(2, [])
+        assert not c.claim_expired(claimed, linked, CONFIG, NOW), f"{body!r} must keep the claim alive"
+    foreign = c.linked_prs([pr(30, body="Refs other/repo#2")], REPO)
+    assert 2 not in foreign, "a foreign repository reference names another issue"
+
+
+def test_no_reference_still_expires_the_claim():
+    claimed = issue(2, ["agent-working"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-working")])
+    for body in ("", "see #2", "Refs #29", "mentions #2 in prose"):
+        assert c.claim_expired(claimed, c.linked_prs([pr(30, body=body)], REPO).get(2, []), CONFIG, NOW), body
+    stale = [pr(30, body="Refs #2", push="2026-10-19T05:00:00Z")]
+    assert c.claim_expired(claimed, c.linked_prs(stale, REPO).get(2, []), CONFIG, NOW), "a stale push expires"
+
+
+def test_a_refs_pull_request_is_still_not_an_agent_pr():
+    cfg = dict(CONFIG, agentAuthors=["bot-x"])
+    assert not c.is_agent_pr(pr(1, body="Refs #7"), cfg, REPO, {7})
+    assert not c.is_agent_pr(pr(1, body="Part of #7"), cfg, REPO, {7})
+    assert c.is_agent_pr(pr(1, body="Fixes #7"), cfg, REPO, {7}), "closing refs still decide agent-PR-ness"
+
+
 def test_plan_issues():
     ready_by_other = issue(3, ["agent-ready", "agent-working"],
                            [ev("labeled", "2026-10-19T01:00:00Z", "HugoXK", "agent-ready")])
@@ -108,20 +143,11 @@ def test_plan_issues():
     assert {"number": 4, "label": "*", "reason": "hold"} in out["skipped"]
 
 
-def test_plan_prs_get_one_risk_label_and_never_agent_pr():
-    """The owner banned ``agent-pr`` repo-wide, so no PR shape may bring it back.
-
-    An ``agent/`` branch and a body that closes an ``agent-ready`` issue are the
-    two rules the controller used to label agent PRs by; both must now be inert.
-    """
-    agent_issue = issue(7, ["agent-ready"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-ready")])
-    out = run(issues=[agent_issue],
-              prs=[pr(10, ["risk:T1", "risk:T3"], tier="T3"), pr(11, tier="T0", head="agent/x"),
-                   pr(14, tier="T1", head="agent/1161-x", body="Fixes #7"),
+def test_plan_prs_get_one_risk_label_and_agent_pr_by_rule():
+    out = run(prs=[pr(10, ["risk:T1", "risk:T3"], tier="T3"), pr(11, tier="T0", head="agent/x"),
                    pr(12, ["hold"], tier="T3"), pr(13, tier=None)])
     ops = {(o["number"], o["op"], o["label"]) for o in out["ops"]}
-    assert ops == {(10, "remove", "risk:T1"), (11, "add", "risk:T0"), (14, "add", "risk:T1")}
-    assert not [o for o in out["ops"] if o["label"] == "agent-pr"]
+    assert ops == {(10, "remove", "risk:T1"), (11, "add", "risk:T0"), (11, "add", "agent-pr")}
 
 
 def test_a_missing_label_is_skipped_never_created():
@@ -137,30 +163,14 @@ def test_plan_only_proposes_managed_labels_and_never_adds_agent_ready():
     for o in out["ops"]:
         assert o["label"] in c.MANAGED[o["op"]]
     assert "agent-ready" not in c.MANAGED["add"]
-    assert "agent-pr" not in c.MANAGED["add"] | c.MANAGED["remove"]
-
-
-def test_the_controller_carries_no_agent_pr_rule_or_its_config():
-    """Banned label, banned plumbing: no rule, no reason, no config key, no helper."""
-    src = (SCRIPTS / "controller.py").read_text(encoding="utf-8")
-    assert "agent-pr" not in src
-    assert "agentAuthors" not in src and "agentBranchPrefixes" not in src
-    assert not hasattr(c, "is_agent_pr")
-    for dead in ("agentAuthors", "agentBranchPrefixes"):
-        assert dead not in CONFIG, f"{dead} only ever fed the agent-pr rule"
-    assert "agent-pr" not in c.REASONS and "agent-pr" not in c.MANAGED["add"]
 
 
 @pytest.mark.parametrize("bad", [
     None, {}, {"version": 2, "ops": []},
-    {"version": 1, "ops": [{"number": 0, "op": "add", "label": "risk:T0", "reason": "risk-tier"}]},
-    {"version": 1, "ops": [{"number": True, "op": "add", "label": "risk:T0", "reason": "risk-tier"}]},
-    {"version": 1, "ops": [{"number": 1, "op": "close", "label": "risk:T0", "reason": "risk-tier"}]},
-    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "agent-ready", "reason": "risk-tier"}]},
-    # agent-pr is banned repo-wide: the controller may not add it, planned here
-    # by hand or otherwise, and its old reason string no longer exists.
-    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "agent-pr", "reason": "risk-tier"}]},
-    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "risk:T0", "reason": "agent-pr"}]},
+    {"version": 1, "ops": [{"number": 0, "op": "add", "label": "agent-pr", "reason": "agent-pr"}]},
+    {"version": 1, "ops": [{"number": True, "op": "add", "label": "agent-pr", "reason": "agent-pr"}]},
+    {"version": 1, "ops": [{"number": 1, "op": "close", "label": "agent-pr", "reason": "agent-pr"}]},
+    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "agent-ready", "reason": "agent-pr"}]},
     {"version": 1, "ops": [{"number": 1, "op": "remove", "label": "hold", "reason": "risk-tier"}]},
     {"version": 1, "ops": [{"number": 1, "op": "add", "label": "risk:T0", "reason": "because"}]},
     {"version": 1, "ops": [{"number": 1, "op": "add", "label": "risk:T0", "reason": "risk-tier"}] * 201},
@@ -195,12 +205,12 @@ def test_apply_writes_only_label_endpoints_and_rechecks_the_state():
         {"number": 2, "op": "add", "label": "risk:T1", "reason": "risk-tier"},
         {"number": 3, "op": "remove", "label": "risk:T3", "reason": "risk-tier"},
         {"number": 4, "op": "remove", "label": "agent-working", "reason": "claim-expired"},
-        {"number": 5, "op": "add", "label": "risk:T0", "reason": "risk-tier"},
+        {"number": 5, "op": "add", "label": "agent-pr", "reason": "agent-pr"},
     ]
     api = FakeApi({1: {"state": "open", "labels": []}, 2: {"state": "closed", "labels": []},
                    3: {"state": "open", "labels": [{"name": "risk:T3"}, {"name": "hold"}]},
                    4: {"state": "open", "labels": [{"name": "agent-working"}]},
-                   5: {"state": "open", "labels": [{"name": "risk:T0"}]}})
+                   5: {"state": "open", "labels": [{"name": "agent-pr"}]}})
     out = c.apply({"version": 1, "ops": ops}, api, REPO)
     assert [o["number"] for o in out["done"]] == [1, 4]
     assert {s["number"]: s["why"] for s in out["skipped"]} == {2: "closed", 3: "hold", 5: "already"}

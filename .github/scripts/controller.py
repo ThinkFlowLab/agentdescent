@@ -9,7 +9,8 @@ PR/issue content: titles and bodies are data for one bounded regex
 (``Fixes #N``); changed files are read only through the API and judged by the
 risk gate's rules.
 
-  - sets ``risk:T0..T3`` (the risk gate's tier) on every open PR not on ``hold``
+  - sets ``agent-pr`` on pull requests an agent opened, and ``risk:T0..T3``
+    (the risk gate's tier) on every open PR not on ``hold``
   - removes ``agent-ready`` (and ``agent-working``) when someone who is not a
     maintainer labeled the issue, or edited its text after it was labeled
   - removes ``agent-working`` from a claim older than the TTL with no recent
@@ -42,11 +43,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RISK = ["risk:T0", "risk:T1", "risk:T2", "risk:T3"]
 MANAGED = {
     # label -> what the controller may do with it. It can never ADD agent-ready.
-    "add": set(RISK),
+    "add": set(["agent-pr"] + RISK),
     "remove": set(["agent-ready", "agent-working"] + RISK),
 }
 MAX_OPS = 200
-REASONS = {"labeled-by-non-maintainer", "edited-by-non-maintainer", "claim-expired", "risk-tier"}
+REASONS = {"labeled-by-non-maintainer", "edited-by-non-maintainer", "claim-expired", "risk-tier", "agent-pr"}
 
 
 # ---- mode -------------------------------------------------------------------
@@ -79,6 +80,38 @@ def closing_refs(body: Optional[str], repo: str) -> List[int]:
         if not m.group(1) or _same(m.group(1), repo):
             out.add(int(m.group(2)))
     return sorted(out)
+
+
+# A body can point at its issue without promising to close it: ``Refs #12``,
+# ``Part of #12``. Those keep a claim alive (issue #1161), but they never make a
+# PR an agent PR — for that only ``closing_refs`` counts.
+_LINKING = re.compile(r"\b(?:refs?|part\s+of)\b:?[ \t]+((?:[\w.-]+/[\w.-]+)?#\d{1,7}"
+                      r"(?:[ \t]*(?:,|and)[ \t]*(?:[\w.-]+/[\w.-]+)?#\d{1,7})*)", re.I)
+_REF = re.compile(r"(?:([\w.-]+/[\w.-]+))?#(\d{1,7})\b")
+
+
+def ttl_refs(body: Optional[str], repo: str) -> List[int]:
+    """Every issue this body points at: the closing refs plus ``Refs``/``Part of``."""
+    out = set(closing_refs(body, repo))
+    for m in _LINKING.finditer(str(body or "")[:20000]):
+        for ref in _REF.finditer(m.group(1)):
+            if not ref.group(1) or _same(ref.group(1), repo):
+                out.add(int(ref.group(2)))
+    return sorted(out)
+
+
+def is_agent_pr(pr: Dict[str, Any], config: Dict[str, Any], repo: str, agent_issues: Iterable[int]) -> bool:
+    """By author, or a branch of this repository with an agent prefix, or a
+    branch of this repository that closes an agent-ready/agent-working issue.
+    A fork PR counts only by author."""
+    if any(_same(a, pr["author"]) for a in config["agentAuthors"]):
+        return True
+    if not pr["sameRepo"]:
+        return False
+    if any(p and pr["headRef"].startswith(p) for p in config["agentBranchPrefixes"]):
+        return True
+    agent_issues = set(agent_issues)
+    return any(n in agent_issues for n in closing_refs(pr["body"], repo))
 
 
 def _last(events: List[Dict[str, Any]], pred: Callable[[Dict[str, Any]], bool]) -> Optional[Dict[str, Any]]:
@@ -125,7 +158,7 @@ def _diff_labels(have: List[str], add: Iterable[str] = (), remove: Iterable[str]
 
 
 def plan(state: Dict[str, Any]) -> Dict[str, List[Any]]:
-    """state: config, now (epoch s), repoLabels [names], issues, prs, linked {issue: [prs]}."""
+    """state: repo, config, now (epoch s), repoLabels [names], issues, prs, linked {issue: [prs]}."""
     config = state["config"]
     exists = {l.lower() for l in state["repoLabels"]}
     ops: List[Dict[str, Any]] = []
@@ -139,6 +172,7 @@ def plan(state: Dict[str, Any]) -> Dict[str, List[Any]]:
             else:
                 ops.append({"kind": kind, "number": number, "op": f["op"], "label": f["label"], "reason": reason})
 
+    agent_issues = {i["number"] for i in state["issues"]}
     for issue in state["issues"]:
         labels = issue["labels"]
         if any(_same(l, "hold") for l in labels):
@@ -167,6 +201,8 @@ def plan(state: Dict[str, Any]) -> Dict[str, List[Any]]:
         want = f"risk:{pr['tier']}"
         push("pr", pr["number"], _diff_labels(pr["labels"], add=[want], remove=[l for l in RISK if l != want]),
              "risk-tier")
+        if is_agent_pr(pr, config, state["repo"], agent_issues):
+            push("pr", pr["number"], _diff_labels(pr["labels"], add=["agent-pr"]), "agent-pr")
     if len(ops) > MAX_OPS:
         notes.append(f"{len(ops)} operations; keeping the first {MAX_OPS}")
         del ops[MAX_OPS:]
@@ -318,9 +354,13 @@ def read_prs(api: Any, repo: str, config: Dict[str, Any], gate: "risk_gate.Gate"
             last_push = max(last_push, date)
         except Exception:  # keep created_at as the last activity
             pass
+        head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or ""
         out.append({
             "number": pr["number"],
             "labels": [l["name"] for l in pr.get("labels", [])],
+            "author": _login(pr.get("user")) or "",
+            "headRef": pr["head"]["ref"],
+            "sameRepo": head_repo.lower() == repo.lower(),
             "body": pr.get("body") or "",
             "tier": tier,
             "lastPushAt": last_push,
@@ -331,7 +371,7 @@ def read_prs(api: Any, repo: str, config: Dict[str, Any], gate: "risk_gate.Gate"
 def linked_prs(prs: List[Dict[str, Any]], repo: str) -> Dict[int, List[Dict[str, Any]]]:
     linked: Dict[int, List[Dict[str, Any]]] = {}
     for pr in prs:
-        for n in closing_refs(pr["body"], repo):
+        for n in ttl_refs(pr["body"], repo):
             linked.setdefault(n, []).append({"lastPushAt": pr["lastPushAt"]})
     return linked
 
@@ -405,7 +445,7 @@ def main(command: Optional[str], env: Dict[str, str], api: Any = None) -> None:
         repo_labels = [l["name"] for l in api.list(f"repos/{repo}/labels?per_page=100")]
         issues = read_issues(api, repo, config)
         prs = read_prs(api, repo, config, gate)
-        result = plan({"config": config, "now": time.time(), "repoLabels": repo_labels,
+        result = plan({"repo": repo, "config": config, "now": time.time(), "repoLabels": repo_labels,
                        "issues": issues, "prs": prs, "linked": linked_prs(prs, repo)})
         full = dict(result, version=1, mode=mode)
         _out(render(full, mode))

@@ -80,8 +80,8 @@ Source of truth: [`.github/labels.json`](.github/labels.json), synced by the
 - **Source:** `self-test` (filed by the self-test routine; issues only).
 - **State:** `needs-info` (spec unclear), `needs-human` (needs Danyang's
   decision; the last comment says what), `agent-ready`, `agent-working`,
-  `awaiting-approval` (green T2/T3 PR waiting for a PASS and Danyang's click),
-  `hold` (automation leaves the item alone).
+  `agent-pr`, `awaiting-approval` (green T2/T3 PR waiting for a PASS and
+  Danyang's click), `hold` (automation leaves the item alone).
 - **Risk:** `risk:T0` … `risk:T3`, set by the controller only, never by hand.
 
 ### Triage: when an issue is `agent-ready`
@@ -98,14 +98,14 @@ question in a comment. Agents develop **only** `agent-ready` issues.
 - Before work: skip an issue someone else is assigned to. Otherwise assign
   `Birfy`, add `agent-working`, and comment naming the branch.
 - Stopping without a PR: unassign, remove `agent-working`, say why.
-- The PR says `Fixes #N`, is assigned to `Birfy`, labeled with its type and
-  area. Agent branches start with `agent/`.
+- The PR says `Fixes #N`, is assigned to `Birfy`, labeled `agent-pr` plus its
+  type and area. Agent branches start with `agent/`.
 
 ## Controller
 
 [`.github/workflows/controller.yml`](.github/workflows/controller.yml) runs every
 30 minutes with the built-in `GITHUB_TOKEN` only (no GitHub App, no secrets) and
-changes labels and nothing else: it sets `risk:T*` on open PRs,
+changes labels and nothing else: it sets `risk:T*` and `agent-pr` on open PRs,
 removes `agent-ready`/`agent-working` when a non-maintainer set or edited an
 issue after it was approved, and expires a claim after 6 h with no linked push.
 It never adds `agent-ready`, never merges, comments or closes.

@@ -387,7 +387,8 @@ class Meter:
 
 
 def measured(fn: Callable[..., T], meter: Optional[Meter],
-             *, phase: Optional[str] = None) -> Callable[..., T]:
+             *, phase: Optional[str] = None,
+             guard: Optional[Any] = None) -> Callable[..., T]:
     """Wrap an actor so each invocation lands in ``meter.usage``.
 
     ``agents.metered`` does the same job for a ``Completion`` (``prompt -> str``);
@@ -408,11 +409,19 @@ def measured(fn: Callable[..., T], meter: Optional[Meter],
 
     Returns ``fn`` unchanged when ``meter`` is ``None``, so the un-instrumented
     path stays exactly one function call deep.
+
+    ``guard`` (a :class:`~agentdescent.budget.CallLimit`) is asked for a slot
+    **before** the call, so a run-level budget refuses the call rather than
+    counting it afterwards (#1166). It raises ``BudgetStop``, which travels out
+    of here unchanged -- the engine catches it by name and ends the round
+    cleanly.
     """
     if meter is None:
         return fn
 
     def call(*args: Any, **kwargs: Any) -> T:
+        if guard is not None:
+            guard.reserve()
         token = meter.usage.begin(phase=phase)
         t0 = time.time()
         try:

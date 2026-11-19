@@ -101,6 +101,11 @@ class BudgetSettings:
     max_rollouts: Optional[int] = None
     max_calls: Optional[int] = None
     max_tokens: Optional[int] = None
+    #: Per-call cap (:class:`~agentdescent.budget.CallLimit`), checked **before**
+    #: each model call (#1166). A different quantity from ``max_calls`` above,
+    #: which is a round-barrier budget and overshoots by up to one round. Built
+    #: by the run store from ``max_calls`` / ``max_usd``.
+    call_limit: Optional["CallLimit"] = None
     stop_on_diminishing_returns: bool = False
     efficiency_floor: float = 0.25
     call_budget: Optional["CallBudget"] = None

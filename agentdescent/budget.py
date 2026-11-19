@@ -34,6 +34,7 @@ spent, never whether the run's numbers mean anything.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -50,6 +51,87 @@ SOFT_FLOOR = 0.75
 #: ``observe_delta`` tie-breaker. Skipping it at 90% trades that tie-breaker
 #: for the run actually finishing its round.
 HARD_FLOOR = 0.90
+
+
+class BudgetStop(Exception):
+    """A model call that a run-level call budget refused to make (#1166).
+
+    Raised by :meth:`CallLimit.reserve` **before** the call, and caught by name
+    in :mod:`agentdescent.evolution` -- the worker wrapper's generic
+    ``except Exception`` would otherwise record a clean budget stop as a failed
+    worker, and the run would end ``failed`` with an error instead of a named
+    stop.
+    """
+
+    def __init__(self, limit: str, observed: float, cap: float) -> None:
+        self.limit = limit
+        self.observed = observed
+        self.cap = cap
+        super().__init__(f"{limit}={cap} reached")
+
+    def detail(self) -> str:
+        """One line for ``status``: which limit fired and what was spent."""
+        if self.limit == "max_calls":
+            return (f"max_calls: {int(self.observed)} call(s) made, "
+                    f"cap {int(self.cap)}")
+        return f"max_usd: ${self.observed:.4f} spent, cap ${self.cap:.4f}"
+
+
+@dataclass
+class CallLimit:
+    """A run-level cap on calls and dollars, charged before every call (#1166).
+
+    ``reserve()`` *is* the mechanism: it runs before the call is made, so "the
+    call did not happen" is structural rather than a check after the fact. The
+    engine's round-barrier ``max_calls`` is a different quantity -- it bounds
+    where to stop, so a four-worker round on ``max_calls=1`` still makes four
+    calls; this one bounds the calls themselves.
+
+    Thread-safe: ``metrics.measured`` wraps both worker threads and the
+    evaluation pool. ``0`` is a limit ("no calls"), not an absence.
+    """
+
+    max_calls: Optional[int] = None
+    #: A dollar cap needs a per-call price; without one it cannot be charged and
+    #: :func:`agentdescent.runstore.require_budget_pair` refuses the run.
+    max_usd: Optional[float] = None
+    usd_per_call: Optional[float] = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False,
+                                 compare=False)
+    _taken: int = field(default=0, init=False, repr=False, compare=False)
+    _stopped: Optional[BudgetStop] = field(default=None, init=False,
+                                           repr=False, compare=False)
+
+    def reserve(self) -> None:
+        """Take the next call's slot, or raise :class:`BudgetStop`.
+
+        The slot is taken **before** the call so concurrent workers cannot both
+        pass a check that only one of them can afford.
+        """
+        with self._lock:
+            n = self._taken + 1
+            stop: Optional[BudgetStop] = None
+            if self.max_calls is not None and n > self.max_calls:
+                stop = BudgetStop("max_calls", self._taken, self.max_calls)
+            elif self.max_usd is not None and self.usd_per_call:
+                # Tolerance: 3 x 0.01 must not exceed 0.03 through float noise.
+                if n * self.usd_per_call > self.max_usd + 1e-9:
+                    stop = BudgetStop("max_usd", self._taken * self.usd_per_call,
+                                      self.max_usd)
+            if stop is not None:
+                if self._stopped is None:
+                    self._stopped = stop
+                raise stop
+            self._taken = n
+
+    @property
+    def calls(self) -> int:
+        """Calls this limit has admitted so far."""
+        return self._taken
+
+    def detail(self) -> Optional[str]:
+        """Why the limit refused, or ``None`` when it never did."""
+        return None if self._stopped is None else self._stopped.detail()
 
 
 @dataclass

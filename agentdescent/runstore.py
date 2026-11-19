@@ -175,13 +175,22 @@ class RunStatus:
     updated: Optional[float] = None
     finished: Optional[float] = None
     stop_reason: Optional[str] = None
+    #: Which limit fired and what was spent, when ``stop_reason == "budget"``
+    #: (#1166). Additive and optional: absent means "no run-level cap tripped",
+    #: and an old ``status.json`` without the key reads as ``None``.
+    stop_detail: Optional[str] = None
     error: Optional[str] = None
     kind: Optional[str] = None
     target: Optional[str] = None
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Shape stability (#1166): a run with no cap must write the same file it
+        # wrote before this field existed, so the key is omitted when unset.
+        if d.get("stop_detail") is None:
+            d.pop("stop_detail", None)
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RunStatus":
@@ -660,6 +669,8 @@ def _error_from_log(log_path: str) -> Optional[str]:
 
 def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
            usd_per_call: Optional[float] = None,
+           max_calls: Optional[int] = None,
+           max_usd: Optional[float] = None,
            env: Optional[Dict[str, str]] = None) -> RunStatus:
     """Start the run as a **detached** process and return at once.
 
@@ -671,6 +682,12 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     Its stdout and stderr go to ``log.txt``.
     """
     require_budget_pair(budget_usd, usd_per_call)
+    from .evolvespec import SpecError, build_call_limit
+    try:
+        build_call_limit(max_calls=max_calls, max_usd=max_usd,
+                         usd_per_call=usd_per_call)
+    except SpecError as e:
+        raise RunStoreError(str(e)) from None
     st = rd.status()
     if st.state == "running" and st.alive():
         raise RunStoreError(f"{rd.run_id} is already running (pid {st.pid})")
@@ -679,6 +696,12 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
         argv += ["--budget", str(budget_usd)]
     if usd_per_call is not None:
         argv += ["--usd-per-call", str(usd_per_call)]
+    # The run-level cap crosses the detach boundary as flags, so the child
+    # charges the same way a foreground run does (#1166).
+    if max_calls is not None:
+        argv += ["--max-calls", str(max_calls)]
+    if max_usd is not None:
+        argv += ["--max-usd", str(max_usd)]
     # Scrub the merged dict, not just the ambient one: a caller-supplied
     # ``env`` is spread last and could otherwise put ``MCP_*``/``DSH_*`` back
     # into the run after the scrub (#1082). ``PYTHONPATH`` carries no marker
@@ -788,7 +811,9 @@ _plain_held_out_warning = _plain_cli_warnings
 
 
 def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
-            usd_per_call: Optional[float] = None) -> EvolutionResult:
+            usd_per_call: Optional[float] = None,
+            max_calls: Optional[int] = None,
+            max_usd: Optional[float] = None) -> EvolutionResult:
     """Run the spec in ``rd`` **in this process**, keeping the directory current.
 
     This is what the detached child calls; it is also usable directly for a
@@ -796,9 +821,16 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     ``on_round`` hook writes ``status.json`` and ``rounds.jsonl``; the ledger
     lives under the run so a later :func:`resume` continues it; the result and
     the materialised tree are written at the end whatever the outcome.
+
+    ``max_calls`` / ``max_usd`` are the run-level caps charged **before** each
+    model call (#1166). They are stricter than ``budget_usd``, which is a
+    between-round warning plus a ``stop_when``: a four-worker round on
+    ``max_calls=1`` still made four calls under that budget, and makes one here.
+    A capped run ends ``done`` with ``stop_reason="budget"`` and ``stop_detail``
+    naming the limit and the spend.
     """
     from .agents import Usage
-    from .evolvespec import EvolveSpec, compose
+    from .evolvespec import EvolveSpec, SpecError, build_call_limit, compose
     from .filetree import materialize
 
     # Refuse before marking running: a missing usd_per_call must not look like a
@@ -811,6 +843,17 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
 
     spec = EvolveSpec.from_dict(rd.spec_dict())
     usage = Usage()
+    # The run-level cap (#1166). Built here rather than in the engine so a
+    # detached child and a foreground run charge the same way; a spec's own
+    # `max_calls` / `max_usd` knobs are validated by `compose`.
+    try:
+        limit = build_call_limit(max_calls=max_calls, max_usd=max_usd,
+                                 usd_per_call=usd_per_call)
+    except SpecError as e:
+        # A bad cap is a refusal, not a live run: record it and never mark
+        # running, the same shape as a missing usd_per_call above.
+        rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
+        raise RunStoreError(str(e)) from None
 
     def _progress() -> None:
         # Mid-call rewrite so CLI/MCP status shows work in flight (#358).
@@ -890,6 +933,10 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
         rd.update_status(**changes)
 
     overrides: Dict[str, Any] = {}
+    if limit is not None:
+        # Wins over a spec's own knobs: an explicit run option is the sharper
+        # instruction, exactly as every other override works (#1166).
+        overrides["call_limit"] = limit
     if budget_usd is not None:
         def stop_when(info: RoundInfo) -> bool:
             # Asked between rounds, where max_calls is; the run overshoots by at
@@ -929,9 +976,13 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
         materialize(result.state, rd.tree_path)
     final = _finite_or_none(result.final_reward)
     initial = _finite_or_none(getattr(result, "initial_reward", None))
+    # Which limit fired, from whichever cap this run actually had: the run
+    # option, or the one `compose` built from the spec's knobs (#1166).
+    cap = limit if limit is not None else getattr(comp, "call_limit", None)
+    detail = cap.detail() if cap is not None else None
     rd.update_status(
         state="failed" if result.error else "done", finished=time.time(),
-        stop_reason=result.stop_reason, error=result.error,
+        stop_reason=result.stop_reason, stop_detail=detail, error=result.error,
         best_reward=max(best) if best else final,
         last_reward=final, initial_reward=initial,
         test_reward=_finite_or_none(getattr(result, "test_reward", None)),

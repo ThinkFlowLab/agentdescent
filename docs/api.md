@@ -246,6 +246,7 @@ evolve(
     max_rollouts: Optional[int] = None,
     max_calls: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    call_limit: Optional['CallLimit'] = None,
     stop_on_diminishing_returns: bool = False,
     efficiency_floor: float = 0.25,
     call_budget: Optional['CallBudget'] = None,
@@ -313,6 +314,7 @@ evolve(
 | `max_rollouts` | `Optional[int]` | `None` | The budget in the two units a comparison has to hold fixed: rollouts completed, and actor invocations (`run` + `propose`). `rounds` is not one of them -- configurations differ in how much model a round buys, so a budget fixed in rounds hands the wider configuration more model and then reports the extra model as a win for parallelism. Either bound stops the run with `stop_reason` `"max_rollouts"` / `"max_calls"`. **Checked at the round barrier, so a run overshoots by up to one round.** A round is dispatched or it is not; stopping halfway would leave a half-merged round, and the states a comparison compares are the ones a merge produced. So a budget is a *bound on where to stop*, never the number to compare on: read the spend the run actually reported (`result.rollouts`, `result.usage.calls`), which is what `baselines` does -- it refuses to call two arms equal-budget when their measured spends differ. The async path has no barrier and enforces both per rollout, so it overshoots by at most the rollouts already in flight. |
 | `max_calls` | `Optional[int]` | `None` | As `max_rollouts`. |
 | `max_tokens` | `Optional[int]` | `None` | Hard cap on total tokens consumed (`prompt_tokens + completion_tokens`). A reasoning model can spend 40k tokens on hidden thinking in one call, so `max_calls` and `max_rollouts` do not bound cost: a 20-round run with 4 workers is 80 rollouts and ~160 model calls, but at 40k tokens each that is 6.4M tokens -- the bill, not the count, is what a deployment needs to control. Checked at the round barrier alongside the other budgets; the async path checks per-rollout for tighter control. Stops with `stop_reason="max_tokens"`. `None` (default) means unbounded. |
+| `call_limit` | `Optional['CallLimit']` | `None` |  |
 | `stop_on_diminishing_returns` | `bool` | `False` | Stop when the run's own return per token has fallen off its peak by more than `efficiency_floor`. The economic rule: keep buying compute while it pays, stop when it does not -- *even with budget left*. Off by default, because a run whose reward only rises late would be cut short by it, and because it needs `max_tokens` (return per token needs a cost to divide by). Stops with `stop_reason="diminishing_returns"`. |
 | `efficiency_floor` | `float` | `0.25` | How far below the peak counts as diminishing, when the stop above is on. Self-calibrating against the run's own best rate, so it is a *ratio*, not an absolute quantity: a reward is in `[0, 1]` and a token count is in the millions, and their quotient has no interpretable scale. |
 | `call_budget` | `Optional['CallBudget']` | `None` | An adaptive per-call thinking budget (o1-style test-time scaling). Pass a `CallBudget` whose `base` matches the adapter's configured `max_tokens`, and the engine adjusts the per-call ceiling based on each parent's score and the remaining budget — promising parents get more thinking, dead-end ones get less, and the allocation tightens as the token budget is spent. The adapter must be wrapped with `budgeted_completion` for this to reach it. `None` (default) means the per-call ceiling is the adapter's own and never changes. |
@@ -4878,6 +4880,7 @@ BudgetSettings(
     max_rollouts: Optional[int] = None,
     max_calls: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    call_limit: Optional['CallLimit'] = None,
     stop_on_diminishing_returns: bool = False,
     efficiency_floor: float = 0.25,
     call_budget: Optional['CallBudget'] = None,

@@ -47,6 +47,7 @@ from __future__ import annotations
 import csv
 import difflib
 import json
+import math
 import os
 import shlex
 from dataclasses import dataclass, field, asdict, replace
@@ -746,6 +747,9 @@ class Composition:
     #: Resolved runner layout for directory kinds (``claude_skill``,
     #: ``skill_library``, …). ``None`` for ``text`` / ``policy_slot``.
     layout: Optional[str] = None
+    #: The run-level call cap this composition carries (#1166), so the run store
+    #: can name the limit that fired without re-reading the spec.
+    call_limit: Optional[Any] = None
 
     def run(self) -> EvolutionResult:
         return evolve(self.tasks, self.reward, **self.kwargs)
@@ -1079,6 +1083,77 @@ _JSON_ANNOTATION_NAMES = frozenset({
 #: field is the place for them.
 _EVOLVE_OBJECT_KNOBS_HANDLED = frozenset({"agg_config"})
 
+#: Spec knobs ``compose`` consumes itself into the run-level call cap (#1166):
+#: ``max_usd`` is a dollar cap and ``usd_per_call`` its price, and neither is an
+#: ``evolve()`` parameter. ``max_calls`` is *not* here -- ``evolve`` already
+#: takes it as the round-barrier budget, and the same number is also enforced per
+#: call, which can only be stricter.
+_COMPOSE_ONLY_KNOBS = frozenset({"max_usd", "usd_per_call"})
+
+
+def _cap_value(field: str, value: Any, *, integer: bool) -> float:
+    """One validated cap, refusing anything that is not a non-negative number.
+
+    ``0`` is a limit, not an absence (#1166): it means "no calls" / "no spend".
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        kind = "integer" if integer else "number"
+        raise SpecError(
+            f"{field}: must be a non-negative {kind}, got {value!r}")
+    if integer and int(value) != value:
+        raise SpecError(
+            f"{field}: must be a non-negative integer, got {value!r}")
+    if not math.isfinite(float(value)) or float(value) < 0:
+        raise SpecError(
+            f"{field}: must be a non-negative {'integer' if integer else 'number'}, "
+            f"got {value!r}")
+    return int(value) if integer else float(value)
+
+
+def build_call_limit(max_calls: Any = None, max_usd: Any = None,
+                     usd_per_call: Any = None) -> Optional["CallLimit"]:
+    """A validated run-level call cap, or ``None`` when neither limit is set.
+
+    Shared by ``compose`` (spec knobs) and the run store / CLI (run options), so
+    the refusal reads the same wherever the number was typed (#1166).
+    """
+    from .budget import CallLimit
+
+    if max_calls is None and max_usd is None:
+        return None
+    limit = CallLimit(
+        max_calls=(None if max_calls is None
+                   else _cap_value("max_calls", max_calls, integer=True)),
+        max_usd=(None if max_usd is None
+                 else _cap_value("max_usd", max_usd, integer=False)),
+        usd_per_call=(None if usd_per_call is None
+                      else _cap_value("usd_per_call", usd_per_call, integer=False)))
+    if limit.max_usd is not None and not limit.usd_per_call:
+        raise SpecError(
+            "max_usd needs usd_per_call: a dollar cap cannot be charged without "
+            "a per-call price (pass --usd-per-call on the command line)")
+    return limit
+
+
+def _limit_from_knobs(knobs: Dict[str, Any]) -> Optional["CallLimit"]:
+    """Build the run-level per-call cap a spec asked for, or ``None`` (#1166).
+
+    Pops the keys ``evolve()`` cannot take (``max_usd`` / ``usd_per_call``) and
+    leaves ``max_calls`` in place, so the barrier budget of the same name still
+    applies -- a per-call cap of N and a barrier cap of N cannot disagree.
+    """
+    limit = build_call_limit(
+        max_calls=(None if knobs.get("max_calls") is None
+                   else _cap_value("evolve.max_calls", knobs["max_calls"], integer=True)),
+        max_usd=(None if knobs.get("max_usd") is None
+                 else _cap_value("evolve.max_usd", knobs["max_usd"], integer=False)),
+        usd_per_call=(None if knobs.get("usd_per_call") is None
+                      else _cap_value("evolve.usd_per_call", knobs["usd_per_call"],
+                                      integer=False)))
+    knobs.pop("max_usd", None)
+    return limit
+
+
 
 def check_evolve_knobs(evolve_knobs: Mapping[str, Any]) -> None:
     """Refuse a ``spec.evolve`` entry that ``evolve()`` could not use as given.
@@ -1101,6 +1176,11 @@ def check_evolve_knobs(evolve_knobs: Mapping[str, Any]) -> None:
     params = inspect.signature(evolve).parameters
     for key, value in evolve_knobs.items():
         param = params.get(key)
+        if param is None and key in _COMPOSE_ONLY_KNOBS:
+            # Consumed by `compose` into the run-level call cap (#1166); they are
+            # not evolve() kwargs, so a spec may carry them and they are popped
+            # before the pass-through.
+            continue
         if param is None:
             raise SpecError(
                 f"evolve.{key}: evolve() has no such parameter; valid JSON knobs are "
@@ -1390,6 +1470,12 @@ def compose(spec: EvolveSpec, *, usage: Optional[Usage] = None,
     # -- knobs: kind defaults < spec.evolve < caller overrides ------------------
     knobs: Dict[str, Any] = {**defaults, **(ov.knobs if ov else {}),
                              **_evolve_pass_through(spec.evolve), **overrides}
+    # A run-level call cap, from `max_calls` / `max_usd` (+ `usd_per_call`) or
+    # from a caller's own CallLimit. Validated here, where `plan` also reaches,
+    # so a negative or non-numeric cap is refused before a run directory exists.
+    limit = _limit_from_knobs(knobs)
+    if limit is not None:
+        knobs.setdefault("call_limit", limit)
     # kind=text defaults to SeededAppendRules above; a card (gepa/ace/dgm/
     # skillopt) or compose(strategy=...) puts "strategy" in knobs and then
     # overwrites that default. Don't also claim SeededAppendRules (#879).
@@ -1479,7 +1565,8 @@ def compose(spec: EvolveSpec, *, usage: Optional[Usage] = None,
     return Composition(tasks=tasks, reward=reward, kwargs=kwargs, tree=tree,
                        notes=notes, audit=audit,
                        algorithm=_algorithm_echo(chosen, spec, ov) if chosen else None,
-                       layout=resolved_layout)
+                       layout=resolved_layout,
+                       call_limit=kwargs.get("call_limit"))
 
 
 def run_spec(spec: EvolveSpec, **hooks: Any) -> EvolutionResult:

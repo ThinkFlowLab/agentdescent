@@ -60,7 +60,7 @@ from .sampling import RoundRobin, TaskSampler
 from .selection import SingleHead
 from .scheduler import AuditScheduler
 from .staleness import StalenessPolicy
-from .budget import BudgetGovernor, CallBudget
+from .budget import BudgetGovernor, BudgetStop, CallBudget
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +673,8 @@ class _Runtime:
                     return value
                 except ContractError:
                     raise            # a caller bug: retrying cannot help
+                except BudgetStop:
+                    raise            # a budget refusal: retrying cannot help either
                 except Exception:  # noqa: BLE001 - a backend transient
                     if attempt == self.ATTEMPTS - 1:
                         raise
@@ -2563,7 +2565,8 @@ def _build_engine(tasks, reward, *, agent, run, propose, strategy, initial_state
                   contract: Optional[Contract] = None,
                   extra_artifacts: Optional[Dict[str, "EvolvingArtifact"]] = None,
                   population_islands: int = 0,
-                  test_frac: float = 0.0) -> _Engine:
+                  test_frac: float = 0.0,
+                  call_limit: Optional[Any] = None) -> _Engine:
     """Wire the ledger, runtime, verifier and aggregator (shared by
     :func:`evolve` and :func:`~agentdescent.async_evolve.async_evolve`)."""
     import tempfile
@@ -2692,8 +2695,8 @@ def _build_engine(tasks, reward, *, agent, run, propose, strategy, initial_state
     if usage is None:
         usage = getattr(agent, "usage", None)
     meter = Meter(usage=usage) if usage is not None else Meter()
-    run, propose = (measured(run, meter, phase="run"),
-                    measured(propose, meter, phase="propose"))
+    run, propose = (measured(run, meter, phase="run", guard=call_limit),
+                    measured(propose, meter, phase="propose", guard=call_limit))
 
     cache = (policies_bundle.eval_cache if policies_bundle is not None
              and policies_bundle.eval_cache is not None else MemoryCache(meter))
@@ -3140,6 +3143,10 @@ def _score_seed_held_out(artifact: "EvolvingArtifact", held_out: Sequence) -> Op
         return float(artifact.score(held_out))
     except ContractError:
         raise
+    except BudgetStop:
+        # Not a diagnostic failure: the call was refused by the run-level
+        # budget, and the caller ends the run with a named stop (#1166).
+        raise
     except Exception:  # noqa: BLE001 - seed score is diagnostic, not a stop reason
         return None
 
@@ -3182,6 +3189,13 @@ def evolve(
     #: Checked at the round barrier alongside the other budgets; the run stops
     #: with ``stop_reason="max_tokens"`` and reports the spend it incurred.
     max_tokens: Optional[int] = None,
+    #: Per-call cap, checked **before** every model call (#1166). Unlike
+    #: ``max_calls`` above -- a round-barrier budget that overshoots by up to a
+    #: round -- this refuses the call itself, so ``CallLimit(max_calls=1)``
+    #: means one call. The refusal unwinds the round through
+    #: :class:`~agentdescent.budget.BudgetStop` and the run ends with
+    #: ``stop_reason="budget"``. Built by the run store; inert when ``None``.
+    call_limit: Optional["CallLimit"] = None,
     #: Stop when the run's *measured* return per token has fallen off its own
     #: peak by more than ``efficiency_floor`` (see
     #: :meth:`~agentdescent.budget.BudgetGovernor.diminishing_returns`). The
@@ -3768,7 +3782,7 @@ def evolve(
     _budget = resolve_budget(
         budget,
         max_seconds=max_seconds, max_rollouts=max_rollouts, max_calls=max_calls,
-        max_tokens=max_tokens,
+        max_tokens=max_tokens, call_limit=call_limit,
         stop_on_diminishing_returns=stop_on_diminishing_returns,
         efficiency_floor=efficiency_floor, call_budget=call_budget,
         target_reward=target_reward, patience=patience,
@@ -3798,6 +3812,7 @@ def evolve(
     max_rollouts = _budget.max_rollouts
     max_calls = _budget.max_calls
     max_tokens = _budget.max_tokens
+    call_limit = _budget.call_limit
     stop_on_diminishing_returns = _budget.stop_on_diminishing_returns
     efficiency_floor = _budget.efficiency_floor
     call_budget = _budget.call_budget
@@ -3987,7 +4002,7 @@ def evolve(
         allocator=allocator, record_trajectories=record_trajectories,
         trajectory_store=trajectory_store, contract=contract,
         extra_artifacts=extra_artifacts,
-        population_islands=population_islands)
+        population_islands=population_islands, call_limit=call_limit)
     # Start the clock after the wiring, before the first unit of work: setup
     # is not what a time-to-quality number is asking about.
     eng.meter.start()
@@ -4014,7 +4029,17 @@ def evolve(
         seed_art = EvolvingArtifact(
             artifact_id, dict(initial_state or strategy.initial()),
             blast_radius=blast_radius, runtime=eng.runtime, strategy=strategy)
-    initial_reward = _score_seed_held_out(seed_art, held_out)
+    #: A run-level budget refusal (#1166). Its own box, for the same reason as
+    #: `contract_error` below: a worker thread cannot propagate, and it must not
+    #: be folded into `first_error` -- a cap is a clean stop, not a backend fail.
+    budget_stop: List[Optional[BudgetStop]] = [None]
+    try:
+        initial_reward = _score_seed_held_out(seed_art, held_out)
+    except BudgetStop as e:
+        # The seed score is the run's first call: a zero-call cap refuses it
+        # here, before any round is dispatched (#1166).
+        budget_stop[0] = e
+        initial_reward = None
     straggler_rounds = 0
     # Shared with the barrier-free loop: the same two questions, the same
     # tracker, and now the same epsilon (they had two).
@@ -4053,6 +4078,13 @@ def evolve(
                               efficiency_floor=efficiency_floor,
                               allocator=allocator)
     for r in range(rounds):
+        # The seed score already spent the cap (e.g. `max_calls=0`): nothing is
+        # dispatched, and the run closes with the named stop (#1166).
+        if budget_stop[0] is not None:
+            stop_reason = "budget"
+            if verbose:
+                print(f"round {r:>3}  stopping: {budget_stop[0].detail()}")
+            break
         if deadline is not None and time.time() >= deadline:
             stop_reason = "max_seconds"
             if verbose:
@@ -4219,6 +4251,16 @@ def evolve(
                 # main thread by hand -- an exception raised in a plain worker thread
                 # goes to the thread excepthook and is lost, not propagated.
                 contract_error.record(e)          # its own lock; first one wins
+            except BudgetStop as e:
+                # A run-level cap refused this call (#1166). Not a worker
+                # failure: it must not touch `first_error` or `failed_units`, or
+                # the run would end `failed` with an error instead of a named
+                # budget stop.
+                with unit_lock:
+                    if budget_stop[0] is None:
+                        budget_stop[0] = e
+                if verbose:
+                    print(f"round {r:>3}  stopping: {e.detail()}")
             except Exception as e:  # noqa: BLE001 - a backend failure
                 with unit_lock:
                     if first_error[0] is None:
@@ -4319,6 +4361,10 @@ def evolve(
             try:
                 raw_proposal = propose(mine.render(), task, output, score)
             except ContractError:
+                raise
+            except BudgetStop:
+                # A budget refusal is the run's stop, not this worker's bad
+                # propose (#1166): it goes up to `_run_unit`'s named handler.
                 raise
             except Exception as e:  # noqa: BLE001 - a reflector/backend failure
                 with unit_lock:
@@ -4484,6 +4530,16 @@ def evolve(
             # read: a broken contract makes the round meaningless.
             contract_error.raise_if_set()
 
+            # A run-level cap made its refusal inside a worker (#1166). The
+            # round has nothing left to merge, so it closes here: no partial
+            # merge, no worker-failure tally, and the run ends with the named
+            # budget stop rather than an error.
+            if budget_stop[0] is not None:
+                stop_reason = "budget"
+                if verbose:
+                    print(f"round {r:>3}  stopping: {budget_stop[0].detail()}")
+                break
+
             # Decide on the round's tally rather than on the first exception. The
             # same global signal the async path uses: while NO worker has ever
             # completed a rollout, repeated total failure means the backend is
@@ -4509,6 +4565,17 @@ def evolve(
                 reports = check_reports(_step(aggregator, n_workers), aggregator)
         except ContractError:
             raise            # a caller-contract violation: the run is meaningless
+        except BudgetStop as e:
+            # The cap tripped on this thread -- a merge-side or held-out call
+            # the workers did not make (#1166). Same clean stop as the worker
+            # path: named reason, no error, no traceback.
+            with unit_lock:
+                if budget_stop[0] is None:
+                    budget_stop[0] = e
+            stop_reason = "budget"
+            if verbose:
+                print(f"round {r:>3}  stopping: {e.detail()}")
+            break
         except Exception as e:  # noqa: BLE001 - a rollout backend failure (e.g. an
             # API/credit error) shouldn't lose the run: stop and return partial results.
             run_error = _describe(e)
@@ -4539,16 +4606,30 @@ def evolve(
         # Part of the barrier too: the workers for the next round cannot start
         # until this measurement lands, retries and backoff included.
         with eng.meter.timed("merge_seconds"), eng.meter.timed("merge_gate_seconds"):
-            for attempt in range(3):
-                try:
-                    round_reward = dev.score(held_out)
-                    break
-                except ContractError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    score_error = e
-                    if attempt < 2:
-                        time.sleep(0.2 * (attempt + 1))
+            try:
+                for attempt in range(3):
+                    try:
+                        round_reward = dev.score(held_out)
+                        break
+                    except ContractError:
+                        raise
+                    except BudgetStop:
+                        # A cap, not a bad measurement: retrying would be refused
+                        # again, and sleeping on it delays the stop (#1166).
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        score_error = e
+                        if attempt < 2:
+                            time.sleep(0.2 * (attempt + 1))
+            except BudgetStop as e:
+                # The held-out measurement is the round's last spend; the cap
+                # fired on it, so the run ends here with the named stop.
+                if budget_stop[0] is None:
+                    budget_stop[0] = e
+                stop_reason = "budget"
+                if verbose:
+                    print(f"round {r:>3}  stopping: {e.detail()}")
+                break
         if round_reward is None:
             e = score_error
             if first_error[0] is None:
@@ -4638,6 +4719,13 @@ def evolve(
         final_reward = final.score(held_out)
     except ContractError:
         raise
+    except BudgetStop as e:
+        # The cap refused the closing measurement (#1166): report the last
+        # round's reward, which is a measurement the run actually paid for.
+        if budget_stop[0] is None:
+            budget_stop[0] = e
+        stop_reason = "budget"
+        final_reward = history[-1].held_out_reward if history else 0.0
     except Exception as e:  # noqa: BLE001 - report, keep the partial result
         run_error = run_error or _describe(e)
         final_reward = history[-1].held_out_reward if history else 0.0
@@ -4649,6 +4737,13 @@ def evolve(
     if eng.test:
         try:
             test_reward = float(final.score(eng.test))
+        except BudgetStop as e:
+            # Same cap, on the closing test sweep: it stays a budget stop with
+            # a missing test score rather than becoming a crash (#1166).
+            if budget_stop[0] is None:
+                budget_stop[0] = e
+            stop_reason = "budget"
+            test_reward = None
         except Exception:  # noqa: BLE001 - a missing test score is not a crash
             test_reward = None
     if run_error:

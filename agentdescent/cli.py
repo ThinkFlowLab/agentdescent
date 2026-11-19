@@ -53,8 +53,8 @@ from . import runstore
 from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_path,
                         reward_set_line)
 from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
-                         compose, estimate, fold_kind, load_spec, resolve_kind,
-                         _POLICY_SLOTS)
+                         build_call_limit, compose, estimate, fold_kind, load_spec,
+                         resolve_kind, _POLICY_SLOTS)
 
 __all__ = ["main", "doctor_report", "starter_spec"]
 
@@ -78,6 +78,10 @@ def _version() -> str:
             return "unknown"
 
 #: Set in every worker's environment by the plugin runner and the MCP server so a
+#: The `stop_reason` a run-level call cap writes (#1166): the budget fired, and
+#: `stop_detail` names which limit and what it observed.
+BUDGET_STOP = "budget"
+
 #: host that is itself being evolved cannot start a nested run. See docs/plugins.md.
 NESTED_ENV = "AGENTDESCENT_NESTED"
 
@@ -175,6 +179,11 @@ def _status_line(st: runstore.RunStatus) -> str:
         ph = f" phase={st.phase}" if st.phase else ""
         pending = f" pending={st.pending_calls}{ph}"
     tail = f" [{st.stop_reason}]" if st.stop_reason else ""
+    # Which limit fired and what it cost, on the same line: a reader asking
+    # "why did my run stop" should not have to open `status.json` (#1166).
+    if st.stop_detail:
+        tail = (f" [{st.stop_reason}: {st.stop_detail}]" if st.stop_reason
+                else f" [{st.stop_detail}]")
     err = f" error: {st.error}" if st.error else ""
     # Reflector exceptions, cumulative (#395): a run can finish `done` with only
     # these to say that it never learned anything.
@@ -2712,6 +2721,14 @@ def cmd_evolve(a: argparse.Namespace) -> int:
     # Before create/launch: a missing --usd-per-call must not leave an orphan run
     # whose status later reads as "process ended without reporting" (#342).
     runstore.require_budget_pair(a.budget, a.usd_per_call)
+    # The run-level cap (#1166): refused here, before a run directory exists,
+    # with the field and the value named -- a bad flag is not a live run.
+    try:
+        build_call_limit(max_calls=getattr(a, "max_calls", None),
+                         max_usd=getattr(a, "max_usd", None),
+                         usd_per_call=a.usd_per_call)
+    except SpecError as e:
+        return _spec_error(a, e)
     # Same gate as plan / MCP start: missing CLI binary must not report started (#346).
     require_cli_on_path(spec)
     _warn_unusable(spec)
@@ -2721,7 +2738,9 @@ def cmd_evolve(a: argparse.Namespace) -> int:
         # The child composes again and rewrites `notes`, but only once it is up;
         # recording them here means `status` has them from the first poll (#414).
         rd.update_status(notes=comp.notes)
-        st = runstore.launch(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call)
+        st = runstore.launch(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call,
+                             max_calls=getattr(a, "max_calls", None),
+                             max_usd=getattr(a, "max_usd", None))
         if not a.json:
             for line in comp.notes:
                 print(f"note: {line}", file=sys.stderr)
@@ -2730,7 +2749,9 @@ def cmd_evolve(a: argparse.Namespace) -> int:
              if a.json else f"{rd.run_id}  started (pid {st.pid})  {rd.path}", as_json=a.json)
         return 0
     try:
-        result = runstore.execute(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call)
+        result = runstore.execute(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call,
+                                  max_calls=getattr(a, "max_calls", None),
+                                  max_usd=getattr(a, "max_usd", None))
     except Exception as e:  # noqa: BLE001 - not BaseException: Ctrl-C stays loud
         return _run_failed(a, rd, e)
     st = rd.status()
@@ -2795,7 +2816,9 @@ def _run_failed(a: argparse.Namespace, rd: "runstore.RunDir", e: Exception) -> i
 def cmd_run(a: argparse.Namespace) -> int:
     """The body of a detached run; not for people."""
     rd = runstore.RunDir(a.run_dir)
-    result = runstore.execute(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call)
+    result = runstore.execute(rd, budget_usd=a.budget, usd_per_call=a.usd_per_call,
+                              max_calls=getattr(a, "max_calls", None),
+                              max_usd=getattr(a, "max_usd", None))
     return 0 if result.error is None else 1
 
 
@@ -6135,6 +6158,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--detach", action="store_true", help="return at once; poll with status")
     s.add_argument("--budget", type=float, help="stop after this many dollars (needs --usd-per-call)")
     s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.add_argument("--max-calls", type=int, dest="max_calls", default=None,
+                   help=f"stop before the call that would exceed this many model "
+                        f"calls; the run ends 'done' with stop_reason={BUDGET_STOP} "
+                        f"(0 means no calls; exit code 0)")
+    s.add_argument("--max-usd", type=float, dest="max_usd", default=None,
+                   help="stop before the call that would exceed this many dollars "
+                        "(needs --usd-per-call)")
     s.set_defaults(fn=cmd_evolve)
 
     # The detached worker `evolve --detach` spawns (runstore: `python -m
@@ -6148,6 +6178,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--run-dir", required=True, dest="run_dir")
     s.add_argument("--budget", type=float)
     s.add_argument("--usd-per-call", type=float, dest="usd_per_call")
+    s.add_argument("--max-calls", type=int, dest="max_calls", default=None)
+    s.add_argument("--max-usd", type=float, dest="max_usd", default=None)
     s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("status", help="one run, or all of them")

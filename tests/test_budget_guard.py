@@ -12,6 +12,9 @@ from a counting factory in this module, so every model call is one entry in
 
 from __future__ import annotations
 
+import json
+import pathlib
+
 import pytest
 
 from agentdescent import runstore
@@ -105,3 +108,17 @@ def test_zero_is_a_limit_not_an_absence(tmp_path):
     assert CALLS == [], f"a zero-call budget made {len(CALLS)} calls"
     assert st.stop_reason == "budget", st
     assert "max_calls" in (st.stop_detail or ""), st.stop_detail
+
+
+def test_status_json_keeps_its_shape_when_no_cap_is_set(tmp_path):
+    """No cap, no new key: a reader of yesterday's file sees yesterday's file."""
+    rd, st, _ = _run(tmp_path)
+    payload = json.loads((pathlib.Path(rd.path) / "status.json").read_text())
+    assert "stop_detail" not in payload, payload
+
+
+def test_status_json_carries_the_limit_that_fired(tmp_path):
+    rd, st, _ = _run(tmp_path, max_calls=1)
+    payload = json.loads((pathlib.Path(rd.path) / "status.json").read_text())
+    assert payload["stop_reason"] == "budget", payload
+    assert "max_calls" in payload["stop_detail"], payload

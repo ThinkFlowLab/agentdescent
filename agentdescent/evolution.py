@@ -3527,6 +3527,16 @@ def evolve(
         other budgets; the async path checks per-rollout for tighter control.
         Stops with ``stop_reason="max_tokens"``. ``None`` (default) means
         unbounded.
+    call_limit:
+        A :class:`~agentdescent.budget.CallLimit` charged **before** each model
+        call: calls and dollars (at a per-call price) are reserved up front, so
+        the call that would cross the cap is never made. Different from
+        ``max_calls`` above, which is a round barrier that lets a wide round
+        overshoot. The refusal unwinds the round without a partial merge, and
+        the run stops with ``stop_reason="budget"``; the run store writes which
+        limit fired and what it observed into ``status.json``. Built by the run
+        store from ``--max-calls`` / ``--max-usd`` (or a spec's ``evolve``
+        knobs); ``None`` (default) is the run exactly as it was.
     stop_on_diminishing_returns:
         Stop when the run's own return per token has fallen off its peak by more
         than ``efficiency_floor``. The economic rule: keep buying compute while

@@ -6913,8 +6913,14 @@ def _register_commands(mount: "_CommandMount", *, with_lab: bool) -> None:
     if with_lab:
         lab = sub.add_parser("lab", help="every other verb, grouped; "
                                          "`lab <verb>` runs it unchanged")
-        _register_commands(_CommandMount(lab.add_subparsers(dest="lab_cmd", required=True),
-                                         listed=True), with_lab=False)
+        lab_sub = lab.add_subparsers(dest="lab_cmd", required=True)
+        _register_commands(_CommandMount(lab_sub, listed=True), with_lab=False)
+        # Same #420 contract as the top-level usage line: `run` is the
+        # detached worker, not a user verb, so it must not appear in the
+        # `{...}` metavar. Help already omits its line; choose-from already
+        # strips it via _visible_choices. The verb still parses (#1171).
+        lab_sub.metavar = "{" + ",".join(
+            n for n in lab_sub.choices if n not in _INTERNAL_COMMANDS) + "}"
 
     s = sub.add_parser("mcp", help="serve the tools over MCP (stdio by default; needs agentdescent[mcp])")
     s.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio",

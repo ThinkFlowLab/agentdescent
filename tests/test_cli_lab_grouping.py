@@ -46,9 +46,9 @@ def _listed_verbs(text):
     return re.findall(r"^    ([a-z][a-z_-]*)\s{2,}\S", text, re.M)
 
 
-#: What a first run needs, in the order argparse lists them (registration order).
+#: What a first run needs, in the order argparse lists them (Path A order).
 DEFAULT_SURFACE = [
-    "demo", "init", "plan", "evolve", "status", "show", "apply", "doctor",
+    "demo", "init", "plan", "evolve", "show", "apply", "doctor", "status",
     "lab", "mcp",
 ]
 

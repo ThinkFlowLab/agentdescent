@@ -125,6 +125,16 @@ class CallLimit:
             self._taken = n
 
     @property
+    def stop(self) -> Optional[BudgetStop]:
+        """The refusal this limit already made, or ``None`` (#1166).
+
+        The refusal is raised inside a worker and caught somewhere else, so the
+        object recorded here is what a later handler re-raises: the numbers
+        survive the trip instead of being rebuilt from a message.
+        """
+        return self._stopped
+
+    @property
     def calls(self) -> int:
         """Calls this limit has admitted so far."""
         return self._taken

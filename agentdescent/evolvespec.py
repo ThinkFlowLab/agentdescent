@@ -1151,6 +1151,7 @@ def _limit_from_knobs(knobs: Dict[str, Any]) -> Optional["CallLimit"]:
                       else _cap_value("evolve.usd_per_call", knobs["usd_per_call"],
                                       integer=False)))
     knobs.pop("max_usd", None)
+    knobs.pop("usd_per_call", None)
     return limit
 
 

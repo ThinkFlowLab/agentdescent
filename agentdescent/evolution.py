@@ -1100,7 +1100,7 @@ def _spec_for(engine: "_Engine", artifact, task: Task,
         sandbox=engine.sandbox_spec or SandboxSpec())
 
 
-def _rollout_failure(outcome) -> BaseException:
+def _rollout_failure(outcome, limit=None) -> BaseException:
     """Turn a reported failure back into the exception the round body expects.
 
     The executor reports rather than raises, because one bad rollout is evidence
@@ -1108,6 +1108,13 @@ def _rollout_failure(outcome) -> BaseException:
     is written against exceptions -- and it distinguishes a caller's broken
     contract, which must stop the run, from a backend transient, which must not.
     That distinction is carried in `Result.kind`, so it survives the trip."""
+    if outcome.kind == "budget" and limit is not None:
+        # A cap refused the call inside this rollout (#1166). The refusal the
+        # limit recorded is re-raised as itself, so the round closes `done`
+        # with a named budget stop and the numbers it observed.
+        stop = limit.stop
+        if stop is not None:
+            return stop
     if outcome.kind == "caller":
         return ProposalContractError(outcome.error or "contract violation")
     return RuntimeError(outcome.error or "rollout failed")
@@ -3887,10 +3894,6 @@ def evolve(
              "the barrier-free runtime has no select/test split yet, so a run "
              "would report a select-set reward as if a test split had been "
              "measured -- run synchronously to get a test_reward (#843)"),
-            ("call_limit", call_limit,
-             "the barrier-free runtime has no per-call guard yet, so a cap "
-             "passed here would not be enforced -- run synchronously for "
-             "--max-calls / --max-usd (#1166)"),
         ):
             if value is not None:
                 warnings.warn(
@@ -4326,7 +4329,7 @@ def evolve(
             rendered = mine.render()
             outcome = eng.executor.rollout(_spec_for(eng, mine, task, rendered))
             if not outcome.ok:
-                raise _rollout_failure(outcome)
+                raise _rollout_failure(outcome, call_limit)
             output = outcome.output
             score = _checked_reward(outcome.reward, task)
             # Record the rollout before anything else can decide it does not

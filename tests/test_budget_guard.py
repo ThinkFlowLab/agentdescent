@@ -122,3 +122,52 @@ def test_status_json_carries_the_limit_that_fired(tmp_path):
     payload = json.loads((pathlib.Path(rd.path) / "status.json").read_text())
     assert payload["stop_reason"] == "budget", payload
     assert "max_calls" in payload["stop_detail"], payload
+
+
+def test_a_spec_level_dollar_cap_runs(tmp_path):
+    """``max_usd`` in a spec's ``evolve`` block is usable, not a ``TypeError``.
+
+    ``usd_per_call`` is compose-only like ``max_usd``: leaving it in the knob
+    dict handed it to ``evolve()``, which has no such parameter, so every valid
+    dollar cap died in round setup while the count cap worked.
+    """
+    spec = _spec(max_usd=0.015, usd_per_call=0.01)
+    comp = compose(spec)
+    assert "usd_per_call" not in comp.kwargs, comp.kwargs
+    rd, st, result = _run(tmp_path, spec=spec)
+    assert CALLS == ["agent"], CALLS
+    assert st.state == "done", st
+    assert st.error is None
+    assert st.stop_reason == "budget", st
+    assert "max_usd" in (st.stop_detail or ""), st.stop_detail
+
+
+def test_a_cap_that_trips_inside_a_rollout_ends_done(tmp_path):
+    """The refusal reaches the engine through a worker's rollout (#1166).
+
+    ``max_calls=2`` under four workers is refused while a rollout is in flight,
+    not at the seed score. The executor reports that refusal like any other
+    rollout outcome, and the run must still end ``done`` with the named budget
+    stop rather than ``failed`` on a ``RuntimeError``.
+    """
+    rd, st, result = _run(tmp_path, max_calls=2)
+    assert st.calls == 2, f"a capped run made {st.calls} calls"
+    assert st.state == "done", st
+    assert st.error is None, st.error
+    assert st.stop_reason == "budget", st
+    assert "max_calls" in (st.stop_detail or ""), st.stop_detail
+
+
+def test_a_dollar_cap_that_trips_inside_a_rollout_ends_done(tmp_path):
+    """The dollar cap, refused on the concurrent segment, not the serial one.
+
+    ``0.05`` at ``0.02``/call admits two calls and refuses the third while four
+    workers are in flight; ``0.05`` at ``0.01`` would admit five, and that
+    refusal lands in a serial propose, so it cannot tell the two paths apart.
+    """
+    rd, st, result = _run(tmp_path, max_usd=0.05, usd_per_call=0.02)
+    assert st.calls == 2, f"a capped run made {st.calls} calls"
+    assert st.state == "done", st
+    assert st.error is None, st.error
+    assert st.stop_reason == "budget", st
+    assert "max_usd" in (st.stop_detail or ""), st.stop_detail

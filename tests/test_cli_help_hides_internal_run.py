@@ -44,9 +44,13 @@ def test_help_and_usage_do_not_list_run():
 
 
 def test_every_public_verb_is_still_listed_in_order():
+    # Since #1112 the usage line lists the first-run surface only; the
+    # advanced verbs are hidden from it, not removed from the parser.
     verbs = _verbs_in_braces(cli.build_parser().format_usage())
-    public = [n for n in _subparsers_action().choices if n != "run"]
-    assert verbs == public
+    assert verbs == list(cli.DEFAULT_SURFACE)
+    hidden = [n for n in _subparsers_action().choices
+              if n not in cli.DEFAULT_SURFACE and n != "run"]
+    assert "campaign" in hidden and "snapshot" in hidden
 
 
 def test_every_listed_verb_has_a_help_line():

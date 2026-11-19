@@ -77,15 +77,6 @@ def test_closing_refs_reads_this_repository_only():
     assert c.closing_refs(body, REPO) == [12, 13, 14]
 
 
-def test_is_agent_pr():
-    cfg = dict(CONFIG, agentAuthors=["bot-x"])
-    assert c.is_agent_pr(pr(1, author="bot-x", same=False), cfg, REPO, set())
-    assert c.is_agent_pr(pr(1, head="agent/fix-3"), cfg, REPO, set())
-    assert not c.is_agent_pr(pr(1, head="agent/fix-3", same=False), cfg, REPO, set()), "fork: by author only"
-    assert c.is_agent_pr(pr(1, body="Fixes #7"), cfg, REPO, {7})
-    assert not c.is_agent_pr(pr(1, body="Fixes #8"), cfg, REPO, {7})
-
-
 def test_judge_ready():
     ok = issue(1, ["agent-ready"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-ready")])
     assert c.judge_ready(ok, CONFIG)["demote"] is None
@@ -117,11 +108,24 @@ def test_plan_issues():
     assert {"number": 4, "label": "*", "reason": "hold"} in out["skipped"]
 
 
-def test_plan_prs_get_one_risk_label_and_agent_pr_by_rule():
+def test_plan_prs_get_one_risk_label_and_nothing_else():
     out = run(prs=[pr(10, ["risk:T1", "risk:T3"], tier="T3"), pr(11, tier="T0", head="agent/x"),
                    pr(12, ["hold"], tier="T3"), pr(13, tier=None)])
     ops = {(o["number"], o["op"], o["label"]) for o in out["ops"]}
-    assert ops == {(10, "remove", "risk:T1"), (11, "add", "risk:T0"), (11, "add", "agent-pr")}
+    assert ops == {(10, "remove", "risk:T1"), (11, "add", "risk:T0")}
+
+
+def test_a_plan_never_adds_agent_pr_not_even_on_an_agent_branch():
+    """The owner banned ``agent-pr`` repo-wide and the sweep strips it, so the
+    controller must not put it back — whatever the author, the branch prefix or
+    the issue the PR closes (#1161)."""
+    closed = issue(7, ["agent-ready"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-ready")])
+    out = run(issues=[closed],
+              prs=[pr(11, tier="T0", head="agent/x"),
+                   pr(12, tier="T2", head="agent/fix-7", body="Fixes #7"),
+                   pr(13, tier="T1", head="feat/plain", author="bot-x")])
+    assert [o for o in out["ops"] if o["label"] == "agent-pr"] == []
+    assert "agent-pr" not in c.MANAGED["add"]
 
 
 def test_a_missing_label_is_skipped_never_created():
@@ -141,10 +145,12 @@ def test_plan_only_proposes_managed_labels_and_never_adds_agent_ready():
 
 @pytest.mark.parametrize("bad", [
     None, {}, {"version": 2, "ops": []},
-    {"version": 1, "ops": [{"number": 0, "op": "add", "label": "agent-pr", "reason": "agent-pr"}]},
-    {"version": 1, "ops": [{"number": True, "op": "add", "label": "agent-pr", "reason": "agent-pr"}]},
-    {"version": 1, "ops": [{"number": 1, "op": "close", "label": "agent-pr", "reason": "agent-pr"}]},
-    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "agent-ready", "reason": "agent-pr"}]},
+    {"version": 1, "ops": [{"number": 0, "op": "add", "label": "risk:T1", "reason": "risk-tier"}]},
+    {"version": 1, "ops": [{"number": True, "op": "add", "label": "risk:T1", "reason": "risk-tier"}]},
+    {"version": 1, "ops": [{"number": 1, "op": "close", "label": "risk:T1", "reason": "risk-tier"}]},
+    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "agent-ready", "reason": "risk-tier"}]},
+    # the banned label is refused even in a hand-written plan (#1161)
+    {"version": 1, "ops": [{"number": 1, "op": "add", "label": "agent-pr", "reason": "risk-tier"}]},
     {"version": 1, "ops": [{"number": 1, "op": "remove", "label": "hold", "reason": "risk-tier"}]},
     {"version": 1, "ops": [{"number": 1, "op": "add", "label": "risk:T0", "reason": "because"}]},
     {"version": 1, "ops": [{"number": 1, "op": "add", "label": "risk:T0", "reason": "risk-tier"}] * 201},
@@ -179,12 +185,12 @@ def test_apply_writes_only_label_endpoints_and_rechecks_the_state():
         {"number": 2, "op": "add", "label": "risk:T1", "reason": "risk-tier"},
         {"number": 3, "op": "remove", "label": "risk:T3", "reason": "risk-tier"},
         {"number": 4, "op": "remove", "label": "agent-working", "reason": "claim-expired"},
-        {"number": 5, "op": "add", "label": "agent-pr", "reason": "agent-pr"},
+        {"number": 5, "op": "add", "label": "risk:T1", "reason": "risk-tier"},
     ]
     api = FakeApi({1: {"state": "open", "labels": []}, 2: {"state": "closed", "labels": []},
                    3: {"state": "open", "labels": [{"name": "risk:T3"}, {"name": "hold"}]},
                    4: {"state": "open", "labels": [{"name": "agent-working"}]},
-                   5: {"state": "open", "labels": [{"name": "agent-pr"}]}})
+                   5: {"state": "open", "labels": [{"name": "risk:T1"}]}})
     out = c.apply({"version": 1, "ops": ops}, api, REPO)
     assert [o["number"] for o in out["done"]] == [1, 4]
     assert {s["number"]: s["why"] for s in out["skipped"]} == {2: "closed", 3: "hold", 5: "already"}

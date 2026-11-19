@@ -48,7 +48,7 @@ never write the key anywhere.
 
 - Push the branch (never `main`, never `--force`), open the PR with the
   template: imperative title, `Fixes #N`, short body, `Tip SHA:` / `Ran:` /
-  `Not run:`. Assign `Birfy`; labels `agent-pr` + type + area.
+  `Not run:`. Assign `Birfy`; labels type + area (never `agent-pr`: retired, #1161).
 - Tier: `python3 .github/scripts/risk_gate.py --pr <n>`.
 
 ## 5. Review at the tip

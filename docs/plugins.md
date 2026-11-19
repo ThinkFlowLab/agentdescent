@@ -245,7 +245,7 @@ The skill file teaches the host model one procedure, and the tool surface
 enforces its shape:
 
 ```
-doctor  →  write a spec  →  plan (show the user)  →  start  →  status (once a round)  →  show  →  ask  →  apply
+doctor  →  write a spec  →  plan (show the user; --probe on a first model)  →  start  →  status (once a round)  →  show  →  ask  →  apply
 ```
 
 That loop is **Path A** — the default MCP tool listing and the verbs to teach a
@@ -258,6 +258,12 @@ all ~39 tools as the primary path.
   the data and builds the policy bundle without running anything, then returns
   the composed `evolve()` arguments and an upper bound on agent calls. A wrong
   field fails here, by name, not in round one of a background process.
+* **The probe is on `plan`, for both surfaces.** `plan --probe` (CLI) and
+  `plan(spec, probe=true)` (MCP) send one minimal call per model-backed agent,
+  through the same adapter the run would use, so an expired subscription or a
+  wrong model name is answered before a run store entry exists. A refusal sets
+  `ok: false` and `next` to the repair action, never to `start`; the default
+  `probe` is off, and plain `plan` still sends nothing.
 * **`start` returns in under a second.** The run is a detached process; the host
   polls `status`. MCP tool calls time out and hosts restart their servers
   between sessions, so nothing blocks on `evolve()`.

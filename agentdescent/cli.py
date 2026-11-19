@@ -55,6 +55,7 @@ from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_p
 from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
                          compose, estimate, fold_kind, load_spec, resolve_kind,
                          _POLICY_SLOTS)
+from .probe import first_failed_next
 
 __all__ = ["main", "doctor_report", "starter_spec"]
 
@@ -2406,12 +2407,6 @@ def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
     return line
 
 
-def _first_failed_probe_next(probe: Mapping[str, Any]) -> str:
-    """The repair action from the first refused probe row (#1093)."""
-    for row in probe.get("rows") or []:
-        if row.get("state") == "failed" and row.get("next"):
-            return str(row["next"])
-    return "run `agentdescent doctor`, then re-run plan --probe"
 
 
 def _print_plan(payload: Dict[str, Any], *, spec_path: str,
@@ -2579,7 +2574,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
         payload["probe"] = probe
         payload["ready"] = bool(probe.get("ok", True))
         if not payload["ready"]:
-            next_line = _first_failed_probe_next(probe)
+            next_line = first_failed_next(probe)
             payload["next"] = next_line
             then_line = f"agentdescent plan {a.spec} --probe"
     # `--baseline-sample` spends real calls, so it runs last: a broken spec or a
@@ -4837,7 +4832,7 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
         # follow it into a run that cannot work (#1093).
         obj["ready"] = bool(probe.get("ok", True))
         if not obj["ready"]:
-            obj["next"] = _first_failed_probe_next(probe)
+            obj["next"] = first_failed_next(probe)
             then_line = f"agentdescent plan {obj['spec_path']} --probe"
     if as_json:
         # Exactly one JSON object on stdout for success and error (#674).

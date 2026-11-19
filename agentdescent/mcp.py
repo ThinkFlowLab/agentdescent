@@ -159,8 +159,11 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "upper bound on agent calls per round and in total, and notes. Pass budget_usd "
         "with usd_per_call to hear when the seed+one-round bound already exceeds the "
         "budget (budget is only checked between rounds). When the spec has an "
-        "`algorithm`, the resolved name/params are echoed. Show the user the spec and "
-        "the estimate and get a yes before calling start."),
+        "`algorithm`, the resolved name/params are echoed. Pass probe=true to send "
+        "one minimal call per model-backed agent (the same preflight as "
+        "`plan --probe`); a refusal returns `probe` and makes this object `ok: false` "
+        "with `next` naming the fix, so do not call start then. Show the user the "
+        "spec and the estimate and get a yes before calling start."),
     "start": (
         "Start an evolution run in the background and return its run_id at once. The run "
         "is a detached process; poll `status` about once per round (not more often) and "
@@ -397,6 +400,26 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "the server reads any trace path it is given, like the other read-only path "
         "tools."),
 }
+
+
+def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
+    """Add the #1048 preflight to a successful ``plan`` when asked (#1094).
+
+    The body is the same ``probe_payload`` the CLI's ``plan --probe`` runs, so
+    a host gets the same rows and the same repair sentence instead of a second
+    implementation. A refusal makes the plan itself ``ok: false`` and replaces
+    ``next`` with that repair: a host following ``next`` must not start a run
+    that cannot work. ``probe`` is added only when the caller asked for it --
+    plain ``plan`` stays the free call that sends nothing.
+    """
+    from .probe import first_failed_next, probe_payload
+
+    result = probe_payload(spec)
+    payload["probe"] = result
+    if not result.get("ok", True):
+        payload["ok"] = False
+        payload["next"] = first_failed_next(result)
+    return payload
 
 
 class Tools:
@@ -640,14 +663,19 @@ class Tools:
         return result
 
     def plan(self, spec: Dict[str, Any], usd_per_call: Optional[float] = None,
-             budget_usd: Optional[float] = None) -> Dict[str, Any]:
+             budget_usd: Optional[float] = None,
+             probe: bool = False) -> Dict[str, Any]:
         try:
             # Relative paths mean "where this server was launched"; the detached
             # run has a different cwd, so they are resolved here, once.
-            return plan_payload(EvolveSpec.from_dict(spec).absolutise(),
-                                usd_per_call=usd_per_call, budget_usd=budget_usd)
+            es = EvolveSpec.from_dict(spec).absolutise()
+            payload = plan_payload(es, usd_per_call=usd_per_call,
+                                   budget_usd=budget_usd)
         except SpecError as e:
             return {"ok": False, "error": str(e)}
+        if not probe or not payload.get("ok", True):
+            return payload
+        return _with_probe(payload, es)
 
     def status(self, run_id: Optional[str] = None) -> Any:
         try:
@@ -1359,8 +1387,9 @@ def build_server(store: Optional[str] = None, *, name: str = "agentdescent",
 
     @maybe_tool("plan")
     def plan(spec: Dict[str, Any], usd_per_call: Optional[float] = None,
-             budget_usd: Optional[float] = None) -> Dict[str, Any]:
-        return t.plan(spec, usd_per_call, budget_usd)
+             budget_usd: Optional[float] = None,
+             probe: bool = False) -> Dict[str, Any]:
+        return t.plan(spec, usd_per_call, budget_usd, probe)
 
     # `start` and `resume` are the two tools that launch a process, so they are
     # the two that take a Context. The annotation is set after the definition

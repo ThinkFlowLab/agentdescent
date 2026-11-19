@@ -135,3 +135,49 @@ def test_nonsense_verb_has_no_guess_and_hides_run(capsys):
     assert "invalid choice: 'no-such-verb'" in err
     assert "did you mean" not in err
     assert "'run'" not in err
+
+
+def _lab_parser():
+    return _subparsers_action().choices["lab"]
+
+
+def test_lab_help_and_usage_do_not_list_run():
+    """The lab mount must honour the same #420 contract as the top level (#1171)."""
+    lab = _lab_parser()
+    for text in (lab.format_help(), lab.format_usage()):
+        verbs = _verbs_in_braces(text)
+        assert "run" not in verbs
+        assert "evolve" in verbs
+        assert "algorithms" in verbs
+
+
+def test_lab_every_listed_verb_has_a_help_line():
+    text = _lab_parser().format_help()
+    for verb in _verbs_in_braces(text):
+        assert re.search(rf"^    {re.escape(verb)}\s+\S", text, re.M), verb
+
+
+def test_lab_unknown_verb_error_does_not_list_run(capsys):
+    out, err = _unknown_verb(capsys, ["lab", "xyz"])
+    assert out == ""
+    assert "run" not in _verbs_in_braces(err)
+    assert "'run'" not in err
+
+
+def test_lab_unknown_verb_json_hides_run(capsys):
+    import json
+
+    out, err = _unknown_verb(capsys, ["--json", "lab", "xyz"])
+    assert err == ""
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert "'run'" not in payload["error"]
+    assert "'run'" not in payload["usage"]
+    assert "run" not in _verbs_in_braces(payload["usage"])
+
+
+def test_lab_run_still_parses():
+    a = cli.build_parser().parse_args(
+        ["lab", "run", "--run-dir", "/tmp/x", "--budget", "1.5"])
+    assert a.fn is cli.cmd_run
+    assert a.run_dir == "/tmp/x" and a.budget == 1.5

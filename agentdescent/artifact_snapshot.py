@@ -426,8 +426,13 @@ def evaluate_snapshot_spec(
     kind = snapshot.kind or spec.kind
     with tempfile.TemporaryDirectory(prefix="ad-snapshot-eval-") as tmp:
         target = _write_target(snapshot, kind, tmp)
+        # Staging stays at tmp/artifact (#1150). The dest agent's layout
+        # prefix comes from EvolveSpec.artifact_id(), which prefers `name`
+        # over the target basename, so a skill_dir snapshot is visible at
+        # `.claude/skills/<artifact_id>/` rather than `.../artifact/` (#1164).
         dest = replace(
             spec, target=target,
+            name=snapshot.artifact_id,
             editable=tuple(snapshot.editable),
             frozen=tuple(snapshot.frozen),
         )

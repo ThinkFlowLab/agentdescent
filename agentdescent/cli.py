@@ -55,6 +55,7 @@ from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_p
 from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
                          build_call_limit, compose, estimate, fold_kind, load_spec,
                          resolve_kind, _POLICY_SLOTS)
+from .probe import first_failed_next
 
 __all__ = ["main", "doctor_report", "starter_spec"]
 
@@ -2415,12 +2416,6 @@ def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
     return line
 
 
-def _first_failed_probe_next(probe: Mapping[str, Any]) -> str:
-    """The repair action from the first refused probe row (#1093)."""
-    for row in probe.get("rows") or []:
-        if row.get("state") == "failed" and row.get("next"):
-            return str(row["next"])
-    return "run `agentdescent doctor`, then re-run plan --probe"
 
 
 def _print_plan(payload: Dict[str, Any], *, spec_path: str,
@@ -2588,7 +2583,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
         payload["probe"] = probe
         payload["ready"] = bool(probe.get("ok", True))
         if not payload["ready"]:
-            next_line = _first_failed_probe_next(probe)
+            next_line = first_failed_next(probe)
             payload["next"] = next_line
             then_line = f"agentdescent plan {a.spec} --probe"
     # `--baseline-sample` spends real calls, so it runs last: a broken spec or a
@@ -4860,7 +4855,7 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
         # follow it into a run that cannot work (#1093).
         obj["ready"] = bool(probe.get("ok", True))
         if not obj["ready"]:
-            obj["next"] = _first_failed_probe_next(probe)
+            obj["next"] = first_failed_next(probe)
             then_line = f"agentdescent plan {obj['spec_path']} --probe"
     if as_json:
         # Exactly one JSON object on stdout for success and error (#674).
@@ -5970,6 +5965,34 @@ def cmd_mcp(a: argparse.Namespace) -> int:
 # `--help`, the usage line, and unknown-verb ``choose from`` lists (#420, #886).
 _INTERNAL_COMMANDS = frozenset({"run"})
 
+#: What a first run needs, in the order the doc's Path A walks it (#1112).
+#: Every other verb keeps its top-level path *and* is grouped under `lab`; the
+#: grouping is additive, so this set only decides what the default `--help`
+#: advertises.
+DEFAULT_SURFACE = ("demo", "init", "plan", "evolve", "show", "apply",
+                   "doctor", "status", "lab", "mcp")
+
+
+class _CommandMount:
+    """Where :func:`_register_commands` places a verb (#1112).
+
+    Every verb is declared once; the top-level parser and the ``lab`` group
+    are two mounts of the same declarations. Mounting must not change an
+    argument, only which verbs the default ``--help`` advertises: an advanced
+    verb mounted at the top level gets no ``help``, so argparse prints no line
+    for it (the trick ``run`` has used since #420) while its parser is
+    unchanged and still parses. ``lab`` lists everything it holds.
+    """
+
+    def __init__(self, sub: "argparse._SubParsersAction", *, listed: bool):
+        self._sub = sub
+        self._listed = listed
+
+    def add_parser(self, name: str, **kwargs: Any) -> argparse.ArgumentParser:
+        if not self._listed and name not in DEFAULT_SURFACE:
+            kwargs.pop("help", None)
+        return self._sub.add_parser(name, **kwargs)
+
 
 def _visible_choices(action: argparse.Action) -> List[Any]:
     """``action.choices`` without internal commands, in registration order."""
@@ -6069,6 +6092,23 @@ def build_parser() -> argparse.ArgumentParser:
                                     "or $AGENTDESCENT_HOME/runs)")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="cmd", required=True)
+    _register_commands(_CommandMount(sub, listed=False), with_lab=True)
+    # Listing order is presentation only: every verb still parses above, this
+    # only prints the first-run path first (#1112).
+    order = {name: i for i, name in enumerate(DEFAULT_SURFACE)}
+    sub._choices_actions.sort(key=lambda action: order.get(action.dest, len(order)))
+    sub.metavar = "{" + ",".join(n for n in DEFAULT_SURFACE if n in sub.choices) + "}"
+    _accept_json_after_verb(sub)
+    return p
+
+
+def _register_commands(mount: "_CommandMount", *, with_lab: bool) -> None:
+    """Declare every verb once; :func:`build_parser` mounts it twice (#1112).
+
+    ``with_lab`` adds the ``lab`` group at the top of the advanced block; the
+    mount inside ``lab`` passes ``False`` so the group is not recursive.
+    """
+    sub = mount
 
     s = sub.add_parser("demo", help="build a complete example and run it, offline")
     s.add_argument("--dir", help="where to build it, and keep it "
@@ -6171,8 +6211,8 @@ def build_parser() -> argparse.ArgumentParser:
     # agentdescent.cli run --run-dir <dir>`); not a user verb.  argparse does
     # not honour help=SUPPRESS on a sub-parser (it prints "==SUPPRESS==" and
     # keeps the name in the {...} list), so register it with no help at all
-    # -- no help line -- leave it out of the metavar below (#420), and strip
-    # it from unknown-verb ``choose from`` lists (#886).
+    # -- no help line, never in the usage metavar (#420), and strip it from
+    # unknown-verb ``choose from`` lists (#886).
     s = sub.add_parser("run", description="internal: the worker `agentdescent evolve "
                                           "--detach` starts; use `evolve` instead")
     s.add_argument("--run-dir", required=True, dest="run_dir")
@@ -6902,6 +6942,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "authentication and lists every run in the store)")
     s.set_defaults(fn=cmd_serve)
 
+    if with_lab:
+        lab = sub.add_parser("lab", help="every other verb, grouped; "
+                                         "`lab <verb>` runs it unchanged")
+        _register_commands(_CommandMount(lab.add_subparsers(dest="lab_cmd", required=True),
+                                         listed=True), with_lab=False)
+
     s = sub.add_parser("mcp", help="serve the tools over MCP (stdio by default; needs agentdescent[mcp])")
     s.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio",
                    help="stdio for hosts that spawn a subprocess (default); streamable-http "
@@ -6925,10 +6971,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: Path A only — doctor/plan/start/status/show/apply/…; "
                         "also AGENTDESCENT_MCP_ADVANCED=1)")
     s.set_defaults(fn=cmd_mcp)
-
-    sub.metavar = "{" + ",".join(n for n in sub.choices if n not in _INTERNAL_COMMANDS) + "}"
-    _accept_json_after_verb(sub)
-    return p
 
 
 def _accept_json_after_verb(sub: "argparse._SubParsersAction") -> None:

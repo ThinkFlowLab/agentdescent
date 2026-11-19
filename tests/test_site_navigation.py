@@ -56,6 +56,17 @@ def test_header_breakpoint_keeps_the_drawer_as_the_mobile_route():
     assert '{{ nav.homepage.url | url }}#demo' in header
 
 
+def test_deepwiki_links_derive_their_base_from_the_script_url():
+    # The site is published under /agentdescent/ but served at / locally, so a
+    # root-absolute href works in CI and 404s on Pages. Both in-panel links must
+    # take the base from the loaded script instead, and with no script element
+    # they are left out rather than pointed at a literal that 404s.
+    js = (ROOT / "docs" / "assets" / "deepwiki.js").read_text()
+    assert 'href="/deepwiki/"' not in js
+    assert "new URL('../deepwiki/', SELF.src).href : null" in js
+    assert js.count('href="\' + GUIDE + \'"') == 2
+
+
 def verify_rendered_site(site):
     cfg = config()
     destination = cfg["site_url"] + "#demo"

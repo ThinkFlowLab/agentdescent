@@ -107,6 +107,32 @@ def test_claim_expiry():
     assert not c.claim_expired(fresh, [], CONFIG, NOW)
 
 
+def test_a_refs_pull_request_keeps_the_claim_alive():
+    claimed = issue(2, ["agent-working"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-working")])
+    for body in ("Refs #2", "refs #2", "Part of #2", "Part of ThinkFlowLab/agentdescent#2",
+                 "Refs #2, #3"):
+        prs = [pr(30, body=body)]
+        linked = c.linked_prs(prs, REPO).get(2, [])
+        assert not c.claim_expired(claimed, linked, CONFIG, NOW), f"{body!r} must keep the claim alive"
+    foreign = c.linked_prs([pr(30, body="Refs other/repo#2")], REPO)
+    assert 2 not in foreign, "a foreign repository reference names another issue"
+
+
+def test_no_reference_still_expires_the_claim():
+    claimed = issue(2, ["agent-working"], [ev("labeled", "2026-10-19T01:00:00Z", "Birfy", "agent-working")])
+    for body in ("", "see #2", "Refs #29", "mentions #2 in prose"):
+        assert c.claim_expired(claimed, c.linked_prs([pr(30, body=body)], REPO).get(2, []), CONFIG, NOW), body
+    stale = [pr(30, body="Refs #2", push="2026-10-19T05:00:00Z")]
+    assert c.claim_expired(claimed, c.linked_prs(stale, REPO).get(2, []), CONFIG, NOW), "a stale push expires"
+
+
+def test_a_refs_pull_request_is_still_not_an_agent_pr():
+    cfg = dict(CONFIG, agentAuthors=["bot-x"])
+    assert not c.is_agent_pr(pr(1, body="Refs #7"), cfg, REPO, {7})
+    assert not c.is_agent_pr(pr(1, body="Part of #7"), cfg, REPO, {7})
+    assert c.is_agent_pr(pr(1, body="Fixes #7"), cfg, REPO, {7}), "closing refs still decide agent-PR-ness"
+
+
 def test_plan_issues():
     ready_by_other = issue(3, ["agent-ready", "agent-working"],
                            [ev("labeled", "2026-10-19T01:00:00Z", "HugoXK", "agent-ready")])

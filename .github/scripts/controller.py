@@ -82,6 +82,24 @@ def closing_refs(body: Optional[str], repo: str) -> List[int]:
     return sorted(out)
 
 
+# A body can point at its issue without promising to close it: ``Refs #12``,
+# ``Part of #12``. Those keep a claim alive (issue #1161), but they never make a
+# PR an agent PR — for that only ``closing_refs`` counts.
+_LINKING = re.compile(r"\b(?:refs?|part\s+of)\b:?[ \t]+((?:[\w.-]+/[\w.-]+)?#\d{1,7}"
+                      r"(?:[ \t]*(?:,|and)[ \t]*(?:[\w.-]+/[\w.-]+)?#\d{1,7})*)", re.I)
+_REF = re.compile(r"(?:([\w.-]+/[\w.-]+))?#(\d{1,7})\b")
+
+
+def ttl_refs(body: Optional[str], repo: str) -> List[int]:
+    """Every issue this body points at: the closing refs plus ``Refs``/``Part of``."""
+    out = set(closing_refs(body, repo))
+    for m in _LINKING.finditer(str(body or "")[:20000]):
+        for ref in _REF.finditer(m.group(1)):
+            if not ref.group(1) or _same(ref.group(1), repo):
+                out.add(int(ref.group(2)))
+    return sorted(out)
+
+
 def is_agent_pr(pr: Dict[str, Any], config: Dict[str, Any], repo: str, agent_issues: Iterable[int]) -> bool:
     """By author, or a branch of this repository with an agent prefix, or a
     branch of this repository that closes an agent-ready/agent-working issue.
@@ -353,7 +371,7 @@ def read_prs(api: Any, repo: str, config: Dict[str, Any], gate: "risk_gate.Gate"
 def linked_prs(prs: List[Dict[str, Any]], repo: str) -> Dict[int, List[Dict[str, Any]]]:
     linked: Dict[int, List[Dict[str, Any]]] = {}
     for pr in prs:
-        for n in closing_refs(pr["body"], repo):
+        for n in ttl_refs(pr["body"], repo):
             linked.setdefault(n, []).append({"lastPushAt": pr["lastPushAt"]})
     return linked
 

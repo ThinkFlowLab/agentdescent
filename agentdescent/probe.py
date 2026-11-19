@@ -154,6 +154,19 @@ def probe_payload(spec: Any) -> Dict[str, Any]:
     return {"ok": not any(row["state"] == "failed" for row in rows), "rows": rows}
 
 
+def first_failed_next(payload: Mapping[str, Any],
+                      *, retry: str = "plan --probe") -> str:
+    """The repair action from the first refused probe row (#1093).
+
+    Shared by the CLI and the MCP ``plan`` tool so both surfaces answer a
+    refusal with the same fix, and neither sends a host to ``start`` (#1094).
+    """
+    for row in payload.get("rows") or []:
+        if row.get("state") == "failed" and row.get("next"):
+            return str(row["next"])
+    return f"run `agentdescent doctor`, then re-run {retry}"
+
+
 def probe_lines(payload: Mapping[str, Any]) -> list:
     """The human ``probe:`` lines, one per row, in the order they ran."""
     lines = []

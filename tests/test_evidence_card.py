@@ -18,17 +18,32 @@ FIELDS = ("held_out", "matched_budget", "cross_model", "cost", "disjoint_search"
           "reliability", "code", "evolved_artifact", "who_edits", "feedback",
           "timing", "topology")
 
+#: An argv the checker resolves offline in this checkout.
+COMMAND = "python -m tools.evidence_card --check"
+
 
 def _tool():
     from tools import evidence_card
     return evidence_card
 
 
+def _stamp(card):
+    """Give the card its ``command:`` line, in a field the test is not about."""
+    if any("command:" in value for value in card.values() if isinstance(value, str)):
+        return card
+    for name in ("code", "timing", "topology"):
+        value = card.get(name)
+        if isinstance(value, str) and value.strip() and value != "not reviewed":
+            card[name] = f"{value}\ncommand: {COMMAND}"
+            return card
+    return card
+
+
 def _card(**overrides):
     card = {name: f"{name} measured" for name in FIELDS}
     card["schema_version"] = 1
     card.update(overrides)
-    return card
+    return _stamp(card)
 
 
 def _write(tmp_path, card, name="card.json"):
@@ -50,6 +65,7 @@ def test_a_complete_card_passes(tmp_path, capsys):
 def test_a_missing_field_is_refused_by_name(tmp_path, capsys, field):
     card = _card()
     del card[field]
+    _stamp(card)  # keep the command rule out of what this test asserts
     assert _check(_write(tmp_path, card)) == 1
     err = capsys.readouterr().err
     assert field in err
@@ -111,6 +127,63 @@ def test_no_paths_scans_the_default_directory(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     assert _tool().main(["--check"]) == 0
     assert "1 card" in capsys.readouterr().out
+
+
+# -- the command rule: a card says what reproduces it ------------------------
+
+def test_a_card_with_no_command_line_is_refused_by_name(tmp_path, capsys):
+    card = _card()
+    card["code"] = "code measured"
+    assert _check(_write(tmp_path, card)) == 1
+    err = capsys.readouterr().err
+    assert "command" in err and "missing" in err
+    assert "\n" not in err.strip(), "a refusal is one line per offending field"
+
+
+def test_the_command_line_may_live_in_any_field(tmp_path):
+    card = _card()
+    card["code"] = "code measured"
+    card["topology"] = f"topology measured\ncommand: {COMMAND}"
+    assert _check(_write(tmp_path, card)) == 0
+
+
+def test_no_offline_command_is_accepted_with_a_reason(tmp_path):
+    card = _card()
+    card["code"] = ("code measured\ncommand: no offline command -- the run needs "
+                    "a live model")
+    assert _check(_write(tmp_path, card)) == 0
+
+
+def test_no_offline_command_without_a_reason_is_refused(tmp_path, capsys):
+    card = _card()
+    card["code"] = "code measured\ncommand: no offline command"
+    assert _check(_write(tmp_path, card)) == 1
+    err = capsys.readouterr().err
+    assert "reason" in err
+    assert "\n" not in err.strip(), "a refusal is one line per offending field"
+
+
+@pytest.mark.parametrize("command, needle", [
+    ("python -m nope.not_here --check", "cannot resolve module"),
+    ("python scripts/nope.py", "cannot resolve"),
+    ("pytest tests/nope.py", "cannot resolve"),
+    ("cargo bench", "unsupported runner"),
+])
+def test_a_command_that_does_not_resolve_is_refused(tmp_path, capsys, command, needle):
+    card = _card()
+    card["code"] = f"code measured\ncommand: {command}"
+    assert _check(_write(tmp_path, card)) == 1
+    err = capsys.readouterr().err
+    assert needle in err and "command" in err
+    assert "\n" not in err.strip(), "a refusal is one line per offending field"
+
+
+def test_two_command_lines_are_refused(tmp_path, capsys):
+    card = _card()
+    card["timing"] = f"timing measured\ncommand: {COMMAND}"
+    assert _check(_write(tmp_path, card)) == 1
+    err = capsys.readouterr().err
+    assert "2 times" in err and "code, timing" in err
 
 
 def test_the_module_is_runnable_with_dash_m(tmp_path):

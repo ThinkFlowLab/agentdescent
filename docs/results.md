@@ -176,6 +176,11 @@ is not `arms × seeds`:
 python -m bench.baselines_run --dataset hotpotqa --budget-rollouts 96 --width 4 --seeds 0,1,2 --plan
 ```
 
+That prints `Runs     : 18 evolve() calls, ~1728 rollouts in total` — 3 seeds ×
+(1 serial + 4 fork + 1 merge), which is the arithmetic the card
+[`reports/evidence/results-baselines-plan-runs.json`](https://github.com/ThinkFlowLab/agentdescent/blob/main/reports/evidence/results-baselines-plan-runs.json)
+pins.
+
 ```bash
 python -m bench.baselines_run --dataset hotpotqa --budget-rollouts 96 --width 4 --seeds 0,1,2 --provider claude --model GLM-5.2 --yes --json equal-budget.json
 ```

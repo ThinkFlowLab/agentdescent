@@ -12,11 +12,20 @@ cards are later slices.
 when none is given (absent is ``0 cards``, not an error). Exit 0 valid, 1 refused
 with one line per offending field, 2 input error. No network, no clock, and it
 writes nothing.
+
+A card says what reproduces it on a line starting ``command:`` inside one of the
+twelve fields: an argv that resolves offline in this repository (``python -m
+tools.evidence_card``, ``python scripts/x.py``, ``pytest tests/test_x.py``), or
+``command: no offline command -- <why>`` when nothing here reproduces the claim.
+Forcing a fake command is worse than none, so the second form is accepted with a
+reason; a card that claims nothing -- all twelve fields ``not reviewed`` -- needs
+neither, because it has nothing to reproduce.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -31,6 +40,15 @@ FIELDS = ("held_out", "matched_budget", "cross_model", "cost", "disjoint_search"
 NOT_REVIEWED = "not reviewed"
 
 DEFAULT_DIR = Path("reports") / "evidence"
+
+#: The line inside a field that says what reproduces the card.
+COMMAND_PREFIX = "command:"
+
+#: The honest form for a claim no command in this repository reproduces.
+NO_COMMAND = "no offline command"
+
+#: A ``command:`` argv is resolved against the repository the cards live in.
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def validate(card, source="card"):
@@ -53,7 +71,87 @@ def validate(card, source="card"):
     # schema_version is metadata, not evidence: checked above, never one of the twelve.
     errors.extend(f"{source}: {name}: unknown field"
                   for name in card if name != "schema_version" and name not in FIELDS)
+    errors.extend(_command_errors(card, source))
     return errors
+
+
+def command_lines(card):
+    """Return ``(field, value)`` for every ``command:`` marker in the card."""
+    found = []
+    for name in FIELDS:
+        value = card.get(name)
+        if not isinstance(value, str):
+            continue
+        for line in value.splitlines():
+            line = line.strip()
+            if line.startswith(COMMAND_PREFIX):
+                found.append((name, line[len(COMMAND_PREFIX):].strip()))
+    return found
+
+
+def _module_exists(name):
+    parts = [part for part in name.split(".") if part]
+    if not parts or len(parts) != len(name.split(".")):
+        return False
+    base = ROOT.joinpath(*parts)
+    return base.with_suffix(".py").is_file() or (base / "__init__.py").is_file()
+
+
+def _path_problems(targets):
+    problems = []
+    for target in targets:
+        # ``tests/test_x.py::test_y`` is a node id; the file is the part to check.
+        if not (ROOT / target.split("::")[0]).exists():
+            problems.append(f"cannot resolve {target!r} offline (no such file)")
+    return problems
+
+
+def _argv_problems(argv):
+    """Return one refusal fragment per argument that does not resolve offline."""
+    runner = argv[0]
+    if runner in ("python", "python3"):
+        if len(argv) > 2 and argv[1] == "-m":
+            module = argv[2]
+            if module == "pytest":
+                return _path_problems([a for a in argv[3:] if not a.startswith("-")])
+            if not _module_exists(module):
+                return [f"cannot resolve module {module!r} offline"]
+            return []
+        if len(argv) > 1 and not argv[1].startswith("-"):
+            return _path_problems([argv[1]])
+        return ["needs a script path or '-m <module>' after the interpreter"]
+    if runner in ("pytest", "py.test"):
+        # Only tokens that look like paths are checked: ``-k expr`` and ``-x``
+        # are flags and their values, not files.
+        return _path_problems([a for a in argv[1:]
+                               if not a.startswith("-") and ("/" in a or a.endswith(".py"))])
+    return [f"unsupported runner {runner!r} (use python, python3 or pytest)"]
+
+
+def _command_errors(card, source):
+    """The command rule: one line per card that does not say what reproduces it."""
+    if all(card.get(name) == NOT_REVIEWED for name in FIELDS):
+        return []  # a card that claims nothing has nothing to reproduce
+    markers = command_lines(card)
+    if not markers:
+        return [f"{source}: command: missing (add 'command: <argv>' to a field, or "
+                f"'command: {NO_COMMAND} -- <why>' when nothing here reproduces it)"]
+    if len(markers) > 1:
+        fields = ", ".join(name for name, _ in markers)
+        return [f"{source}: command: given {len(markers)} times ({fields}); one is enough"]
+    _, marker = markers[0]
+    if marker.startswith(NO_COMMAND):
+        reason = marker[len(NO_COMMAND):].strip()
+        if not reason.startswith("--") or not reason[2:].strip():
+            return [f"{source}: command: '{NO_COMMAND}' needs a reason after '--'"]
+        return []
+    try:
+        argv = shlex.split(marker)
+    except ValueError as exc:
+        return [f"{source}: command: not a command line ({exc})"]
+    if not argv:
+        return [f"{source}: command: blank (an argv, or '{NO_COMMAND} -- <why>')"]
+    return [f"{source}: command: {problem}" for problem in _argv_problems(argv)]
 
 
 def collect(paths):

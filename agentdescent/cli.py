@@ -5949,6 +5949,17 @@ _INTERNAL_COMMANDS = frozenset({"run"})
 DEFAULT_SURFACE = ("demo", "init", "plan", "evolve", "show", "apply",
                    "doctor", "status", "lab", "mcp")
 
+#: The top-level ``--help`` epilog (#1174).  ``install`` and ``algorithms`` are
+#: advanced verbs since #1112, yet the first-run docs still walk a reader to
+#: both; this is a pointer to those two commands and the group, not a second
+#: listing, so ``DEFAULT_SURFACE`` and the usage line stay as #1112 left them.
+_HELP_EPILOG = """next steps:
+  agentdescent install <host>      wire the skill + MCP server into a host
+                                   (claude-code, dsh, codex, opencode, grok-bot)
+  agentdescent algorithms list     the named algorithms a spec can ask for
+                                   (show / run NAME PATH CASES)
+  agentdescent lab --help          every other verb"""
+
 
 class _CommandMount:
     """Where :func:`_register_commands` places a verb (#1112).
@@ -6058,10 +6069,12 @@ def _wants_json(argv: Sequence[str]) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     p = _CliParser(prog="agentdescent",
-                                description="Evolve skills, agents, prompts, code and plugins "
-                                            "with a parallel, merge-based optimiser. "
-                                            "Path A: demo | doctor | init | plan | "
-                                            "evolve | apply; named cards: algorithms.")
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                description="Evolve skills, agents, prompts, code and plugins\n"
+                                            "with a parallel, merge-based optimiser. Path A: demo |\n"
+                                            "doctor | init | plan | evolve | apply; named cards:\n"
+                                            "algorithms.",
+                                epilog=_HELP_EPILOG)
     p.add_argument("-V", "--version", action="version",
                    version=f"%(prog)s {_version()}",
                    help="print the AgentDescent version and exit")

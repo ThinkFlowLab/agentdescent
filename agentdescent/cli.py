@@ -3091,20 +3091,24 @@ def _partial_show(rd: "runstore.RunDir", st: Any) -> Dict[str, Any]:
 
 
 def _refuse_plan_outside_write_dirs(payload: Dict[str, Any],
-                                   target: Optional[str]) -> None:
+                                    target: Optional[str],
+                                    written: Sequence[str] = (),
+                                    backup: Optional[str] = None) -> None:
     """Say so when the boundary would refuse the write ``apply_plan`` describes.
 
     ``show`` writes nothing, so it still renders the diff; what it must not do is
-    print a plan naming a file ``apply`` would then refuse (#1082).
+    print a plan naming a file ``apply`` would then refuse (#1082, #1188). The
+    check set is the one ``apply`` uses for a single-file artifact: the
+    destination, every path in ``written``, and the ``.bak-N`` slot when one
+    would be taken. A tree artifact gets the same set from ``_write_to`` called
+    with ``check_write``, which is the call ``apply`` makes for a tree.
     """
     plan = payload.get("apply_plan")
     if not target or not isinstance(plan, dict) or "error" in plan:
         return
-    guard = _operator_write_guard()
-    if guard is None:
-        return
     try:
-        guard(os.path.expanduser(target), "to")
+        _check_apply_paths(os.path.expanduser(target), list(written), backup,
+                           _operator_write_guard())
     except runstore.RunStoreError as e:
         payload["apply_plan"] = {"error": str(e)}
 
@@ -3181,8 +3185,12 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         return payload
     if spec.kind == "text":
         payload["rendered"] = result.rendered[:max_chars]
-        payload["apply_plan"] = _text_plan(os.path.expanduser(spec.target), result.rendered)
-        _refuse_plan_outside_write_dirs(payload, spec.target)
+        dest = os.path.expanduser(spec.target)
+        plan = _text_plan(dest, result.rendered)
+        payload["apply_plan"] = plan
+        _refuse_plan_outside_write_dirs(
+            payload, dest, plan["written"],
+            _backup_slot(dest) if not plan["noop"] and os.path.exists(dest) else None)
         return payload
     payload["files"] = sorted(result.state)
     if diff:
@@ -3192,11 +3200,15 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         except Exception as e:  # noqa: BLE001 - the original may have moved
             before, payload["diff_note"] = {}, f"could not read original {spec.target}: {e}"
         payload["diff"] = _tree_diff(before, result.state)[:max_chars]
+        # The call `apply` makes for a tree, with only `dry_run` differing:
+        # `_write_to` checks the destination, every written leaf and the
+        # directory backup slot before it returns the plan (#1188).
         try:
-            payload["apply_plan"] = result.write_to(os.path.expanduser(spec.target), dry_run=True)
+            payload["apply_plan"] = result._write_to(
+                os.path.expanduser(spec.target), dry_run=True,
+                check_write=_operator_write_guard())
         except Exception as e:  # noqa: BLE001
             payload["apply_plan"] = {"error": str(e)}
-        _refuse_plan_outside_write_dirs(payload, spec.target)
     return payload
 
 

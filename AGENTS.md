@@ -105,9 +105,10 @@ question in a comment. Agents develop **only** `agent-ready` issues.
 
 [`.github/workflows/controller.yml`](.github/workflows/controller.yml) runs every
 30 minutes with the built-in `GITHUB_TOKEN` only (no GitHub App, no secrets) and
-changes labels and nothing else: it sets `risk:T*` and `agent-pr` on open PRs,
-removes `agent-ready`/`agent-working` when a non-maintainer set or edited an
-issue after it was approved, and expires a claim after 6 h with no linked push.
+changes labels and nothing else: it sets `risk:T*` and `agent-pr` on open
+non-draft PRs, removes `agent-ready`/`agent-working` when a non-maintainer set
+or edited an issue after it was approved, and expires a claim after 6 h with no
+linked push.
 It never adds `agent-ready`, never merges, comments or closes.
 
 | Repository variable | Effect |

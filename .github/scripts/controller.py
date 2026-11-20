@@ -10,7 +10,8 @@ PR/issue content: titles and bodies are data for one bounded regex
 risk gate's rules.
 
   - sets ``agent-pr`` on pull requests an agent opened, and ``risk:T0..T3``
-    (the risk gate's tier) on every open PR not on ``hold``
+    (the risk gate's tier) on every open PR that is neither on ``hold`` nor a
+    draft: a parked draft is not in the review queue yet (issue #1192)
   - removes ``agent-ready`` (and ``agent-working``) when someone who is not a
     maintainer labeled the issue, or edited its text after it was labeled
   - removes ``agent-working`` from a claim older than the TTL with no recent
@@ -196,6 +197,11 @@ def plan(state: Dict[str, Any]) -> Dict[str, List[Any]]:
         if any(_same(l, "hold") for l in pr["labels"]):
             skipped.append({"number": pr["number"], "label": "*", "reason": "hold"})
             continue
+        if pr.get("draft"):
+            # A draft is parked, not up for review: no add and no remove, so the
+            # labels it already carries stay (#1192). `hold` above still wins.
+            skipped.append({"number": pr["number"], "label": "*", "reason": "draft"})
+            continue
         if not pr["tier"]:
             continue  # the files could not be read; leave the labels as they are
         want = f"risk:{pr['tier']}"
@@ -358,6 +364,7 @@ def read_prs(api: Any, repo: str, config: Dict[str, Any], gate: "risk_gate.Gate"
         out.append({
             "number": pr["number"],
             "labels": [l["name"] for l in pr.get("labels", [])],
+            "draft": bool(pr.get("draft")),  # already in this pull list; no extra request (#1192)
             "author": _login(pr.get("user")) or "",
             "headRef": pr["head"]["ref"],
             "sameRepo": head_repo.lower() == repo.lower(),

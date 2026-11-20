@@ -13,14 +13,16 @@ name: controller
 # To turn it off entirely, disable this workflow in the Actions tab.
 #
 # It also runs on the three PR lifecycle events, so a new PR is labelled now
-# rather than at the next cron tick (the schedule is throttled and can be
-# hours late). A `pull_request` run from a fork head carries a read-only
-# token, so both jobs skip it: the fallback cron still labels fork PRs.
+# rather than at the next cron tick. The old half-hourly schedule declared 48
+# slots a day and in practice ran twice (2026-11-19: 3 runs; 2026-11-20: 2),
+# so immediacy comes from these events and manual dispatch, and the cron is a
+# four-a-day backstop only. A `pull_request` run from a fork head carries a
+# read-only token, so both jobs skip it: the fallback cron still labels fork PRs.
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 concurrency:

@@ -274,7 +274,10 @@ def test_workflow_shape():
     wf = yaml.safe_load(text)
     on = wf.get("on", wf.get(True))
     assert set(on) == {"schedule", "workflow_dispatch", "pull_request"}
-    assert on["schedule"] == [{"cron": "7,37 * * * *"}], "every 30 minutes"
+    assert on["schedule"] == [{"cron": "17 */6 * * *"}], (
+        "four slots a day: the half-hourly cron only ran two or three times a day, "
+        "so immediacy comes from the pull_request events, not the schedule"
+    )
     assert on["pull_request"] == {"types": ["opened", "ready_for_review", "reopened"]}, \
         "label a PR when it becomes reviewable, not on every push to its head"
     assert wf["permissions"] == {}

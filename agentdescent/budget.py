@@ -63,18 +63,23 @@ class BudgetStop(Exception):
     stop.
     """
 
-    def __init__(self, limit: str, observed: float, cap: float) -> None:
+    def __init__(self, limit: str, observed: float, cap: float,
+                 source: Optional[str] = None) -> None:
         self.limit = limit
         self.observed = observed
         self.cap = cap
+        #: The knob that set the cap, when it is worth naming in ``status``
+        #: (the operator's environment ceiling, #1082); ``None`` for a flag.
+        self.source = source
         super().__init__(f"{limit}={cap} reached")
 
     def detail(self) -> str:
         """One line for ``status``: which limit fired and what was spent."""
+        name = f"{self.limit} ({self.source})" if self.source else self.limit
         if self.limit == "max_calls":
-            return (f"max_calls: {int(self.observed)} call(s) made, "
+            return (f"{name}: {int(self.observed)} call(s) made, "
                     f"cap {int(self.cap)}")
-        return f"max_usd: ${self.observed:.4f} spent, cap ${self.cap:.4f}"
+        return f"{name}: ${self.observed:.4f} spent, cap ${self.cap:.4f}"
 
 
 @dataclass
@@ -99,6 +104,8 @@ class CallLimit:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False,
                                  compare=False)
     _taken: int = field(default=0, init=False, repr=False, compare=False)
+    #: Names the knob in the refusal when it is not the caller's flag (#1082).
+    source: Optional[str] = None
     _stopped: Optional[BudgetStop] = field(default=None, init=False,
                                            repr=False, compare=False)
 
@@ -112,12 +119,13 @@ class CallLimit:
             n = self._taken + 1
             stop: Optional[BudgetStop] = None
             if self.max_calls is not None and n > self.max_calls:
-                stop = BudgetStop("max_calls", self._taken, self.max_calls)
+                stop = BudgetStop("max_calls", self._taken, self.max_calls,
+                                  self.source)
             elif self.max_usd is not None and self.usd_per_call:
                 # Tolerance: 3 x 0.01 must not exceed 0.03 through float noise.
                 if n * self.usd_per_call > self.max_usd + 1e-9:
                     stop = BudgetStop("max_usd", self._taken * self.usd_per_call,
-                                      self.max_usd)
+                                      self.max_usd, self.source)
             if stop is not None:
                 if self._stopped is None:
                     self._stopped = stop

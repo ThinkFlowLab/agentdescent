@@ -48,7 +48,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import (Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple)
 
 from .evolution import EvolutionResult, RoundInfo
 from .surface_common import scrub_host_env
@@ -97,6 +97,41 @@ def require_budget_pair(budget_usd: Optional[float],
     """
     if budget_usd is not None and not usd_per_call:
         raise RunStoreError(_BUDGET_NEEDS_PRICE)
+
+
+#: The operator's per-run model-call ceiling (#1082): every run this process
+#: starts -- foreground or detached -- is clamped to it. A caller's
+#: ``--max-calls`` may lower it, never raise it. Calls only: a dollar ceiling
+#: needs a per-call price, and `require_budget_pair` already refuses an
+#: un-priced dollar budget rather than guessing one.
+OPERATOR_MAX_CALLS_ENV = "AGENTDESCENT_MAX_CALLS"
+
+
+def operator_max_calls(environ: Optional[Mapping[str, str]] = None
+                       ) -> Optional[int]:
+    """The operator's per-run call ceiling, or ``None`` when unset (#1082)."""
+    env = os.environ if environ is None else environ
+    raw = env.get(OPERATOR_MAX_CALLS_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise RunStoreError(
+            f"{OPERATOR_MAX_CALLS_ENV} must be a non-negative integer, got {raw!r}")
+    return value
+
+
+def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
+    """``(max_calls, whether the operator's ceiling is what bound it)`` (#1082)."""
+    cap = operator_max_calls()
+    if cap is None:
+        return max_calls, False
+    if max_calls is None or cap < max_calls:
+        return cap, True
+    return max_calls, False
 
 
 def root() -> str:
@@ -681,6 +716,7 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     reaped when it ends instead of lingering as a zombie that still looks alive).
     Its stdout and stderr go to ``log.txt``.
     """
+    max_calls, _ = _clamped_max_calls(max_calls)
     require_budget_pair(budget_usd, usd_per_call)
     from .evolvespec import SpecError, build_call_limit
     try:
@@ -837,6 +873,7 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     # live run that later "ended without reporting".
     try:
         require_budget_pair(budget_usd, usd_per_call)
+        max_calls, operator_bound = _clamped_max_calls(max_calls)
     except RunStoreError as e:
         rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
         raise
@@ -854,6 +891,9 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
         # running, the same shape as a missing usd_per_call above.
         rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
         raise RunStoreError(str(e)) from None
+    if limit is not None and operator_bound:
+        # So `status` says which ceiling stopped the run, not just "max_calls".
+        limit.source = OPERATOR_MAX_CALLS_ENV
 
     def _progress() -> None:
         # Mid-call rewrite so CLI/MCP status shows work in flight (#358).

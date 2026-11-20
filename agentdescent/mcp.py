@@ -42,7 +42,7 @@ from .cli import (NESTED_ENV, NESTED_REFUSAL, apply_with_target, demo_payload,
                  require_resume_not_solved, resolve_run_id, show_payload,
                  status_payload)
 from .evolvespec import (EvolveSpec, SpecError, budget_round_overshoot_warning,
-                         compose, estimate)
+                         build_call_limit, compose, estimate)
 
 __all__ = ["ADVANCED_ENV", "DEFAULT_HTTP_HOST", "DEFAULT_HTTP_PORT", "PATH_A_TOOLS",
            "RESCAN_ALLOW_ENV", "STREAMABLE_HTTP_REQUIRES", "TRANSPORTS",
@@ -163,13 +163,18 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "one minimal call per model-backed agent (the same preflight as "
         "`plan --probe`); a refusal returns `probe`, and prints the same refusal "
         "contract as the CLI (`ok: false`, `ready: false`) with `next` naming the "
-        "fix, so do not call start then. Show the user the "
+        "fix, so do not call start then. Pass max_calls (and/or max_usd with "
+        "usd_per_call) to cap the run at the model call; the reply's `call_limit` is "
+        "what start would enforce. Show the user the "
         "spec and the estimate and get a yes before calling start."),
     "start": (
         "Start an evolution run in the background and return its run_id at once. The run "
         "is a detached process; poll `status` about once per round (not more often) and "
         "read `show` when it is done. Never call start without having shown the user the "
-        "plan. A run costs real agent calls: rounds x n_workers x tasks. When the spec has "
+        "plan. A run costs real agent calls: rounds x n_workers x tasks. Pass max_calls "
+        "(and/or max_usd with usd_per_call) to stop it at that many model calls; a bad "
+        "value refuses before any run exists, and an operator ceiling lowers the number "
+        "rather than raising it. When the spec has "
         "an `audit` block, `status` reports `audit_store` once records exist -- pass that "
         "path to audit_status to find out how far the run's scorer is from the truth."),
     "status": (
@@ -426,6 +431,40 @@ def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
     return payload
 
 
+def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
+                        usd_per_call: Optional[float]) -> Optional[Dict[str, Any]]:
+    """The run-level cap an MCP ``plan`` / ``start`` will enforce, or ``None`` (#1184).
+
+    Validated by the same :func:`~agentdescent.evolvespec.build_call_limit` the
+    CLI and the run store use, so a bad number -- and a ``max_usd`` with no
+    ``usd_per_call`` -- refuses with the CLI's own sentence instead of a second
+    wording for this surface. The operator's ceiling is applied with the same
+    ``min`` as ``runstore.launch`` / ``execute``: a caller may lower it, never
+    raise it, and a caller that names no cap still gets it.
+
+    ``source`` and ``max_calls_requested`` appear only when the ceiling is what
+    binds, the same distinction ``AGENTDESCENT_MAX_CALLS_REQUESTED`` carries
+    into the child: without them a host cannot tell "the ceiling lowered your 9
+    to 2" from "you asked for 2".
+    """
+    limit = build_call_limit(max_calls=max_calls, max_usd=max_usd,
+                             usd_per_call=usd_per_call)
+    ceiling = runstore.operator_max_calls()
+    if limit is None and ceiling is None:
+        return None
+    enforced = None if limit is None else limit.max_calls
+    payload: Dict[str, Any] = {"max_calls": enforced,
+                              "max_usd": None if limit is None else limit.max_usd}
+    if ceiling is not None and (enforced is None or ceiling < enforced):
+        # A run that names no cap still gets the ceiling -- and then the reply
+        # has to say so, or `start` would look unbounded while it is capped.
+        payload["max_calls"] = ceiling
+        payload["source"] = runstore.OPERATOR_MAX_CALLS_ENV
+        if max_calls is not None:
+            payload["max_calls_requested"] = int(max_calls)
+    return payload
+
+
 class Tools:
     """The tool bodies, SDK-free. One instance per server, bound to a run store."""
 
@@ -668,15 +707,23 @@ class Tools:
 
     def plan(self, spec: Dict[str, Any], usd_per_call: Optional[float] = None,
              budget_usd: Optional[float] = None,
-             probe: bool = False) -> Dict[str, Any]:
+             probe: bool = False, max_calls: Optional[int] = None,
+             max_usd: Optional[float] = None) -> Dict[str, Any]:
         try:
             # Relative paths mean "where this server was launched"; the detached
             # run has a different cwd, so they are resolved here, once.
             es = EvolveSpec.from_dict(spec).absolutise()
             payload = plan_payload(es, usd_per_call=usd_per_call,
                                    budget_usd=budget_usd)
+            limit = _call_limit_payload(max_calls, max_usd, usd_per_call)
         except SpecError as e:
             return {"ok": False, "error": str(e)}
+        except runstore.RunStoreError as e:
+            return {"ok": False, "error": str(e)}
+        if limit is not None:
+            # What `start` would enforce, so the host can show the number the
+            # user is agreeing to -- and the clamped one when a ceiling binds.
+            payload["call_limit"] = limit
         if not probe or not payload.get("ok", True):
             return payload
         return _with_probe(payload, es)
@@ -712,13 +759,18 @@ class Tools:
     # -- side effects -----------------------------------------------------------
 
     def start(self, spec: Dict[str, Any], budget_usd: Optional[float] = None,
-              usd_per_call: Optional[float] = None) -> Dict[str, Any]:
+              usd_per_call: Optional[float] = None,
+              max_calls: Optional[int] = None,
+              max_usd: Optional[float] = None) -> Dict[str, Any]:
         try:
             es = EvolveSpec.from_dict(spec).absolutise()
             comp = compose(es)                # fail here, with the field, not in the child
             # Before create: same rule as CLI -- budget without price must not
             # return ok/started and then fail only in log.txt (#342).
             runstore.require_budget_pair(budget_usd, usd_per_call)
+            # A bad cap is a refusal too, not a run whose log.txt explains it
+            # later; same sentence the CLI prints (#1184).
+            limit = _call_limit_payload(max_calls, max_usd, usd_per_call)
         except SpecError as e:
             return {"ok": False, "error": str(e)}
         except runstore.RunStoreError as e:
@@ -754,7 +806,11 @@ class Tools:
             # The run is a detached process, so a `host_model` reference in the
             # spec resolves there, not here -- it needs the bridge's address in
             # its environment or it has no session to borrow.
+            # The caller's own numbers go in, not `limit`'s clamped ones:
+            # `launch` applies the same min and is what records what was asked
+            # for across the detach boundary (#1184).
             st = runstore.launch(rd, budget_usd=budget_usd, usd_per_call=usd_per_call,
+                                 max_calls=max_calls, max_usd=max_usd,
                                  env=self.host_model_env())
         except runstore.RunStoreError as e:
             return {"ok": False, "error": str(e), "run_id": rd.run_id, "dir": rd.path}
@@ -767,7 +823,9 @@ class Tools:
                 "host_model_route": ("sampling" if self.bridge
                                      else (self.host_cli or None)),
                 **({} if (self.bridge or self.host_cli)
-                   else {"host_model_unavailable": self.bridge_error})}
+                   else {"host_model_unavailable": self.bridge_error}),
+                # Enforced value, and the ceiling that bound it when one did.
+                **({"call_limit": limit} if limit is not None else {})}
         if budget_warn:
             out["warnings"] = [budget_warn]
         return out
@@ -1392,8 +1450,9 @@ def build_server(store: Optional[str] = None, *, name: str = "agentdescent",
     @maybe_tool("plan")
     def plan(spec: Dict[str, Any], usd_per_call: Optional[float] = None,
              budget_usd: Optional[float] = None,
-             probe: bool = False) -> Dict[str, Any]:
-        return t.plan(spec, usd_per_call, budget_usd, probe)
+             probe: bool = False, max_calls: Optional[int] = None,
+             max_usd: Optional[float] = None) -> Dict[str, Any]:
+        return t.plan(spec, usd_per_call, budget_usd, probe, max_calls, max_usd)
 
     # `start` and `resume` are the two tools that launch a process, so they are
     # the two that take a Context. The annotation is set after the definition
@@ -1402,7 +1461,9 @@ def build_server(store: Optional[str] = None, *, name: str = "agentdescent",
     context_cls = _context_class()
 
     async def start(spec: Dict[str, Any], ctx, budget_usd: Optional[float] = None,
-                    usd_per_call: Optional[float] = None) -> Dict[str, Any]:
+                    usd_per_call: Optional[float] = None,
+                    max_calls: Optional[int] = None,
+                    max_usd: Optional[float] = None) -> Dict[str, Any]:
         import asyncio
 
         import anyio.to_thread
@@ -1410,7 +1471,7 @@ def build_server(store: Optional[str] = None, *, name: str = "agentdescent",
         attach_bridge(ctx, asyncio.get_running_loop())
         # The body forks a process, so it stays off the loop the bridge needs.
         return await anyio.to_thread.run_sync(
-            lambda: t.start(spec, budget_usd, usd_per_call))
+            lambda: t.start(spec, budget_usd, usd_per_call, max_calls, max_usd))
 
     start.__annotations__["ctx"] = context_cls
     maybe_tool("start")(start)

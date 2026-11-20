@@ -238,8 +238,8 @@ descriptions are written for the *calling model*, since that is who reads them.
 | Tool | Returns | Notes |
 |---|---|---|
 | `doctor()` | available agents, providers, missing keys | call first |
-| `plan(spec)` | validated spec + cost estimate | **does not run**; `validate()` resolves refs and builds `Policies`, so composition errors surface here |
-| `start(spec, budget_usd?)` | `run_id` | detaches; returns in < 1 s |
+| `plan(spec, usd_per_call?, budget_usd?, probe?, max_calls?, max_usd?)` | validated spec + cost estimate, and `call_limit` when a cap was asked for | **does not run**; `validate()` resolves refs and builds `Policies`, so composition errors surface here |
+| `start(spec, budget_usd?, usd_per_call?, max_calls?, max_usd?)` | `run_id` | detaches; returns in < 1 s; `max_calls` / `max_usd` cap the run's model calls (#1184) |
 | `status(run_id?)` | `status.json` (+ last 3 rounds) | cheap; safe to poll |
 | `show(run_id, diff=true)` | evolved tree, `write_to(dry_run=True)` plan, unified diff, `outcomes()` | what the user reads before deciding |
 | `apply(run_id, to?)` | files written, backup path | **destructive**; host must confirm with the user |
@@ -601,7 +601,10 @@ Two guards keep this from folding in on itself:
   child starts with the clamped `--max-calls` and learns what the caller asked
   for through an internal label-only variable, so `status` says which knob bound
   it from either path. So "a worker asked for an unbounded run" is answered by
-  the environment, not by review.
+  the environment, not by review. The MCP surface takes the same numbers —
+  `plan` / `start` accept `max_calls` / `max_usd` and report `call_limit` with
+  what was asked for and what will be enforced, so a host sees a request of 9
+  come back as 2 with `source: AGENTDESCENT_MAX_CALLS` (#1184).
 * **The controller never hot-swaps itself.** A self-evolved plugin reaches the
   user's real installation only through `apply`, which is a human decision on
   a diff, after an L1 oracle gate, with a backup. The loop can improve its own

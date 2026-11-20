@@ -281,7 +281,8 @@ Two habits worth keeping from the first run:
   wrong model name or a dead endpoint is refused before a run store entry is
   written. If the probe fails, the last line is the repair action (not
   `next: agentdescent evolve`); `then:` is `plan <spec> --probe` to re-test,
-  and `--json` sets `ready: false` while leaving `ok` about the plan itself.
+  and `--json` sets `ok: false` and `ready: false` -- the MCP `plan` tool
+  prints the same pair, so one check works on both surfaces.
   CLI agents are reported as `probe: … skipped (cli agent)` because one
   call would cost a whole session.
 * `--budget 5 --usd-per-call 0.02` on the first real run. A dollar budget

@@ -161,8 +161,9 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "budget (budget is only checked between rounds). When the spec has an "
         "`algorithm`, the resolved name/params are echoed. Pass probe=true to send "
         "one minimal call per model-backed agent (the same preflight as "
-        "`plan --probe`); a refusal returns `probe` and makes this object `ok: false` "
-        "with `next` naming the fix, so do not call start then. Show the user the "
+        "`plan --probe`); a refusal returns `probe`, and prints the same refusal "
+        "contract as the CLI (`ok: false`, `ready: false`) with `next` naming the "
+        "fix, so do not call start then. Show the user the "
         "spec and the estimate and get a yes before calling start."),
     "start": (
         "Start an evolution run in the background and return its run_id at once. The run "
@@ -407,16 +408,19 @@ def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
 
     The body is the same ``probe_payload`` the CLI's ``plan --probe`` runs, so
     a host gets the same rows and the same repair sentence instead of a second
-    implementation. A refusal makes the plan itself ``ok: false`` and replaces
-    ``next`` with that repair: a host following ``next`` must not start a run
-    that cannot work. ``probe`` is added only when the caller asked for it --
-    plain ``plan`` stays the free call that sends nothing.
+    implementation. A refusal prints the one contract both surfaces carry
+    (#1175): ``ok: false``, ``ready: false`` and ``next`` replaced with that
+    repair, so a host following ``next`` must not start a run that cannot work
+    and a host porting its check from the CLI reads the same keys. ``probe`` is
+    added only when the caller asked for it -- plain ``plan`` stays the free
+    call that sends nothing, and has no ``ready`` key.
     """
     from .probe import first_failed_next, probe_payload
 
     result = probe_payload(spec)
     payload["probe"] = result
-    if not result.get("ok", True):
+    payload["ready"] = bool(result.get("ok", True))
+    if not payload["ready"]:
         payload["ok"] = False
         payload["next"] = first_failed_next(result)
     return payload

@@ -24,8 +24,14 @@ CLI Path A verbs match: `demo`, `doctor`, `init`/`algorithms run`, `plan`, `evol
 `status`/`watch`, `show`, `apply`, `cancel`, `resume`, `algorithms list|show`.
 
 ```
-demo (optional, zero-key)  →  doctor  →  write a spec  →  plan (show the user)  →  start  →  status  →  show  →  ask  →  apply
+demo (optional, zero-key)  →  doctor  →  write a spec  →  plan (show the user; --probe on a first model)  →  start  →  status  →  show  →  ask  →  apply
 ```
+
+The first time a spec names a model or endpoint, run the plan with the probe
+on: `agentdescent plan <spec> --probe` on the CLI, or `plan(spec, probe=true)`
+over MCP. A refused probe prints one contract on both surfaces -- `ok: false`,
+`ready: false`, and `next` as the repair action -- so give the user `next` and
+do not call `start` (#1175).
 
 ## Advanced (opt-in)
 

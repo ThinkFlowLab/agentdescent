@@ -248,7 +248,7 @@ def test_algorithms_run_json_exits_nonzero_on_a_refused_probe(tmp_path, monkeypa
 
     payload = json.loads(out)
     assert payload["probe"]["ok"] is False
-    assert payload["ok"] is True, "the plan itself is fine; only the probe refused"
+    assert payload["ok"] is False, "a refusal is not success on either surface (#1175)"
     assert payload["ready"] is False
     assert payload["next"] == (
         "renew the subscription at the provider, or point api_key_env / "
@@ -344,15 +344,20 @@ def test_the_probe_caps_the_reply_budget_and_the_wait(tmp_path, monkeypatch, end
     assert seen["max_tokens"] == probe_module.PROBE_MAX_TOKENS
     assert seen["timeout"] == probe_module.DEFAULT_PROBE_TIMEOUT
 
-def test_plan_json_marks_a_refused_probe_unready_and_keeps_ok(tmp_path, endpoint):
-    """`ok` stays about the plan; `ready` and `next` are how a host gates (#1093)."""
+def test_plan_json_marks_a_refused_probe_unready_and_not_ok(tmp_path, endpoint):
+    """A refusal is neither `ok` nor `ready`; `next` is the repair (#1175).
+
+    The plan file parsed, but the run it describes cannot start, so the same
+    pair travels to the MCP `plan` tool instead of `ok: true` here and
+    `ok: false` there.
+    """
     endpoint(body=ARK_SUBSCRIPTION)
 
     code, out, err = _run(["plan", _write_spec(tmp_path), "--json", "--probe"])
 
     payload = json.loads(out)
     assert code == 1, (code, err)
-    assert payload["ok"] is True
+    assert payload["ok"] is False
     assert payload["ready"] is False
     assert payload["probe"]["ok"] is False
     assert payload["next"] == (

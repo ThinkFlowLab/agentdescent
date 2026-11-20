@@ -258,12 +258,15 @@ all ~39 tools as the primary path.
   the data and builds the policy bundle without running anything, then returns
   the composed `evolve()` arguments and an upper bound on agent calls. A wrong
   field fails here, by name, not in round one of a background process.
-* **The probe is on `plan`, for both surfaces.** `plan --probe` (CLI) and
-  `plan(spec, probe=true)` (MCP) send one minimal call per model-backed agent,
-  through the same adapter the run would use, so an expired subscription or a
-  wrong model name is answered before a run store entry exists. A refusal sets
-  `ok: false` and `next` to the repair action, never to `start`; the default
-  `probe` is off, and plain `plan` still sends nothing.
+* **The probe is on `plan`, for both surfaces, and one refusal contract comes
+  back.** `plan --probe` (CLI) and `plan(spec, probe=true)` (MCP) send one
+  minimal call per model-backed agent, through the same adapter the run would
+  use, so an expired subscription or a wrong model name is answered before a
+  run store entry exists. A refusal prints `ok: false`, `ready: false` and
+  `next` as the repair action -- identical keys and values on both surfaces, so
+  a host never has to translate its check -- and `next` never says `start`. The
+  default `probe` is off; plain `plan` still sends nothing and has no `ready`
+  key.
 * **`start` returns in under a second.** The run is a detached process; the host
   polls `status`. MCP tool calls time out and hosts restart their servers
   between sessions, so nothing blocks on `evolve()`.

@@ -2570,7 +2570,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
     probe = _probe_if_asked(a, spec) if payload.get("ok", True) else None
     # Default next is evolve; a refused probe replaces it with the repair
     # action so a reader (or a host following `next`) does not start a run
-    # that cannot work (#1093). `ok` stays about the plan/spec itself.
+    # that cannot work (#1093), and flips `ok` too (#1175) -- see below.
     next_line = f"agentdescent evolve {a.spec}"
     # Keep an ad-hoc `--algorithm` / `--param` override in the suggested
     # command: it lives in memory, not in the spec file.
@@ -2579,10 +2579,19 @@ def cmd_plan(a: argparse.Namespace) -> int:
         for param in getattr(a, "param", None) or []:
             next_line += f" --param {param}"
     then_line = None
+    probe_refused = False
     if probe is not None:
         payload["probe"] = probe
         payload["ready"] = bool(probe.get("ok", True))
         if not payload["ready"]:
+            # One refusal contract on every surface (#1175): a probe that
+            # cannot work is not `ok` either, so the CLI and the MCP `plan`
+            # tool print the same `ok`/`ready` pair and a host reading either
+            # key reaches the same verdict. The plan itself parsed, but the
+            # run it describes cannot start; the exit code stays 1, which is
+            # the config answer `evolve`'s first call would have taken.
+            payload["ok"] = False
+            probe_refused = True
             next_line = first_failed_next(probe)
             payload["next"] = next_line
             then_line = f"agentdescent plan {a.spec} --probe"
@@ -2658,7 +2667,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
                     probe_lines=(_probe_lines(probe) if probe is not None else None),
                     then_line=then_line, baseline_lines=baseline_lines,
                     refused_headroom=refused_headroom)
-    if not payload.get("ok", True):
+    if not payload.get("ok", True) and not probe_refused:
         return 2
     # A saturated seed is a config answer, like a refused probe: plan found the
     # run cannot learn anything, before the run store gained an entry (#1113).
@@ -4850,11 +4859,14 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
         # wrote: one call, before the `evolve` it recommends (#1048).
         probe = _probe_if_asked(a, load_spec(obj["spec_path"]))
         obj["probe"] = probe
-        # `ok` stays about the written plan; `ready` is whether evolve can
-        # start. A refused probe also replaces `next` so a host does not
-        # follow it into a run that cannot work (#1093).
+        # The one refusal contract (#1175): `ok: false`, `ready: false` and
+        # `next` as the repair, identical to `plan --probe` and the MCP `plan`
+        # tool. The written plan is fine, but the run it recommends cannot
+        # start, so a host reading either key refuses it. The exit code stays
+        # 1 (a config answer, not the spec error that exits 2).
         obj["ready"] = bool(probe.get("ok", True))
         if not obj["ready"]:
+            obj["ok"] = False
             obj["next"] = first_failed_next(probe)
             then_line = f"agentdescent plan {obj['spec_path']} --probe"
     if as_json:

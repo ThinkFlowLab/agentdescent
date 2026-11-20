@@ -1,9 +1,11 @@
 """The label-only controller (AGENTS.md › Controller).
 
-It runs every 30 minutes with a write token, so its contract is tested
-offline: it touches only the labels it manages, only in the allowed direction,
-never adds ``agent-ready``, stops entirely on ``AGENT_PAUSE`` and is a dry run
-unless ``CONTROLLER_LIVE`` is exactly ``true``.
+It runs on ``pull_request`` ``opened`` / ``ready_for_review`` /
+``reopened`` (same-repo) and on a four-a-day cron backstop, with a write
+token, so its contract is tested offline: it touches only the labels it
+manages, only in the allowed direction, never adds ``agent-ready``, stops
+entirely on ``AGENT_PAUSE`` and is a dry run unless ``CONTROLLER_LIVE`` is
+exactly ``true``.
 """
 
 import importlib.util

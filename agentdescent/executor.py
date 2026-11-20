@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, List, Optional, Protocol, Sequence, runtime_checkable
 
 from .agents import ProviderConfigError
+from .budget import BudgetStop
 from .metrics import Meter
 from .pipeline import describe
 from .workspec import RolloutSpec
@@ -63,7 +64,7 @@ class Result:
     #: How the failure should be counted. Infrastructure failures must not feed
     #: the worker-retirement rule, which fires hardest before any worker has
     #: succeeded -- exactly when sandboxes fail to start.
-    kind: str = "ok"          # "ok" | "model" | "infrastructure" | "caller"
+    kind: str = "ok"          # "ok" | "model" | "infrastructure" | "caller" | "budget"
     seconds: float = 0.0
 
     @property
@@ -139,6 +140,14 @@ class ThreadExecutor:
             # sample (#635).
             return Result(spec.lease_id, spec.task.id, error=describe(e),
                           kind="caller", seconds=time.time() - t0)
+        except BudgetStop as e:
+            # A run-level call cap refused this call (#1166). Not a rollout
+            # failure and not raised: `map_rollouts` delivers results through a
+            # queue, so an exception here would either hang the reader or be
+            # lost. Its own kind lets the engine re-raise the stop the limit
+            # already recorded, numbers included.
+            return Result(spec.lease_id, spec.task.id, error=e.detail(),
+                          kind="budget", seconds=time.time() - t0)
         except Exception as e:  # noqa: BLE001 -- a backend or candidate failure
             return Result(spec.lease_id, spec.task.id, error=describe(e),
                           kind="model", seconds=time.time() - t0)

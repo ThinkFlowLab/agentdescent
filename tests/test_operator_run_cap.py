@@ -165,3 +165,45 @@ def test_a_hand_set_request_does_not_blame_a_looser_ceiling(tmp_path, monkeypatc
     detail = st.stop_detail or ""
     assert "max_calls" in detail, detail
     assert "AGENTDESCENT_MAX_CALLS" not in detail, detail
+
+
+def test_a_hand_set_request_below_the_ceiling_stays_bare(tmp_path, monkeypatch):
+    """Same class as the row above, from the other side of the ceiling.
+
+    Ceiling 2, caller cap 1, a stale request of 50: the applied value is the
+    caller's, so the ceiling never bound the run and must not be named.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "2")
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS_REQUESTED", "50")
+    rd, st, _ = _run(tmp_path, max_calls=1)
+    assert len(CALLS) == 1, f"the caller's cap let {len(CALLS)} calls through"
+    assert st.stop_reason == "budget", st
+    assert "AGENTDESCENT_MAX_CALLS" not in (st.stop_detail or ""), st.stop_detail
+
+
+def test_a_detached_run_with_no_caller_cap_still_names_the_ceiling(tmp_path,
+                                                                 monkeypatch):
+    """The empty-string branch: the caller named no cap, so the ceiling did.
+
+    The parent records "no caller cap" as an empty value rather than omitting
+    the variable, which is the one ``_requested_calls`` branch with no other
+    row: the child must still attribute the stop to the ceiling.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "2")
+    rd = runstore.create(_spec().to_dict(), store=str(tmp_path / "runs"))
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout="4242", stderr="")
+
+    monkeypatch.setattr(runstore.subprocess, "run", fake_run)
+    runstore.launch(rd)
+    assert seen["env"].get("AGENTDESCENT_MAX_CALLS_REQUESTED") == ""
+
+    # The child's own view: the empty value plus the clamped argv.
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS_REQUESTED", "")
+    rd2, st, _ = _run(tmp_path, max_calls=2)
+    assert len(CALLS) == 2, f"the ceiling let {len(CALLS)} calls through"
+    assert st.stop_reason == "budget", st
+    assert "AGENTDESCENT_MAX_CALLS" in (st.stop_detail or ""), st.stop_detail

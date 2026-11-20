@@ -6,6 +6,612 @@ All notable changes to AgentDescent are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-20
+
+### Added
+
+- Add an opt-in `ArtifactSearch` policy bundle that routes proposal generation
+    across configured models, screens duplicate candidates before held-out
+    evaluation, and feeds attributable measured gains back to the router.
+  - Preserve optional proposal identities through synchronous and asynchronous
+    evolution while keeping existing string proposers compatible.
+
+- `agentdescent plan --probe` and `agentdescent algorithms run … --probe` send one
+  minimal model call per model-backed agent and reflector before a run exists, so
+  an expired subscription, an exhausted quota, a wrong model name or a dead
+  endpoint is refused there with the same `SubscriptionInactive` /
+  `QuotaExhausted` / `ProviderConfigError` answer `evolve` would have given — and
+  without a `failed round 0/1` entry in the run store. Off by default: plain
+  `plan` still sends nothing (#1048).
+
+- An `otel-wire` CI leg installs the `[otel]` extra and exports one span and one
+  metric to a closed port on `127.0.0.1`, asserting a refused connection is logged
+  and contained rather than raised out of `export_run`. A test pins that
+  `export_span` copies `ExportedSpan.attributes` verbatim — it filters and invents
+  nothing — so the no-content guarantee is `export_run`'s and the caller's for
+  spans built by hand (#1083).
+
+  The leg also keeps the fail-fast row real where the extra is installed: the SDK
+  import is halted through the interpreter's own `sys.modules` marker instead of a
+  probe-and-skip, so construction still has to name the install line, and the
+  loopback endpoint rows assert the accepted endpoint on a stubbed seam rather than
+  building a live provider. `docs/metrics.md` now says credentials go in
+  `OTEL_EXPORTER_OTLP_HEADERS`, never in the URL (#1083).
+
+- MCP `plan` takes `probe: bool = False` and, when true, runs the same
+  preflight as `plan --probe`: one minimal call per model-backed agent, with the
+  rows under `probe` in the result. A refusal makes the plan `ok: false` and
+  points `next` at the repair action instead of `start`, so a host that follows
+  `next` no longer discovers an expired subscription only after the run exists.
+  The default is unchanged: plain `plan` still sends nothing and returns its old
+  key set. The shared host skill teaches the probe step, so every installed
+  host now asks for it on the first use of a model (#1094).
+
+- `plan` can now catch two wasteful runs before they are paid for. The opt-in
+  `--baseline-sample N` scores the seed artifact on the first N tasks (one agent
+  call per task, quoted before the first call) and a seed at or above
+  `--saturation` (default `0.90`) prints `no headroom` and withholds the paid
+  run's quote unless `--force` is passed; `--json` carries the result as
+  `baseline` and sets `ready: false`. A plain `plan` still sends nothing.
+  `plan` and the pilot report also say when the artifact holds one key (a
+  `SingleSlot` prompt, a one-file tree): worker proposals contradict on that key,
+  so extra workers buy best-of-N selection, not merging (#1113).
+
+- A Star History chart at the end of the README, so visitors can see the
+  repository's GitHub star growth over time (#1130).
+
+- Portable artifact snapshots capture a complete FileTree candidate
+  (editable files plus frozen context) and the ledger's existing
+  id/parent/root lineage, and can be re-scored on another compatible
+  dataset without further search (`agentdescent snapshot
+  export|show|eval|apply`, #1138).
+
+- A run-level call cap that holds before the call (`--max-calls`, `--max-usd`,
+  also `max_calls` / `max_usd` in a spec's `evolve` block) (#1166). Unlike
+  `max_calls` on `evolve()`, which is a round barrier and lets a four-worker round
+  overshoot, the guarded cap is charged before each model call: the call that
+  would cross the limit is not made, the round closes without a partial merge or a
+  traceback, and the run ends `done` with `stop_reason=budget` and a
+  `stop_detail` naming the limit and the observed value, in `status.json` and in
+  `agentdescent status`. `0` is a real limit (no calls); a negative or non-numeric
+  value is refused at validation with the field and the value named; with neither
+  flag set the run and `status.json` are unchanged. Offline, no new dependency.
+
+- `agentdescent.facade` is the versioned import surface for embedding the engine:
+  a curated `__all__` covering Path A and the durable `LoopKernel` path, with
+  `API_VERSION = "1"` and a promise that changes are additive within a version and
+  removals need a bump. `tests/test_facade.py` pins the list, so widening or
+  narrowing it is a deliberate edit rather than an accidental import; nothing
+  outside the list — including the package root's research exports — is covered
+  (#920).
+
+- An opt-in OpenTelemetry bridge (`agentdescent.otel_export`): `export_run()` writes
+  one span per round and one per decision, and re-publishes the `rsi_metrics`
+  families plus a round-reward histogram. It is off unless
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a host can inject any object with
+  `export_span`/`export_metric` (so tests need no collector), and the new optional
+  `agentdescent[otel]` extra is imported only when an `OtlpExporter` is
+  constructed — importing the package and running normally needs nothing new. No
+  prompts or responses are exported by default. An endpoint carrying
+  credentials is refused without the value being echoed, and plain
+  `http://` is accepted only for a literal loopback collector; a remote
+  collector needs TLS terminated in front of it (#923).
+
+- `agentdescent.ports` adds the `ArtifactStore` protocol and the
+  `FileArtifactStore` reference backend over a content-addressed directory tree;
+  an id, revision, parent or path that could leave the root is refused (#1026).
+
+- `agentdescent.ports` adds the `EvaluationProvider` protocol and the
+  `CsvEvaluationProvider` reference backend, so a split and the scorer a run
+  optimises can come from a database or an internal judge service instead of a
+  file; `oracle` and `judge` report `None` rather than a score they cannot measure
+  (#924).
+
+- `agentdescent.pilot` turns one evolution run into one report a user can defend:
+  the seed and the result are scored on the same disjoint test tasks, the paired
+  scores become `TrustEvidence`, and `promote()` returns `promote` / `defer` /
+  `reject` with the reasons, cost, manifest and next action. A test task that
+  raised is run-health evidence rather than a zero, an unchanged artifact reports
+  `noise_only`, a missing contamination check defers, and a contaminated dataset
+  rejects before any model call. `pilot_scores()` exposes the same decision seam
+  for a run that already happened elsewhere; the CLI and `apply` are separate
+  follow-ups (#937).
+
+- Falsification-gated lesson admission: `FalsificationAcceptance` fills the existing
+  `Policies(acceptance=...)` slot and decides a commit on per-task measurements
+  instead of held-out counts alone. A lesson commits only with a measured gain on the
+  target-transfer partition, no per-task regression on the archived partition, and no
+  verdict change on the falsification partition; each reject reason
+  (`no-target-transfer`, `archived-regression`, `falsification-moved`) names the
+  failing task ids. Probes are caller-supplied (`MergeContext.probes`), and when they
+  are unavailable the policy defers (`AcceptDecision(defer=True)`) rather than falling
+  back to the count-only gate; all three partitions are required, and an empty one is
+  refused at construction instead of deferring on every candidate. A deferral under a
+  category this build does not know reports `probes-unavailable` rather than raising
+  inside the merge thread. A committed lesson hands its review evidence
+  (`rule_id -> {precondition, behavior_change, expected_effect, verifier, trace_ids,
+  evidence_card_hash}`) to the shared provenance writer as
+  `AcceptDecision.provenance` (#938).
+
+- `VerifierAgreement.admission_report()` now measures the cross-prompt error
+  overlap of the accepted stratum: the share of audit prompts on which a commit
+  the verifier accepted is oracle-denied, reported as `repeat_overlap`, with
+  `high_universality` at half the prompts over three audited accepts. A high
+  overlap blocks the admit the mean gains would allow; an unmeasurable one (a
+  single prompt, or a thin sample) stays `None` and never reads as zero (#940).
+
+- Verifier admission on both strata: `VerifierAgreement(rejected_sample_rate=...)`
+  audits a sample of the commits it rejected, and `admission_report()` reports
+  precision on the accepted stratum with its bootstrap interval and
+  `rejection_accuracy_{lower,upper}`, the interval on the share of rejections that
+  were correct, so a verifier that rejects good work no longer scores 1.0 on
+  precision alone. A demote needs a bound already under 0.5 on a stratum with at
+  least three audited decisions, an admit needs both pessimistic bounds at 0.8, and
+  a thin sample defers. `require_verifier_admission=True` carries it on
+  `EnsembleReport.admission`: missing, incomplete or insufficient defers, `reject`
+  fails closed (#940).
+
+- Baseline noise calibration repeats the baseline and reports a `noise_floor`,
+  task/model/run variance decomposition, `gain_over_noise` and `distinguishable`;
+  a gain inside the floor is labelled "not distinguishable from noise" and is
+  never promotion evidence (#944).
+
+- A per-diff `Cost` block (calls, tokens, wall seconds, optional USD), the
+  `cost_efficiency` / `cost_status` reads, a `CostPolicy` acceptance wrapper that
+  refuses a quality gain whose cost efficiency regressed (and defers when cost is
+  required but unmeasured), a `cost_report` with cost per accepted diff and per
+  point of gain, and `PromotionRules(require_cost=True)` (#945). A report average
+  is `None` unless every decision measured the unit being divided -- a row priced
+  in tokens only cannot make the dollar figure look cheaper than the evidence.
+  This also fixes the API reference for the name it exports: `docs/api.md` was
+  generated from a flat short-name map, so `agentdescent.Cost` was shadowed by
+  `agentdescent.audit.scorecard.Cost` and the page documented a signature the
+  top-level import does not return. The generator now keys by `(module, name)` and
+  `agentdescent.cost` has its own section, so both types are documented.
+
+- `FailureStratifiedSampler` stratifies tasks by base failure signature, keeps
+  search/select/final sets disjoint, and reports stratum coverage, overlap and
+  transfer status so one dominant failure mode cannot take over the search set
+  (#946). It is exported from the package root, the transfer comparison keeps a
+  float floor so equal means report `holds`, and the pick refusal names the
+  supported wiring (`tasks=sampler.split().search`).
+
+- Memory operation telemetry: `memory.read` / `memory.write` / `memory.update` /
+  `memory.forget` spans with lesson provenance (precondition, evidence hash,
+  source trace ids, verifier, expected effect), plus a memory audit block on the
+  telemetry and experience reports that counts each operation, flags lessons
+  without provenance, and lists forgotten or rolled-back lessons with a reason and
+  attributable regressions (#947).
+
+- `HarnessIntegrity` checks a plugin/harness before/after snapshot before
+  promotion: guardrail enforcement-point order (policy before tool mediation),
+  permission and allow-rule state, the action set unless the diff declares exactly
+  that change, and the decision-path record for every enforced relationship.
+  `govern_harness_change(..., integrity=...)` rejects a broken composition before
+  the proof, approval and promotion seams, and the report names each broken
+  relationship with the state it observed (#949).
+
+- `reports/evidence/1042-ports-leaf-write-through.json` publishes the
+  leaf-write-through fix as a v1 evidence card — `code` and `reliability` cite
+  the merged sha, the guarded lines and the regression test, and the other ten
+  fields say `not reviewed` — with a test that keeps every published card
+  schema-valid (#951).
+
+- `python -m tools.evidence_card --check` validates the 12-field evidence card
+  schema v1 over the named `*.json` cards, and refuses a missing, unknown or blank
+  field by name; `not reviewed` is the explicit way to say a field has no evidence
+  (#1025).
+
+- Two evidence cards for headline results from `reports/` -- the audit's constant
+  rubric tying the judge at 0.836, and the 177-pair verifier bias with its 0.2203
+  resolution floor -- plus `reports/evidence/README.md`, which states that a new
+  claim needs a card, and tests pinning each card's number, its reproduction and
+  the rule itself (#951).
+
+- `docs/dsh-super-agent.md` and `scripts/verify-dsh-superagent.sh`: the zero-code
+  composition of AgentDescent with dsh-super-agent — the two Cordis rows in the
+  `superagent` profile, the skill-or-MCP fallback, the `plan → start → status →
+  show` worker loop with no auto-apply, write-dir and budget settings for a
+  worker, and a gated check that skips cleanly without a live host (#962).
+
+- A worker session (`AGENTDESCENT_NESTED=1`, set in every host worker the runner
+  spawns) can no longer start a nested run through the CLI: `agentdescent evolve`
+  refuses with exit 2 and `reason: nested-run` before it reads the spec or creates
+  a run, and `doctor` reports `nested_guard` instead of only a boolean. The MCP
+  `start` stub carries the same reason and sentence, so a host branches on one
+  contract. Offline, no new sandbox or auth layer (#963).
+
+- `scripts/dsh-superagent-run.sh` hands a long evolution run off a
+  dsh-superagent worker: it starts the run in a detached `tmux` session
+  (`setsid` fallback), writes `waiting.json` with the run id, round and run
+  directory, and returns at once, so a worker turn no longer holds its slot for
+  the length of the run (#964).
+
+### Changed
+
+- A product-surface refusal prints one `error: <message>` line — the same envelope
+  the `cannot write` writers use — instead of prefixing `SurfaceError:`, and the
+  `--json` `error` field drops the prefix too. Any other exception keeps its class
+  name (#1032).
+
+- `agentdescent governed-harness` accepts a caller-supplied `integrity` pair and
+  passes it to `govern_harness_change`, so a spec whose after-state reorders the
+  guardrail path, drops an allow rule, loses a decision record or changes the
+  action set without declaring it is rejected before proof, approval and
+  promotion instead of silently skipping the composition check (#1053).
+
+- `agentdescent apply` honours `AGENTDESCENT_SURFACE_WRITE_DIRS`: a destination,
+  a materialised tree or a `.bak-N` slot outside the allowlist is refused with
+  exit 2 before anything touches disk. Inside a host worker
+  (`AGENTDESCENT_NESTED=1`) the allowlist defaults to the run's cwd plus
+  `$AGENTDESCENT_HOME`; outside one it is only enforced when the variable is set,
+  so a terminal `apply --to <path>` behaves as before. `show --diff` still
+  renders and reports the refused target in `apply_plan` (#1082).
+
+- `docs/cost.md` and the `Cost.from_cards` / module docstrings now state what the
+  card fallback actually returns in-tree: no producer writes
+  `cost_tokens`/`cost_wallclock` onto an `EvidenceCard`, so `Cost.from_cards`
+  yields `Cost()` — unknown, not a free diff — and a caller that wants the gate to
+  price a diff passes `MergeContext.diff_cost = Cost.from_usage(usage)`. The page
+  also warns that `require_cost=True` defers every candidate on a run whose cards
+  carry no cost (#1085).
+
+- `agentdescent --help` now lists the first-run path (`demo`, `init`, `plan`,
+  `evolve`, `show`, `apply`, `doctor`, `status`) plus `mcp`, and every other verb
+  is grouped under a new `lab` subcommand (`agentdescent lab campaign …`); each
+  verb keeps its old top-level path, its arguments, its output and its exit code,
+  and the same declaration mounts both paths (#1112).
+
+- The README and documentation landing pages now lead with one first-run path,
+  and the docs navigation is grouped by getting started, hosts and plugins, and
+  algorithms, instead of one long mixed list (#1131).
+
+- The top-level `agentdescent --help` now ends with a short next-steps block
+  naming `agentdescent install <host>`, `agentdescent algorithms list` and
+  `agentdescent lab --help`, so the two verbs the first-run docs use are
+  discoverable on the first screen without reading the ~40 verbs under `lab`
+  (#1174). The listing, the usage line and `DEFAULT_SURFACE` are unchanged from
+  #1112, and no verb, argument, output or exit code changed.
+
+- The results and audit pages now point at evidence cards for their headline
+  claims: one card per claim under `reports/evidence/`, each answering all twelve
+  fields and writing `not reviewed` where nobody measured. Eight new cards cover
+  the one-call path, bringing your own agent, the efficiency rows, equal-budget
+  HotpotQA, the merge cost lever, judge bias across five workloads, ground-truth
+  repair, and the rule search's residual against the sigma floor. The directory
+  indexes them in `reports/evidence/README.md`, the two bench cards are recomputed
+  in CI from the committed runs, and the rest say on the card that their number
+  came from a live run — so the gap between "we measured it" and "you can check
+  it" is visible where the claim is (#951).
+
+### Fixed
+
+- `init` and `algorithms run` refuse a symlink planted at the destination — the
+  `--out` leaf, the `<stem>.opencode-providers.json` file, and the starter
+  directories a skill library is seeded into — instead of writing through it, so
+  the spec can no longer land outside the tree and no `.bak-N` copy holds a file
+  from outside it (#1008).
+
+- `agentdescent demo --algorithm evoskill` now says what it learned in one
+  readable line: each induced `SKILL.md` is named with its rule bullets instead
+  of a whole escaped file, and a seeded `rules.md` the run left unchanged is no
+  longer listed as learned (#1011).
+
+- `agentdescent skills` now treats the store leaf as a regular file: a directory,
+  device or FIFO named by `--store` is refused with `cannot read skill bank …: not
+  a regular file` instead of reporting `skills: 0`, and every write refuses a
+  symlink store before it creates anything, so `--apply` can no longer replace the
+  link and leave the link and its target disagreeing. A link to a file still
+  reads. `audit --apply` now prints `applied: false` when no status changed (it
+  used to echo the flag), which is a visible change to that output line.
+
+- `agentdescent demo --dir` now refuses a symlink planted at a fixture leaf or at
+  `spec.json` instead of following it: the run exits `2` with
+  `cannot write …: '<leaf>' is a symlink` before the first byte, so the demo's
+  bytes can no longer land outside `--dir` or overwrite the file the link points
+  at. The check is `filetree.dest_problem`, the same rule `init` (#1008) and the
+  tree writer (#977) use, and a link above `--dir` is still allowed (#1017).
+
+- The MCP `algorithm_spec` tool now refuses an `out` path outside the operator's
+  `AGENTDESCENT_SURFACE_WRITE_DIRS` allowlist instead of writing the spec there.
+  It was the only writing tool that skipped `_check_write`, so a host could name
+  any path on the server's filesystem; the default allowlist is unchanged (the
+  server's cwd and `$AGENTDESCENT_HOME`), and an allowed `out` plans as before
+  (#1018).
+
+- The product surfaces (`governed-harness`, `platform`, `capability`,
+  `meta-campaign`, `ops`, `tenant`, `traces`, `compile-skill`) and the MCP writers
+  now refuse a symlink planted at the output leaf — one `error: SurfaceError:
+  cannot write …: '<leaf>' is a symlink` line, exit 2, without touching the link
+  or its target — instead of silently replacing the operator's link with a
+  regular file (#1029).
+
+- The workspace registry, the consolidation archive (`archive`, `mark_exam`) and
+  the run store's atomic JSON writer refuse a symlink planted at their own file
+  instead of silently replacing it with a regular file: `cannot write <path>:
+  '<leaf>' is a symlink`, raised before any temporary exists, with the link and
+  its target's bytes untouched. A symlinked directory above the file still
+  works (#1030).
+
+- `plan` no longer warns that `n_workers` is "best-of-N selection" for
+  `algorithm: gepa`: its Pareto pool admits every surviving proposal, so the
+  "collapse to one candidate / name a `reflect` model" advice did not apply on
+  the aggregator_factory path (#1039).
+
+- `FileArtifactStore` no longer writes through a link planted at a leaf it
+  writes: `promote` refuses `<to>` before it reads or removes through it, and
+  `_commit` refuses `<name>.json` before staging, both as `ValueError: cannot
+  write <path>: '<leaf>' is a symlink`. The sidecar is now staged and renamed
+  over that leaf, so a hardlink at `<name>.json` is replaced instead of
+  truncating the inode it shares with bytes outside `root`. The link and those
+  bytes are untouched, and a symlinked directory above the store still works
+  (#1041).
+
+- `agentdescent capability init --demo` refuses a symlink planted at
+  `capability-traces.jsonl` or at `--out` before the first byte, instead of
+  following the link and destroying the file it points at; a link at `--out` no
+  longer leaves a half-written traces fixture behind (#1043).
+
+  The traces fixture is now staged in a temporary file and renamed into place, so
+  a hardlink at that leaf keeps the bytes it shares with the file outside, a link
+  planted between the guard and the write is never dereferenced, and a directory
+  at the leaf is refused with `cannot write <path>: not a file` instead of a raw
+  `IsADirectoryError`.
+
+- `FileArtifactStore` now refuses a regular file where a revision tree belongs and
+  a directory where its sidecar belongs with `ValueError` before anything is
+  written, instead of the raw `NotADirectoryError`/`IsADirectoryError` from the
+  rename; a refused sidecar no longer leaves the revision listed without one
+  (#1045).
+
+- `agentdescent capability init` writes the spec before the demo traces, so an
+  `--out` that is an existing directory fails at exit 2 without leaving a
+  `capability-traces.jsonl` in its parent. The staged traces are flushed and
+  `fsync`ed before the rename, and a `KeyboardInterrupt` while they are written
+  removes the temporary file instead of leaving a `.staging-*.jsonl` behind
+  (#1046).
+
+- `ExperienceStore.add` refuses a link planted at the `--store` leaf before the
+  first byte — a symlink, a hardlink and a dangling symlink each appended
+  wherever the link pointed — and refuses a leaf that is not a regular file,
+  with the sibling writers' `cannot write <path>: <problem>` shape (#1064).
+
+- Telemetry exports lose no more than credentials: a key is dropped when a whole
+  component of it names a credential, not when it merely contains the substring
+  `token` or `secret`. `tokens`, `max_tokens`, `input_tokens`, `output_tokens`,
+  `token_count`, `tokens_in`, `budget_tokens`, `secret_free` and
+  `secrets_scanned` are written again (the cost and budget counters among them),
+  while `api_key`, `apikey`, `access_key`, `client_secret`, `private_key`,
+  `password`, `authorization`, `credential` and the `*_token` spellings still
+  drop (#1070).
+
+- A detached run no longer inherits the worker's own session: `runstore.launch`
+  drops the host-session markers it lists, except the four host config roots it
+  keeps (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`, `XDG_CONFIG_HOME`), before
+  it starts the grandchild, so the host worker's session identity and MCP server
+  configuration stay with the host while the credentials and `PATH` the run needs
+  still pass through (#1082). The marker list is `SESSION_MARKERS` (`DSH_*`,
+  `CLAUDE*`, `CODEX*`, `MCP_*`, the OpenCode config carriers and
+  `XDG_CONFIG_HOME`), the one the candidate worker already dropped
+  (`agentdescent.agents.worker_env`); it used to be a second, shorter copy, and
+  five of its eleven entries crossed the scrub. Those four roots name
+  configuration rather than session, and the run resolves a host's real home from
+  them (#1082).
+
+- Trust evidence now names the actual reason a gain is refused as noise: too few
+  baseline repeats to bound a floor, a gain inside the floor (printed as a band
+  around the baseline mean rather than an absolute interval against a delta), or
+  a gain below `min_effect`. `gain_over_noise` is `0.0` when the floor is
+  undefined instead of a ratio over an epsilon (#1089).
+
+- `trust_evidence` now explains a refused gain that is zero or negative as "the
+  candidate did not improve on the baseline" instead of blaming the noise floor,
+  and the note's docstring lists all four causes in code order (#1091).
+
+- A resumed run continues its ledger's round numbering instead of restarting at
+  `0`, and `status.best_reward` no longer rewinds below a reward the run's own
+  history still holds. `execute()` passes one past the last recorded round as the
+  new `round_base` and seeds the best from the existing rows; a checkpoint further
+  ahead than the ledger still wins, and an empty ledger still starts at `0`
+  (#1092).
+
+- A failed `plan --probe` or `algorithms run --probe` no longer ends with
+  `next: agentdescent evolve`. The last line (and the JSON `next`) is the
+  repair action, `--json` sets `ready: false` while leaving `ok` about the
+  plan itself, and a successful or omitted probe is unchanged (#1093).
+
+- `_is_secret_key` no longer lets a credential through when it arrives as one
+  word: `PGPASSWORD`, `s3secretkey` and `AWSSecretAccessKey` are matched by
+  whole-word suffix on a single-component key, and the adjacent-pair lookup
+  tolerates one plural `s`, so `client_secrets` and `api_keys` are dropped too.
+  The plural spellings (`passwords`, `pgpasswords`, `db_secrets`) match in the
+  last position or as a whole component. The `#1070` counters (`tokens`,
+  `max_tokens`, `secrets_scanned`) still survive, and `auth` stays a recorded
+  non-goal (#1095).
+
+- The handoff wrapper no longer reports a run that never started as a successful
+  handoff: when the wait window closes with the child gone and no new
+  `status.json` where the wrapper can see it, it writes `waiting.json` with
+  `status: failed` and `state: exited`, and exits nonzero with the child's own
+  reason left in `worker.log`. A child that is still running and has not written
+  its status yet is unchanged: `waiting`, `found: false`, exit 0. A store the
+  caller owns as the run directory is still reported from its own rewritten
+  `status.json`. The verdict reads the store again after the liveness probe, so a
+  status written while the probe ran is still this handoff's. The page says all
+  three (#1096).
+
+- The env-scrub note no longer says it drops "every" session marker and then keeps
+  some of them: `docs/dsh-super-agent.md` and the #1082 release note now name the
+  four host config roots (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`,
+  `XDG_CONFIG_HOME`) as an exception to the marker list before that list appears,
+  so the first clause cannot be read as dropping them (#1098).
+
+- `manifest.redact` now matches every credential spelling `rsi_telemetry` does:
+  `PGPASSWORD`, `s3secretkey`, `client_secrets` and the other one-word or plural
+  forms are redacted before hashing and before a manifest or trajectory record is
+  written, instead of being stored and hashed in clear. The manifest predicate
+  keeps its own rules (`bearer`, and the `*_key` suffix that `sort_key` relies on)
+  and delegates the rest, so a key redacted before still is. Records whose
+  `model_config` or `extra` carried one of the newly matched spellings get a new
+  `model_hash` / `spec_hash`, so `verify_manifest` reports those inputs as changed
+  for them: that is the fix redacting what it used to leak, not a bug (#1100).
+
+- The `scripts/dsh-superagent-run.sh` handoff no longer reports an earlier run that
+  is still going. The launch epoch is taken with the `status.json` snapshot, and a
+  changed file is only reported when its `started` is numeric and no older than
+  that epoch, so a handoff into a reused store names its own run — or
+  `found: false` — instead of the earlier run, whose `run_id` the page's read-back
+  would then have polled (#1101).
+
+- `algorithms run` no longer prints the `--rounds 1 --workers 1` quick-trial hint
+  after a refused `--probe`: with the kind's default rounds and workers the hint
+  used to land below `next: renew the subscription …`, so the last line on screen
+  answered a question the refusal had already answered. The hint still prints
+  after a passing probe and when no probe runs, and every other line of the
+  refusal is unchanged (#1106).
+
+- The MCP `demo` tool description no longer says evoskill needs a real model:
+  it lists the same offline cards as `agentdescent demo --help` (including
+  evoskill, which defaults to the `skill_library` fixture) and accepts
+  `kind` `skill_library` (#1107).
+
+- `algorithm_spec` no longer defaults its starter spec to a path beside the
+  user's target, which the default write allowlist refused: an omitted `out` now
+  writes `agentdescent.<name>.spec.json` under `$AGENTDESCENT_HOME` (or the first
+  explicitly allowed root), so the shortest documented path plans on an untouched
+  install. The tool description and the shared `SKILL.md` say so, and a refused
+  explicit `out` names the allowed roots and an `out` that works (#1108).
+
+- `apply` into a tree target that no longer exists now says so: the plan carries
+  `"created": true` and a real run prints `created <dest> from run <id>; nothing
+  was restored and no backup was taken` once on stderr, instead of a
+  `written`/`backup: []` plan that read like an ordinary in-place update. An
+  in-place apply keeps `"created": false` and prints no line; so does a no-op one,
+  because an empty artifact into a missing target writes nothing and must not
+  claim a recreate. The dry run reports the flag without the line, since it
+  creates nothing. The flag is emitted for the tree path only: a text `--to` plan
+  is unchanged and carries no `created` key (#1118).
+
+- `traces digest --events FILE` now reads a wrapped `{"events": [...]}` object
+  (compact or pretty-printed) as the same digest as a JSON array, instead of
+  reporting a clean bill or exiting 2 (#1119).
+
+- The GitHub publisher page now documents fast-forward-only proposal branch
+  updates: a second publish of a `behind` or `diverged` branch is refused with
+  `refusing to rewrite it` instead of promising a force update (#1120).
+
+- `algorithm_spec` no longer writes its default starter spec inside a directory
+  target: when the only allowed write roots are the target itself or below it,
+  the call returns `ok: false` naming the target and
+  AGENTDESCENT_SURFACE_WRITE_DIRS instead of
+  dropping `agentdescent.<name>.spec.json` into the user's directory; a usable
+  root outside the target is still preferred, and the description no longer
+  claims `$AGENTDESCENT_HOME` when that home is the target (#1122).
+
+- A text-kind `apply <run> --to <fresh>/rule.md` now creates the missing parent
+  directory before writing, so the dry run it had already reported green is true:
+  the real run exits 0 and the file lands at that path. A genuinely unwritable
+  `--to` still exits 2 with the single `error: cannot write …` line (#1124).
+
+- The cost page no longer says `agentdescent/pilot.py` is absent: the module shipped
+  in #1121, its `PilotReport` carries the run's cost mapping, and `CostReport`
+  stays the cost-only surface that page describes (#1132).
+
+- `pilot` no longer reports the seed-0 artifact next to scores pooled
+  across every seed. A single artifact is reported only when every seed
+  produced it; otherwise the report summarizes per seed (#1137).
+
+- A promoting multi-seed pilot report no longer tells the reader to "review the
+  artifact diff" or "apply it" when the seeds produced different artifacts and the
+  report names none. The steps point at `run.per_seed` and ask for one seed's
+  artifact to be chosen, reviewed and applied as an explicit step; the single-seed
+  and agreeing-seed reports keep their current text (#1141).
+
+- `demo --algorithm NAME` no longer ends with `evolve agentdescent.NAME.spec.json`.
+  That file does not exist until `algorithms run` writes it, so following the
+  footer (or `--json` / MCP `next`) failed with exit 2. The footer still points
+  at `algorithms run NAME ...`, which plans and then prints `evolve` with the
+  absolute path it just wrote (#1145).
+
+- The first-screen demo transcripts (`README.md`, `docs/start.md`,
+  `docs/plugin-quickstart.md`, `docs/testing-guide.md`) now show the seed baseline
+  the CLI prints, `held-out reward: 0.000 -> 1.000`, instead of a bare `1.000`, and
+  a docs guard keeps those four blocks on the command's output (#1146).
+
+- `snapshot apply` on a text snapshot now writes the rendered prompt to the file named by `--to`, with the same backup, no-op, and parent-creation rules as `apply --from`. It previously materialised the strategy's internal rule store (hash-named files) into a directory, and an empty-rules snapshot reported a no-op instead of writing the seed prompt. A directory `--to` is refused. Tree-kind snapshots are unchanged (#1149).
+
+- A snapshot's `artifact_id` is validated as one path-safe component when the
+  snapshot is built, and both staging writes (`snapshot eval`, `snapshot apply`)
+  stage under a fixed name inside their temp directory instead of deriving a
+  path from the id: applying or scoring a snapshot JSON received from someone
+  else can no longer make the staging write land outside that temp directory.
+  A malformed id is reported as a clean CLI error (exit 2), not a traceback
+  (#1150).
+
+- The snapshot re-evaluation examples now use `dest.json`, which `load_spec`
+  can read, instead of `dest.yaml` (#1154).
+
+- `plan --baseline-sample` now keeps the plan envelope when seed scoring fails
+  on a provider, subscription, or endpoint error: exit 1 (not 2), `--json`
+  writes `ok: true`, `ready: false`, a `baseline` object with the failure, and
+  a `next` repair step (the same wording `plan --probe` already uses), and the
+  human form keeps the plan plus `next:` / `then:`. Input errors such as
+  `--baseline-sample 0` still exit 2. No run-store entry is written (#1155).
+
+- `plan --baseline-sample` now quotes the number of tasks the sample can
+  actually score, not the requested N: a 4-task spec asked for 50 is priced
+  at 4 calls, and that count matches `baseline.sample`. A request below the
+  task count is unchanged (#1157).
+
+- A claim no longer expires under a pull request that links its issue with
+  `Refs #N` or `Part of #N`: the controller now reads those references when it
+  decides whether the claim's TTL is still fed by a push, while only closing
+  keywords still make a PR an agent PR (#1161).
+
+- `snapshot eval` of a `skill_dir` snapshot now exposes the candidate under
+  the snapshot's `artifact_id` in the destination layout (for example
+  `.claude/skills/csv-total/`), so a demo export re-evaluated with `--spec`
+  scores the learned skill instead of 0 because the dest agent looked under
+  `.claude/skills/artifact/` (#1164).
+
+- `agentdescent lab --help` and the usage line on a `lab` argparse error no
+  longer list the internal `run` worker in the `{...}` metavar; the verb stays
+  reachable as `lab run` (#1171).
+
+- `export_metric()` sent histograms through the counter's `add`, so the first real
+  export of an `agentdescent_rsi_round_reward` raised `AttributeError` out of
+  `export_run`. Histograms now call the SDK's `Histogram.record()`, and the fake
+  SDK gives each instrument kind only its own method, so the same mistake fails in
+  the offline suite instead of on a host's first run (#923).
+
+- The review gate now orders comments and reviews together by time and lets the
+  newest report at a tip decide, so a same-tip follow-up with no `Verdict:` line
+  (a withdrawal, an added requirement, an open question) voids an earlier PASS
+  there instead of leaving it counting. A report that names another tip is still
+  judged against that tip, a newer PASS still counts, and the `Ran:` / `Not run:`
+  handling for the winning PASS is unchanged (#928).
+
+### Security
+
+- Span values are redacted at the boundary that carries them out of the process:
+  `set_attribute`, `add_event`, a span's initial `attributes`, a directly
+  constructed `TelemetrySpan`, a `MemoryOperation.to_span_attributes()` and the
+  `exception` event's message now pass through the same key/value filter, so a
+  credential in a precondition, verifier, event detail or raised error is written
+  as `[redacted]` (#1063).
+
+- The handoff wrapper no longer builds its launch command as a shell string: the
+  log path and the run's command reach `tmux`/`setsid` as arguments, so a `--store`
+  containing `'`, `;`, `$` or a space is used literally instead of closing the
+  quote and running the rest of the path as shell words outside the worker's
+  process group (#1109).
+
+- `agentdescent mcp --transport streamable-http` can now require an
+  `Authorization: Bearer` header (`--http-token-env NAME`, with the token read
+  from the environment and never from the command line). A request without it is
+  answered 401 before an MCP session is created, so a leaked tunnel URL no longer
+  reaches `apply` or `start`; `--allow-remote` is refused without a token (#912).
+
 ## [0.10.0] — 2026-11-13
 
 ### Added
@@ -7639,7 +8245,8 @@ First public release on PyPI as **`agentdescent`**.
   discrete-space `Aggregator`, staleness policies, DP/TP/PP parallelism, layered
   governance, and the provider-agnostic `agentdescent.agents` completion layer.
 
-[Unreleased]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.7.0...v0.8.0

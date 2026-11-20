@@ -87,3 +87,62 @@ def test_a_detached_run_carries_the_operator_ceiling(tmp_path, monkeypatch):
     runstore.launch(rd, max_calls=50)
     argv = seen["argv"]
     assert argv[argv.index("--max-calls") + 1] == "2", argv
+
+
+def test_a_dollar_stop_never_names_the_call_ceiling(tmp_path, monkeypatch):
+    """The two caps are independent: a USD stop must not blame the call knob.
+
+    A run can carry both the operator's call ceiling and the caller's
+    ``--max-usd``. The USD refusal happens before any call, so the call ceiling
+    never bound it -- naming it in ``stop_detail`` would point the reader at a
+    knob that did nothing.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "2")
+    rd, st, _ = _run(tmp_path, max_usd=0.01, usd_per_call=0.01)
+    assert st.stop_reason == "budget", st
+    detail = st.stop_detail or ""
+    assert "max_usd" in detail, detail
+    assert "AGENTDESCENT_MAX_CALLS" not in detail, detail
+
+
+def test_the_detached_child_learns_what_the_caller_asked(tmp_path, monkeypatch):
+    """The child sees the clamped argv, so the label travels separately (#1082).
+
+    ``launch`` starts the child with ``--max-calls 2`` (the ceiling), which on its
+    own is indistinguishable from a caller who asked for 2. The requested number
+    rides in an internal variable so the child's ``status`` can still say which
+    knob bound the run; it never changes what is enforced.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "2")
+    rd = runstore.create(_spec().to_dict(), store=str(tmp_path / "runs"))
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout="4242", stderr="")
+
+    monkeypatch.setattr(runstore.subprocess, "run", fake_run)
+    runstore.launch(rd, max_calls=50)
+    argv = seen["argv"]
+    assert argv[argv.index("--max-calls") + 1] == "2", argv
+    assert seen["env"].get("AGENTDESCENT_MAX_CALLS_REQUESTED") == "50", seen["env"]
+
+
+def test_the_detached_run_names_the_ceiling_the_parent_applied(tmp_path, monkeypatch):
+    """The child's own view: requested 50, ceiling 2, argv capped at 2."""
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "2")
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS_REQUESTED", "50")
+    rd, st, _ = _run(tmp_path, max_calls=2)
+    assert len(CALLS) == 2, f"the ceiling let {len(CALLS)} calls through"
+    assert st.stop_reason == "budget", st
+    assert "AGENTDESCENT_MAX_CALLS" in (st.stop_detail or ""), st.stop_detail
+
+
+def test_an_equal_cap_does_not_name_the_ceiling(tmp_path, monkeypatch):
+    """Caller asked for exactly the ceiling: the caller's number bound it."""
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "2")
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS_REQUESTED", "2")
+    rd, st, _ = _run(tmp_path, max_calls=2)
+    assert st.stop_reason == "budget", st
+    assert "AGENTDESCENT_MAX_CALLS" not in (st.stop_detail or ""), st.stop_detail

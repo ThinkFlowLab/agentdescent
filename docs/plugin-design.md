@@ -597,8 +597,11 @@ Two guards keep this from folding in on itself:
   foreground `evolve` and the detached one alike. A caller's `--max-calls` can
   lower the ceiling but never raise it, and a run that names no cap of its own
   still gets it; reaching it ends the run `done` with `stop_reason="budget"`
-  and a `stop_detail` naming the variable. So "a worker asked for an unbounded
-  run" is answered by the environment, not by review.
+  and a `stop_detail` naming the variable. A detached run reads the same: the
+  child starts with the clamped `--max-calls` and learns what the caller asked
+  for through an internal label-only variable, so `status` says which knob bound
+  it from either path. So "a worker asked for an unbounded run" is answered by
+  the environment, not by review.
 * **The controller never hot-swaps itself.** A self-evolved plugin reaches the
   user's real installation only through `apply`, which is a human decision on
   a diff, after an L1 oracle gate, with a backup. The loop can improve its own

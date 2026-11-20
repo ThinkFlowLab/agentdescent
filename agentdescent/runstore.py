@@ -106,6 +106,12 @@ def require_budget_pair(budget_usd: Optional[float],
 #: un-priced dollar budget rather than guessing one.
 OPERATOR_MAX_CALLS_ENV = "AGENTDESCENT_MAX_CALLS"
 
+#: What the caller asked for, carried across the detach boundary (#1082). The
+#: child is started with the clamped ``--max-calls``, so without this its
+#: ``status`` cannot tell "the ceiling bound the run" from "the caller asked
+#: for exactly this". Label only: it never changes what is enforced.
+OPERATOR_MAX_CALLS_REQUESTED_ENV = "AGENTDESCENT_MAX_CALLS_REQUESTED"
+
 
 def operator_max_calls(environ: Optional[Mapping[str, str]] = None
                        ) -> Optional[int]:
@@ -124,14 +130,40 @@ def operator_max_calls(environ: Optional[Mapping[str, str]] = None
     return value
 
 
+def _requested_calls() -> Tuple[Optional[int], bool]:
+    """``(what the caller asked for, whether the parent recorded it)`` (#1082).
+
+    Label only. A malformed or negative value is ignored rather than refused:
+    the child was already started with the clamped argv, and this variable must
+    not be able to change anything but the wording of ``stop_detail``. A
+    present-but-empty value means "the caller named no cap of its own".
+    """
+    raw = os.environ.get(OPERATOR_MAX_CALLS_REQUESTED_ENV)
+    if raw is None:
+        return None, False
+    if not str(raw).strip():
+        return None, True
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None, False
+    return (value, True) if value >= 0 else (None, False)
+
+
 def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
-    """``(max_calls, whether the operator's ceiling is what bound it)`` (#1082)."""
+    """``(max_calls, whether the operator's ceiling is what bound it)`` (#1082).
+
+    In the detached child ``max_calls`` is already the clamped argv value, so
+    the parent's record of what the caller asked for is what decides whether
+    the ceiling bound the run.
+    """
     cap = operator_max_calls()
     if cap is None:
         return max_calls, False
     if max_calls is None or cap < max_calls:
         return cap, True
-    return max_calls, False
+    requested, present = _requested_calls()
+    return max_calls, present and (requested is None or requested > cap)
 
 
 def root() -> str:
@@ -716,7 +748,8 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     reaped when it ends instead of lingering as a zombie that still looks alive).
     Its stdout and stderr go to ``log.txt``.
     """
-    max_calls, _ = _clamped_max_calls(max_calls)
+    requested_calls = max_calls
+    max_calls, operator_bound = _clamped_max_calls(max_calls)
     require_budget_pair(budget_usd, usd_per_call)
     from .evolvespec import SpecError, build_call_limit
     try:
@@ -744,6 +777,10 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # prefix, so it survives either way.
     child_env = scrub_host_env({**os.environ, "PYTHONPATH": _child_pythonpath(),
                                 **(env or {})})
+    if operator_bound:
+        # After the scrub, so it survives; label only, nothing here is enforced.
+        child_env[OPERATOR_MAX_CALLS_REQUESTED_ENV] = (
+            "" if requested_calls is None else str(requested_calls))
     boot = subprocess.run([_python(), "-c", _BOOTSTRAP, rd.log_path, *argv],
                           capture_output=True, text=True, cwd=rd.path, env=child_env)
     if boot.returncode != 0 or not boot.stdout.strip().isdigit():

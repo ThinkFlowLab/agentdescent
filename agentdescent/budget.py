@@ -124,8 +124,10 @@ class CallLimit:
             elif self.max_usd is not None and self.usd_per_call:
                 # Tolerance: 3 x 0.01 must not exceed 0.03 through float noise.
                 if n * self.usd_per_call > self.max_usd + 1e-9:
+                    # No ``source``: a dollar cap has no operator ceiling behind
+                    # it (an un-priced one is refused before the run starts).
                     stop = BudgetStop("max_usd", self._taken * self.usd_per_call,
-                                      self.max_usd, self.source)
+                                      self.max_usd)
             if stop is not None:
                 if self._stopped is None:
                     self._stopped = stop

@@ -48,7 +48,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import (Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple)
 
 from .evolution import EvolutionResult, RoundInfo
 from .surface_common import scrub_host_env
@@ -97,6 +97,78 @@ def require_budget_pair(budget_usd: Optional[float],
     """
     if budget_usd is not None and not usd_per_call:
         raise RunStoreError(_BUDGET_NEEDS_PRICE)
+
+
+#: The operator's per-run model-call ceiling (#1082): every run this process
+#: starts -- foreground or detached -- is clamped to it. A caller's
+#: ``--max-calls`` may lower it, never raise it. Calls only: a dollar ceiling
+#: needs a per-call price, and `require_budget_pair` already refuses an
+#: un-priced dollar budget rather than guessing one.
+OPERATOR_MAX_CALLS_ENV = "AGENTDESCENT_MAX_CALLS"
+
+#: What the caller asked for, carried across the detach boundary (#1082). The
+#: child is started with the clamped ``--max-calls``, so without this its
+#: ``status`` cannot tell "the ceiling bound the run" from "the caller asked
+#: for exactly this". Label only: it never changes what is enforced.
+OPERATOR_MAX_CALLS_REQUESTED_ENV = "AGENTDESCENT_MAX_CALLS_REQUESTED"
+
+
+def operator_max_calls(environ: Optional[Mapping[str, str]] = None
+                       ) -> Optional[int]:
+    """The operator's per-run call ceiling, or ``None`` when unset (#1082)."""
+    env = os.environ if environ is None else environ
+    raw = env.get(OPERATOR_MAX_CALLS_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise RunStoreError(
+            f"{OPERATOR_MAX_CALLS_ENV} must be a non-negative integer, got {raw!r}")
+    return value
+
+
+def _requested_calls() -> Tuple[Optional[int], bool]:
+    """``(what the caller asked for, whether the parent recorded it)`` (#1082).
+
+    Label only. A malformed or negative value is ignored rather than refused:
+    the child was already started with the clamped argv, and this variable must
+    not be able to change anything but the wording of ``stop_detail``. A
+    present-but-empty value means "the caller named no cap of its own".
+    """
+    raw = os.environ.get(OPERATOR_MAX_CALLS_REQUESTED_ENV)
+    if raw is None:
+        return None, False
+    if not str(raw).strip():
+        return None, True
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None, False
+    return (value, True) if value >= 0 else (None, False)
+
+
+def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
+    """``(max_calls, whether the operator's ceiling is what bound it)`` (#1082).
+
+    In the detached child ``max_calls`` is already the clamped argv value, so
+    the parent's record of what the caller asked for is what decides whether
+    the ceiling bound the run.
+    """
+    cap = operator_max_calls()
+    if cap is None:
+        return max_calls, False
+    if max_calls is None or cap < max_calls:
+        return cap, True
+    requested, present = _requested_calls()
+    # The label follows the clamp, not the variable: only a run whose applied
+    # value *is* the ceiling can say the ceiling bound it, so a hand-set or
+    # stale request cannot blame a ceiling that never bit (#1082).
+    return (max_calls,
+            present and max_calls == cap
+            and (requested is None or requested > cap))
 
 
 def root() -> str:
@@ -681,6 +753,8 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     reaped when it ends instead of lingering as a zombie that still looks alive).
     Its stdout and stderr go to ``log.txt``.
     """
+    requested_calls = max_calls
+    max_calls, operator_bound = _clamped_max_calls(max_calls)
     require_budget_pair(budget_usd, usd_per_call)
     from .evolvespec import SpecError, build_call_limit
     try:
@@ -708,6 +782,10 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # prefix, so it survives either way.
     child_env = scrub_host_env({**os.environ, "PYTHONPATH": _child_pythonpath(),
                                 **(env or {})})
+    if operator_bound:
+        # After the scrub, so it survives; label only, nothing here is enforced.
+        child_env[OPERATOR_MAX_CALLS_REQUESTED_ENV] = (
+            "" if requested_calls is None else str(requested_calls))
     boot = subprocess.run([_python(), "-c", _BOOTSTRAP, rd.log_path, *argv],
                           capture_output=True, text=True, cwd=rd.path, env=child_env)
     if boot.returncode != 0 or not boot.stdout.strip().isdigit():
@@ -837,6 +915,7 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     # live run that later "ended without reporting".
     try:
         require_budget_pair(budget_usd, usd_per_call)
+        max_calls, operator_bound = _clamped_max_calls(max_calls)
     except RunStoreError as e:
         rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
         raise
@@ -854,6 +933,9 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
         # running, the same shape as a missing usd_per_call above.
         rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
         raise RunStoreError(str(e)) from None
+    if limit is not None and operator_bound:
+        # So `status` says which ceiling stopped the run, not just "max_calls".
+        limit.source = OPERATOR_MAX_CALLS_ENV
 
     def _progress() -> None:
         # Mid-call rewrite so CLI/MCP status shows work in flight (#358).

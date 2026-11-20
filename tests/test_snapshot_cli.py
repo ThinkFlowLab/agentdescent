@@ -124,3 +124,39 @@ def test_snapshot_show_export_eval_and_apply(tmp_path, capsys, monkeypatch):
     assert main(["--json", "snapshot", "apply", str(tree_source), "--to", str(target)]) == 0
     assert (target / "SKILL.md").read_text() == "always say yes\n"
     assert (target / "tests/n.txt").read_text() == "frozen\n"
+
+
+def test_snapshot_eval_json_reports_ok_false_when_a_task_fails(tmp_path, capsys):
+    """A partial eval exits 1, so ``--json`` must not call itself ``ok`` (#1179).
+
+    ``EvalReport.to_dict()`` has no ``ok`` key: ``cmd_snapshot_eval`` is the only
+    writer of that field, and it used to write ``True`` unconditionally while the
+    exit code read ``report.failed``, so a caller trusting the JSON saw success.
+    """
+    snap = _snap(tmp_path)
+    source = tmp_path / "skill.json"
+    snap.save(source)
+    dest = tmp_path / "dest.json"
+
+    def write_spec(*tasks):
+        dest.write_text(json.dumps({
+            "kind": "text", "target": "ignored",
+            "agent": "echo", "score": "contains",
+            "data": {"inline": list(tasks)},
+            "evolve": {"rounds": 9},
+        }))
+
+    good = {"id": "0", "prompt": "say yes", "gold": "yes"}
+    # No ``gold``: the scorer raises on this task, so the eval is partial.
+    bad = {"id": "1", "prompt": "say yes"}
+
+    write_spec(good, bad)
+    assert main(["--json", "snapshot", "eval", str(source), "--spec", str(dest)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failed"] == ["1"]
+    assert payload["ok"] is False
+
+    write_spec(good)
+    assert main(["--json", "snapshot", "eval", str(source), "--spec", str(dest)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True

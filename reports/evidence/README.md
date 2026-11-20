@@ -42,10 +42,12 @@ Exit 0 valid, 1 refused with one line per offending field, 2 input error. A
 missing field, an unknown field, a blank value or a non-string value is refused
 by name; `schema_version` must be `1`.
 
-A card must also say what reproduces it, on one `command:` line inside any one
-of its fields: an argv that resolves offline in this checkout (`python -m
-tools.evidence_card`, `pytest tests/test_ports_symlink_leaf.py`), or
+A card must also name the command behind its claim, on one `command:` line
+inside any one of its fields: an argv that resolves offline in this checkout
+(`python -m tools.evidence_card`, `pytest tests/test_ports_symlink_leaf.py`), or
 `command: no offline command -- <why>` when nothing here reproduces the claim.
-Forcing a command that does not run would be worse than saying there is none, so
-the second form is accepted with a reason. A card that claims nothing — all
-twelve fields `not reviewed` — needs neither.
+The checker **resolves** that argv — the module or script path, the test node id
+— and never runs it, so the line says a reader has a command to run, not that the
+number came from it. Forcing a command that does not run would be worse than
+saying there is none, so the second form is accepted with a reason. A card that
+claims nothing — all twelve fields `not reviewed` — needs neither.

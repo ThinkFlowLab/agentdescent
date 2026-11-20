@@ -12,8 +12,6 @@ about files in this repository, so they are pinned here rather than trusted.
 import json
 import re
 import shlex
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -258,21 +256,49 @@ def test_every_published_card_says_what_reproduces_it():
         assert command.strip(), card_path.name
 
 
-def test_the_baselines_plan_reports_eighteen_runs():
-    """The plan card's number is that command's own output, run as documented."""
+def test_the_baselines_plan_reports_eighteen_runs(monkeypatch, capsys):
+    """The plan card's number is that command's own output, run as documented.
+
+    In-process, not as a subprocess: the documented argv lets ``main`` reach the
+    split check, and for ``hotpotqa`` that loads the dataset -- a test may not
+    make a network call, and on a networked runner the default fetch is 24/12/12
+    and ``main`` exits 2 because the test split is under ``MIN_TEST_TASKS``. The
+    card documents the cold-cache branch, so ``split_sizes`` raises ``OSError``
+    the way an offline checkout does, and the assertions stay on the documented
+    argv so the card cannot drift away from the test.
+    """
     card = json.loads((EVIDENCE / "results-baselines-plan-runs.json")
                       .read_text(encoding="utf-8"))
     _, documented = evidence_card.command_lines(card)[0]
     argv = shlex.split(documented)
     assert argv[:3] == ["python", "-m", "bench.baselines_run"], argv
-    proc = subprocess.run([sys.executable, *argv[1:]], cwd=str(REPO),
-                          capture_output=True, text=True, timeout=300)
-    assert proc.returncode == 0, proc.stderr
-    printed = proc.stdout
+
+    from bench import baselines_run
+
+    def cold_cache(_args):
+        raise OSError("no network: the branch the card documents")
+
+    monkeypatch.setattr(baselines_run, "split_sizes", cold_cache)
+    rc = baselines_run.main(argv[3:])
+    printed = capsys.readouterr().out
+    assert rc == 0, printed
     for line in ("Arms     : serial, fork, merge (N=4)",
                  "Seeds    : [0, 1, 2]",
-                 "Runs     : 18 evolve() calls, ~1728 rollouts in total"):
+                 "Runs     : 18 evolve() calls, ~1728 rollouts in total",
+                 "Split    : could not be checked offline (OSError)"):
         assert line in printed, printed
+
+    # The other branch a warm fetch takes, pinned the same way: 48 tasks split
+    # 24/12/12, so the 12-task test split is under MIN_TEST_TASKS and the plan
+    # refuses with rc 2 rather than printing a number it cannot resolve. The run
+    # count prints in both branches, so the card's 18 never depends on the fetch.
+    monkeypatch.setattr(baselines_run, "split_sizes", lambda _args: (24, 12, 12))
+    rc = baselines_run.main(argv[3:])
+    captured = capsys.readouterr()
+    assert rc == 2, captured.out
+    assert "REFUSED: 12 test tasks" in captured.err, captured.err
+    assert "Runs     : 18 evolve() calls, ~1728 rollouts in total" in captured.out, \
+        captured.out
 
 
 def test_the_plan_card_states_why_the_split_is_not_checked():

@@ -305,4 +305,8 @@ def test_the_plan_card_states_why_the_split_is_not_checked():
     """The card keeps the honest gap rather than papering over it."""
     card = json.loads((EVIDENCE / "results-baselines-plan-runs.json")
                       .read_text(encoding="utf-8"))
-    assert "could not be checked offline (OSError)" in card["held_out"]
+    # The printed name is the loader's own exception type (bench/baselines_run.py:628
+    # prints ``type(e).__name__``), so the card states the branch and both names it
+    # has been measured with rather than pinning one host's rendering.
+    assert "could not be checked offline (<the loader's exception type name>)" in card["held_out"]
+    assert "OSError" in card["held_out"] and "URLError" in card["held_out"]

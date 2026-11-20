@@ -56,6 +56,11 @@ EVOLVE_PARAM_ALLOWLIST = frozenset({
     #: RuntimeSettings field for this slice (#804): it is additive, defaults to
     #: ``0.0`` (the old run exactly), and the bag refactor is a separate card.
     "test_frac",
+    #: #1166: the per-call budget, passed by ``compose`` / the run store and
+    #: also a ``BudgetSettings`` field. A flat name because a JSON
+    #: ``spec.evolve`` knob has to reach the engine by that name; it defaults to
+    #: ``None``, which is the old run exactly.
+    "call_limit",
     # typed bags (#804) — preferred home for new numerics / flags
     "budget", "runtime", "observability",
 })
@@ -101,6 +106,11 @@ class BudgetSettings:
     max_rollouts: Optional[int] = None
     max_calls: Optional[int] = None
     max_tokens: Optional[int] = None
+    #: Per-call cap (:class:`~agentdescent.budget.CallLimit`), checked **before**
+    #: each model call (#1166). A different quantity from ``max_calls`` above,
+    #: which is a round-barrier budget and overshoots by up to one round. Built
+    #: by the run store from ``max_calls`` / ``max_usd``.
+    call_limit: Optional["CallLimit"] = None
     stop_on_diminishing_returns: bool = False
     efficiency_floor: float = 0.25
     call_budget: Optional["CallBudget"] = None

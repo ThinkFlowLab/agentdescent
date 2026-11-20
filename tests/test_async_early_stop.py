@@ -61,7 +61,11 @@ def test_no_evolve_argument_is_dropped_without_notice():
     # has always called `max_iters`, so it reaches async_evolve as that.
     remapped = {"tasks", "reward", "rounds", "max_seconds", "asynchronous",
                 "max_rollouts"}
-    leaked = set(inspect.signature(_evolve).parameters) - forwarded - warned - remapped
+    # Refused by name: a knob this path rejects with its own ValueError is
+    # accounted for more strongly than one it warns about (#1166).
+    refused = set(re.findall(r"if (\w+) is not None:", src))
+    leaked = (set(inspect.signature(_evolve).parameters)
+              - forwarded - warned - refused - remapped)
     assert not leaked, f"silently dropped by the async path: {sorted(leaked)}"
 
 

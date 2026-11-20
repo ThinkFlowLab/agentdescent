@@ -122,6 +122,20 @@ know a tool-using agent's bill in advance:
 agentdescent plan spec.json --budget 5 --usd-per-call 0.02
 ```
 
+`--budget` is checked between rounds, so a wide round can overshoot it. For a
+cap that holds **per call**, pass `--max-calls` / `--max-usd`: the call that
+would cross the limit is not made, the round winds down, and the run ends with
+`stop_reason=budget` plus the limit and the spend it observed, in `status.json`
+and in `agentdescent status`:
+
+```bash
+agentdescent evolve spec.json --max-calls 40
+agentdescent evolve spec.json --max-usd 5 --usd-per-call 0.02
+```
+
+`--max-calls 0` is a real limit — no calls at all — not "unset". Leave both
+flags off and the run behaves exactly as before.
+
 The walkthrough that loads a dataset, calls a model, and evolves an instruction
 is in [Quickstart — dataset to skill](quickstart-skill.md). That path evolves a
 `SingleSlot` instruction; for a skill library use

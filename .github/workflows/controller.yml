@@ -11,7 +11,14 @@ name: controller
 #                    else -> dry run, the plan goes to the job summary.
 #   AGENT_PAUSE      `true` -> kill switch: nothing is read, proposed or changed.
 # To turn it off entirely, disable this workflow in the Actions tab.
+#
+# It also runs on the three PR lifecycle events, so a new PR is labelled now
+# rather than at the next cron tick (the schedule is throttled and can be
+# hours late). A `pull_request` run from a fork head carries a read-only
+# token, so both jobs skip it: the fallback cron still labels fork PRs.
 on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
   schedule:
     - cron: '7,37 * * * *'
   workflow_dispatch:
@@ -27,6 +34,11 @@ jobs:
     name: plan (read only)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # A read-only token is all this job needs, but a fork head's run must not
+    # hand `apply` a live plan, so it is skipped like `apply` is.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       issues: read
@@ -50,7 +62,11 @@ jobs:
   apply:
     name: apply labels (live only)
     needs: plan
-    if: needs.plan.outputs.live == 'true' && vars.CONTROLLER_LIVE == 'true' && vars.AGENT_PAUSE != 'true'
+    if: >-
+      needs.plan.outputs.live == 'true' && vars.CONTROLLER_LIVE == 'true'
+      && vars.AGENT_PAUSE != 'true'
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

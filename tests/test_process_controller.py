@@ -18,7 +18,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github" / "scripts"
 WORKFLOW = ROOT / ".github" / "workflows" / "controller.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
 CONFIG = json.loads((ROOT / ".github" / "agent" / "controller.json").read_text())
+# A `pull_request` run on a fork head gets a read-only GITHUB_TOKEN, so neither
+# job may run for it: `plan` would hand `apply` a live plan it cannot carry out.
+SAME_REPO_GUARD = ("github.event_name != 'pull_request' "
+                   "|| github.event.pull_request.head.repo.full_name == github.repository")
 
 
 def _mod():
@@ -268,8 +273,10 @@ def test_workflow_shape():
     text = WORKFLOW.read_text(encoding="utf-8")
     wf = yaml.safe_load(text)
     on = wf.get("on", wf.get(True))
-    assert set(on) == {"schedule", "workflow_dispatch"}
+    assert set(on) == {"schedule", "workflow_dispatch", "pull_request"}
     assert on["schedule"] == [{"cron": "7,37 * * * *"}], "every 30 minutes"
+    assert on["pull_request"] == {"types": ["opened", "ready_for_review", "reopened"]}, \
+        "label a PR when it becomes reviewable, not on every push to its head"
     assert wf["permissions"] == {}
     plan, apply = wf["jobs"]["plan"], wf["jobs"]["apply"]
     assert plan["permissions"] == {"contents": "read", "issues": "read", "pull-requests": "read"}
@@ -280,6 +287,24 @@ def test_workflow_shape():
     assert "${{ secrets." not in text
     runs = "\n".join(s.get("run", "") for j in (plan, apply) for s in j["steps"])
     assert "${{" not in runs, "values reach the shell only through env"
+
+
+def test_a_fork_head_never_reaches_the_label_jobs():
+    wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    for name in ("plan", "apply"):
+        assert SAME_REPO_GUARD in wf["jobs"][name]["if"], (
+            f"{name} must skip a pull_request from a fork: that token cannot write"
+        )
+
+
+def test_no_workflow_uses_pull_request_target():
+    offenders = []
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+        on = wf.get("on", wf.get(True)) or {}
+        if "pull_request_target" in on:
+            offenders.append(path.name)
+    assert not offenders, f"pull_request_target runs with a writable token on untrusted code: {offenders}"
 
 
 def test_labels_json_has_the_labels_the_controller_manages():

@@ -3879,7 +3879,7 @@ def cmd_snapshot_eval(a: argparse.Namespace) -> int:
     spec = load_spec(a.spec)
     report = evaluate_snapshot_spec(snap, spec)
     payload = report.to_dict()
-    payload["ok"] = True
+    payload["ok"] = not report.failed
     _out(payload, as_json=True)
     return 0 if not report.failed else 1
 

@@ -9,8 +9,9 @@ PR/issue content: titles and bodies are data for one bounded regex
 (``Fixes #N``); changed files are read only through the API and judged by the
 risk gate's rules.
 
-  - sets ``agent-pr`` on pull requests an agent opened, and ``risk:T0..T3``
-    (the risk gate's tier) on every open PR not on ``hold``
+  - sets ``risk:T0..T3`` (the risk gate's tier) on every open PR not on
+    ``hold``. It never adds the retired agent PR label: the owner banned it
+    (#1161)
   - removes ``agent-ready`` (and ``agent-working``) when someone who is not a
     maintainer labeled the issue, or edited its text after it was labeled
   - removes ``agent-working`` from a claim older than the TTL with no recent
@@ -43,11 +44,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RISK = ["risk:T0", "risk:T1", "risk:T2", "risk:T3"]
 MANAGED = {
     # label -> what the controller may do with it. It can never ADD agent-ready.
-    "add": set(["agent-pr"] + RISK),
+    "add": set(RISK),
     "remove": set(["agent-ready", "agent-working"] + RISK),
 }
 MAX_OPS = 200
-REASONS = {"labeled-by-non-maintainer", "edited-by-non-maintainer", "claim-expired", "risk-tier", "agent-pr"}
+REASONS = {"labeled-by-non-maintainer", "edited-by-non-maintainer", "claim-expired", "risk-tier"}
 
 
 # ---- mode -------------------------------------------------------------------
@@ -83,8 +84,7 @@ def closing_refs(body: Optional[str], repo: str) -> List[int]:
 
 
 # A body can point at its issue without promising to close it: ``Refs #12``,
-# ``Part of #12``. Those keep a claim alive (issue #1161), but they never make a
-# PR an agent PR — for that only ``closing_refs`` counts.
+# ``Part of #12``. Those keep a claim alive (issue #1161).
 _LINKING = re.compile(r"\b(?:refs?|part\s+of)\b:?[ \t]+((?:[\w.-]+/[\w.-]+)?#\d{1,7}"
                       r"(?:[ \t]*(?:,|and)[ \t]*(?:[\w.-]+/[\w.-]+)?#\d{1,7})*)", re.I)
 _REF = re.compile(r"(?:([\w.-]+/[\w.-]+))?#(\d{1,7})\b")
@@ -98,20 +98,6 @@ def ttl_refs(body: Optional[str], repo: str) -> List[int]:
             if not ref.group(1) or _same(ref.group(1), repo):
                 out.add(int(ref.group(2)))
     return sorted(out)
-
-
-def is_agent_pr(pr: Dict[str, Any], config: Dict[str, Any], repo: str, agent_issues: Iterable[int]) -> bool:
-    """By author, or a branch of this repository with an agent prefix, or a
-    branch of this repository that closes an agent-ready/agent-working issue.
-    A fork PR counts only by author."""
-    if any(_same(a, pr["author"]) for a in config["agentAuthors"]):
-        return True
-    if not pr["sameRepo"]:
-        return False
-    if any(p and pr["headRef"].startswith(p) for p in config["agentBranchPrefixes"]):
-        return True
-    agent_issues = set(agent_issues)
-    return any(n in agent_issues for n in closing_refs(pr["body"], repo))
 
 
 def _last(events: List[Dict[str, Any]], pred: Callable[[Dict[str, Any]], bool]) -> Optional[Dict[str, Any]]:
@@ -172,7 +158,6 @@ def plan(state: Dict[str, Any]) -> Dict[str, List[Any]]:
             else:
                 ops.append({"kind": kind, "number": number, "op": f["op"], "label": f["label"], "reason": reason})
 
-    agent_issues = {i["number"] for i in state["issues"]}
     for issue in state["issues"]:
         labels = issue["labels"]
         if any(_same(l, "hold") for l in labels):
@@ -201,8 +186,6 @@ def plan(state: Dict[str, Any]) -> Dict[str, List[Any]]:
         want = f"risk:{pr['tier']}"
         push("pr", pr["number"], _diff_labels(pr["labels"], add=[want], remove=[l for l in RISK if l != want]),
              "risk-tier")
-        if is_agent_pr(pr, config, state["repo"], agent_issues):
-            push("pr", pr["number"], _diff_labels(pr["labels"], add=["agent-pr"]), "agent-pr")
     if len(ops) > MAX_OPS:
         notes.append(f"{len(ops)} operations; keeping the first {MAX_OPS}")
         del ops[MAX_OPS:]

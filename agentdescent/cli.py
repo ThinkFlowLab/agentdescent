@@ -2768,6 +2768,11 @@ def cmd_evolve(a: argparse.Namespace) -> int:
                "test_tasks": getattr(result, "test_tasks", 0),
                "select_tasks": getattr(result, "select_tasks", 0),
                "outcomes": result.outcomes(), "error": result.error, "dir": rd.path}
+    # Which limit fired, in the machine output too: `stop_reason` alone cannot
+    # tell the operator ceiling from the caller's own cap (#1190). Present only
+    # when set, so an uncapped payload keeps yesterday's bytes.
+    if st.stop_detail:
+        payload["stop_detail"] = st.stop_detail
     from .diagnose import SEED_SOLVED_HINT, seed_already_solved
     seed_solved = seed_already_solved(init, result.final_reward, result.stop_reason)
     if seed_solved:
@@ -3117,6 +3122,10 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
     result = rd.result()
     payload: Dict[str, Any] = {"run_id": run_id, "state": st.state,
                                "stop_reason": st.stop_reason, "error": st.error}
+    # Same rule as `evolve --json` (#1190): name the cap only when one tripped,
+    # so a run that never hit a limit reports the shape it always had.
+    if st.stop_detail:
+        payload["stop_detail"] = st.stop_detail
     if result is None:
         # A failed, cancelled or still-running run has no artifact and no diff,
         # but what it did is on disk: the rounds that finished, the reflector

@@ -1110,12 +1110,27 @@ def _cap_value(field: str, value: Any, *, integer: bool) -> float:
     return int(value) if integer else float(value)
 
 
+#: What an unpriced dollar cap tells the caller to add on the command line. A
+#: caller that is not the CLI passes its own ``usd_hint`` (#1196).
+CLI_CAP_HINT = "pass --usd-per-call on the command line"
+
+#: The default hint names no surface: ``runstore.launch`` / ``execute`` reach
+#: this through Python, where a flag or a tool argument would be unactionable.
+NEUTRAL_CAP_HINT = "set usd_per_call beside it"
+
+
 def build_call_limit(max_calls: Any = None, max_usd: Any = None,
-                     usd_per_call: Any = None) -> Optional["CallLimit"]:
+                     usd_per_call: Any = None, *,
+                     usd_hint: str = NEUTRAL_CAP_HINT) -> Optional["CallLimit"]:
     """A validated run-level call cap, or ``None`` when neither limit is set.
 
-    Shared by ``compose`` (spec knobs) and the run store / CLI (run options), so
-    the refusal reads the same wherever the number was typed (#1166).
+    Shared by ``compose`` (spec knobs) and the run store / CLI (run options): the
+    reason is the same wherever the number was typed, while the actionable hint
+    belongs to the surface -- the CLI flag, the tool's argument, or the field
+    alone for a Python caller (#1166, #1196).
+
+    ``usd_hint`` carries that surface; its default names the field without
+    assuming one, and a caller that has a flag or an argument passes its own.
     """
     from .budget import CallLimit
 
@@ -1131,7 +1146,7 @@ def build_call_limit(max_calls: Any = None, max_usd: Any = None,
     if limit.max_usd is not None and not limit.usd_per_call:
         raise SpecError(
             "max_usd needs usd_per_call: a dollar cap cannot be charged without "
-            "a per-call price (pass --usd-per-call on the command line)")
+            f"a per-call price ({usd_hint})")
     return limit
 
 

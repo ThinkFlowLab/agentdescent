@@ -52,7 +52,8 @@ from urllib.parse import urlparse
 from . import runstore
 from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_path,
                         reward_set_line)
-from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
+from .evolvespec import (CLI_CAP_HINT, KINDS, EvolveSpec, SpecError,
+                         budget_round_overshoot_warning,
                          build_call_limit, compose, estimate, fold_kind, load_spec,
                          resolve_kind, _POLICY_SLOTS)
 from .probe import first_failed_next
@@ -2726,11 +2727,12 @@ def cmd_evolve(a: argparse.Namespace) -> int:
     # whose status later reads as "process ended without reporting" (#342).
     runstore.require_budget_pair(a.budget, a.usd_per_call)
     # The run-level cap (#1166): refused here, before a run directory exists,
-    # with the field and the value named -- a bad flag is not a live run.
+    # with the field and the value named -- a bad flag is not a live run. The
+    # CLI passes its own hint: this caller can type the flag (#1196).
     try:
         build_call_limit(max_calls=getattr(a, "max_calls", None),
                          max_usd=getattr(a, "max_usd", None),
-                         usd_per_call=a.usd_per_call)
+                         usd_per_call=a.usd_per_call, usd_hint=CLI_CAP_HINT)
     except SpecError as e:
         return _spec_error(a, e)
     # Same gate as plan / MCP start: missing CLI binary must not report started (#346).

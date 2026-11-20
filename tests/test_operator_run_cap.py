@@ -146,3 +146,22 @@ def test_an_equal_cap_does_not_name_the_ceiling(tmp_path, monkeypatch):
     rd, st, _ = _run(tmp_path, max_calls=2)
     assert st.stop_reason == "budget", st
     assert "AGENTDESCENT_MAX_CALLS" not in (st.stop_detail or ""), st.stop_detail
+
+
+
+def test_a_hand_set_request_does_not_blame_a_looser_ceiling(tmp_path, monkeypatch):
+    """The label follows the clamp: caller 2, ceiling 5, a stale request of 50.
+
+    The variable only exists so a detached child can report what the caller
+    asked for. A hand-set or inherited value must not make the run blame a
+    ceiling that never bound it, and it must not change what is enforced: the
+    caller's cap of 2 still stops the run at 2 calls.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS_REQUESTED", "50")
+    rd, st, _ = _run(tmp_path, max_calls=2)
+    assert len(CALLS) == 2, f"the caller's cap let {len(CALLS)} calls through"
+    assert st.stop_reason == "budget", st
+    detail = st.stop_detail or ""
+    assert "max_calls" in detail, detail
+    assert "AGENTDESCENT_MAX_CALLS" not in detail, detail

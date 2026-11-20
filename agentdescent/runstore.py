@@ -163,7 +163,12 @@ def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
     if max_calls is None or cap < max_calls:
         return cap, True
     requested, present = _requested_calls()
-    return max_calls, present and (requested is None or requested > cap)
+    # The label follows the clamp, not the variable: only a run whose applied
+    # value *is* the ceiling can say the ceiling bound it, so a hand-set or
+    # stale request cannot blame a ceiling that never bit (#1082).
+    return (max_calls,
+            present and max_calls == cap
+            and (requested is None or requested > cap))
 
 
 def root() -> str:

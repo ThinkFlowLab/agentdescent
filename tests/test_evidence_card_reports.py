@@ -11,6 +11,7 @@ about files in this repository, so they are pinned here rather than trusted.
 """
 import json
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,8 @@ CLAIM_CARDS = {
         "docs/results.md", ("0.800", "132", "73")),
     "results-merge-cost-lever.json": (
         "docs/results.md", ("1424", "1.39×", "1.92×")),
+    "results-baselines-plan-runs.json": (
+        "docs/results.md", ("fork arm is N runs by itself", "budget-rollouts 96")),
     "audit-judge-bias-five-workloads.json": (
         "reports/README.md", ("18.6%", "3.7%", "32.7%")),
     "audit-ground-truth-repair.json": (
@@ -136,9 +139,11 @@ CLAIM_CARDS = {
         ("0.2421", "0.2203", "0.3812")),
 }
 
-#: Cards whose number a test below recomputes from a committed run.
+#: Cards whose number a test here recomputes offline: the two bench cards from a
+#: committed run, the plan card by running its own documented command.
 RECOMPUTED_OFFLINE = ("results-equal-budget-hotpotqa.json",
-                      "results-merge-cost-lever.json")
+                      "results-merge-cost-lever.json",
+                      "results-baselines-plan-runs.json")
 
 #: The words a card uses when its number came from a live model run instead.
 LIVE = "not reproducible offline"
@@ -238,3 +243,70 @@ def test_the_evidence_directory_indexes_every_card():
     assert not missing, f"cards missing from the index: {missing}"
     results = (REPO / "docs" / "results.md").read_text(encoding="utf-8")
     assert "reports/evidence" in results
+
+
+# -- every card says what reproduces it (#951) ------------------------------
+
+def test_every_published_card_says_what_reproduces_it():
+    for card_path in _published():
+        card = json.loads(card_path.read_text(encoding="utf-8"))
+        markers = evidence_card.command_lines(card)
+        assert len(markers) == 1, f"{card_path.name}: {len(markers)} command lines"
+        _, command = markers[0]
+        assert command.strip(), card_path.name
+
+
+def test_the_baselines_plan_reports_eighteen_runs(monkeypatch, capsys):
+    """The plan card's number is that command's own output, run as documented.
+
+    In-process, not as a subprocess: the documented argv lets ``main`` reach the
+    split check, and for ``hotpotqa`` that loads the dataset -- a test may not
+    make a network call, and on a networked runner the default fetch is 24/12/12
+    and ``main`` exits 2 because the test split is under ``MIN_TEST_TASKS``. The
+    card documents the cold-cache branch, so ``split_sizes`` raises ``OSError``
+    the way an offline checkout does, and the assertions stay on the documented
+    argv so the card cannot drift away from the test.
+    """
+    card = json.loads((EVIDENCE / "results-baselines-plan-runs.json")
+                      .read_text(encoding="utf-8"))
+    _, documented = evidence_card.command_lines(card)[0]
+    argv = shlex.split(documented)
+    assert argv[:3] == ["python", "-m", "bench.baselines_run"], argv
+
+    from bench import baselines_run
+
+    def cold_cache(_args):
+        raise OSError("no network: the branch the card documents")
+
+    monkeypatch.setattr(baselines_run, "split_sizes", cold_cache)
+    rc = baselines_run.main(argv[3:])
+    printed = capsys.readouterr().out
+    assert rc == 0, printed
+    for line in ("Arms     : serial, fork, merge (N=4)",
+                 "Seeds    : [0, 1, 2]",
+                 "Runs     : 18 evolve() calls, ~1728 rollouts in total",
+                 "Split    : could not be checked offline (OSError)"):
+        assert line in printed, printed
+
+    # The other branch a warm fetch takes, pinned the same way: 48 tasks split
+    # 24/12/12, so the 12-task test split is under MIN_TEST_TASKS and the plan
+    # refuses with rc 2 rather than printing a number it cannot resolve. The run
+    # count prints in both branches, so the card's 18 never depends on the fetch.
+    monkeypatch.setattr(baselines_run, "split_sizes", lambda _args: (24, 12, 12))
+    rc = baselines_run.main(argv[3:])
+    captured = capsys.readouterr()
+    assert rc == 2, captured.out
+    assert "REFUSED: 12 test tasks" in captured.err, captured.err
+    assert "Runs     : 18 evolve() calls, ~1728 rollouts in total" in captured.out, \
+        captured.out
+
+
+def test_the_plan_card_states_why_the_split_is_not_checked():
+    """The card keeps the honest gap rather than papering over it."""
+    card = json.loads((EVIDENCE / "results-baselines-plan-runs.json")
+                      .read_text(encoding="utf-8"))
+    # The printed name is the loader's own exception type (bench/baselines_run.py:628
+    # prints ``type(e).__name__``), so the card states the branch and both names it
+    # has been measured with rather than pinning one host's rendering.
+    assert "could not be checked offline (<the loader's exception type name>)" in card["held_out"]
+    assert "OSError" in card["held_out"] and "URLError" in card["held_out"]

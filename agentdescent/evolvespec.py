@@ -1142,14 +1142,24 @@ def _limit_from_knobs(knobs: Dict[str, Any]) -> Optional["CallLimit"]:
     leaves ``max_calls`` in place, so the barrier budget of the same name still
     applies -- a per-call cap of N and a barrier cap of N cannot disagree.
     """
-    limit = build_call_limit(
-        max_calls=(None if knobs.get("max_calls") is None
-                   else _cap_value("evolve.max_calls", knobs["max_calls"], integer=True)),
-        max_usd=(None if knobs.get("max_usd") is None
-                 else _cap_value("evolve.max_usd", knobs["max_usd"], integer=False)),
-        usd_per_call=(None if knobs.get("usd_per_call") is None
-                      else _cap_value("evolve.usd_per_call", knobs["usd_per_call"],
-                                      integer=False)))
+    # Validate all three values first, then refuse the pair: testing the pair on
+    # the raw knob would answer a non-numeric `max_usd` with "needs usd_per_call"
+    # and lose the field that is actually wrong (#1183).
+    max_calls = (None if knobs.get("max_calls") is None
+                 else _cap_value("evolve.max_calls", knobs["max_calls"], integer=True))
+    max_usd = (None if knobs.get("max_usd") is None
+               else _cap_value("evolve.max_usd", knobs["max_usd"], integer=False))
+    usd_per_call = (None if knobs.get("usd_per_call") is None
+                    else _cap_value("evolve.usd_per_call", knobs["usd_per_call"],
+                                    integer=False))
+    # A spec can only be priced by its own field: `compose` runs before the CLI
+    # reads `--usd-per-call`, so that advice cannot be acted on here (#1183).
+    if max_usd is not None and not usd_per_call:
+        raise SpecError(
+            "evolve.max_usd needs evolve.usd_per_call beside it: a dollar cap "
+            "cannot be charged without a per-call price")
+    limit = build_call_limit(max_calls=max_calls, max_usd=max_usd,
+                             usd_per_call=usd_per_call)
     knobs.pop("max_usd", None)
     knobs.pop("usd_per_call", None)
     return limit

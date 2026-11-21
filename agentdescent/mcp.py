@@ -436,11 +436,12 @@ def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
     """The run-level cap an MCP ``plan`` / ``start`` will enforce, or ``None`` (#1184).
 
     Validated by the same :func:`~agentdescent.evolvespec.build_call_limit` the
-    CLI and the run store use, so a bad number -- and a ``max_usd`` with no
-    ``usd_per_call`` -- refuses with the CLI's own sentence instead of a second
-    wording for this surface. The operator's ceiling is applied with the same
-    ``min`` as ``runstore.launch`` / ``execute``: a caller may lower it, never
-    raise it, and a caller that names no cap still gets it.
+    CLI and the run store use: the reason is the same, while the actionable hint
+    belongs to the surface. This one names ``usd_per_call``, the argument the
+    host passes in the same tool call -- it has no command line to type
+    ``--usd-per-call`` on (#1196). The operator's ceiling is applied with the
+    same ``min`` as ``runstore.launch`` / ``execute``: a caller may lower it,
+    never raise it, and a caller that names no cap still gets it.
 
     ``source`` and ``max_calls_requested`` appear only when the ceiling is what
     binds, the same distinction ``AGENTDESCENT_MAX_CALLS_REQUESTED`` carries
@@ -448,7 +449,8 @@ def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
     to 2" from "you asked for 2".
     """
     limit = build_call_limit(max_calls=max_calls, max_usd=max_usd,
-                             usd_per_call=usd_per_call)
+                             usd_per_call=usd_per_call,
+                             usd_hint="usd_per_call in the same tool call")
     ceiling = runstore.operator_max_calls()
     if limit is None and ceiling is None:
         return None

@@ -2,9 +2,11 @@
 
 The CLI and the run store already carry the run-level cap (#1166) and the
 operator ceiling (#1082). This is the third surface: a host that calls `start`
-from a tool can now say "at most N model calls for this run", hears the CLI's
-own refusal when it asks for a dollar cap with no price, and sees the clamped
-number (requested vs enforced) when ``AGENTDESCENT_MAX_CALLS`` binds.
+from a tool can now say "at most N model calls for this run", gets a refusal
+naming the argument it can pass when it asks for a dollar cap with no price
+(the wording per surface lives in ``tests/test_max_usd_refusal_hint.py``,
+#1196), and sees the clamped number (requested vs enforced) when
+``AGENTDESCENT_MAX_CALLS`` binds.
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ import pytest
 
 from agentdescent import runstore
 from agentdescent.cli import NESTED_ENV
-from agentdescent.evolvespec import SpecError, build_call_limit
 from agentdescent.mcp import Tools
 
 from tests.test_evolvespec import _dir_spec  # noqa: F401
@@ -70,20 +71,6 @@ def test_start_without_a_cap_is_unchanged(store, tmp_path):
     started = t.start(_dir_spec(str(tmp_path)).to_dict())
     assert started["ok"] is True, started
     assert "call_limit" not in started
-
-
-def test_max_usd_alone_is_refused_with_the_cli_sentence(store, tmp_path):
-    t = Tools(store)
-    spec = _dir_spec(str(tmp_path)).to_dict()
-    plan = t.plan(spec, max_usd=1.0)
-    start = t.start(spec, max_usd=1.0)
-    with pytest.raises(SpecError) as raised:
-        build_call_limit(max_usd=1.0)
-    for payload in (plan, start):
-        assert payload["ok"] is False, payload
-        # The CLI's wording, not a second sentence for this surface.
-        assert payload["error"] == str(raised.value), payload["error"]
-    assert t.status()["runs"] == [], "a refused cap must not leave a run behind"
 
 
 def test_a_caller_cap_above_the_operator_ceiling_is_clamped_and_labelled(

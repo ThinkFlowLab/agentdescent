@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Mapping, Optional, Protocol,
-                    Sequence, runtime_checkable)
+                    Sequence, Tuple, runtime_checkable)
 
 from .evolvable import ContractError
 from ._subprocess import decode_output

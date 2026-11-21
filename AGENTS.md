@@ -107,7 +107,9 @@ question in a comment. Agents develop **only** `agent-ready` issues.
 
 [`.github/workflows/controller.yml`](.github/workflows/controller.yml) runs on
 the `pull_request` events `opened`, `ready_for_review` and `reopened` (a
-fork-head run is skipped: that token cannot write) and on a four-a-day cron
+fork-head run is skipped: that token cannot write), on the `issues` events
+`labeled`, `unlabeled` and `edited` so an approval that someone voided is read
+in the same minute, and on a four-a-day cron
 backstop, with the built-in `GITHUB_TOKEN` only (no GitHub App, no secrets) and
 changes labels and nothing else: it sets `risk:T*` and `agent-pr` on open
 non-draft PRs, removes `agent-ready`/`agent-working` when a non-maintainer set

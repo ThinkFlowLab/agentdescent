@@ -52,7 +52,8 @@ from urllib.parse import urlparse
 from . import runstore
 from .evolution import (SELECT_SET_NOTE, _check_apply_paths, _file_tree_backup_path,
                         reward_set_line)
-from .evolvespec import (KINDS, EvolveSpec, SpecError, budget_round_overshoot_warning,
+from .evolvespec import (CLI_CAP_HINT, KINDS, EvolveSpec, SpecError,
+                         budget_round_overshoot_warning,
                          build_call_limit, compose, estimate, fold_kind, load_spec,
                          resolve_kind, _POLICY_SLOTS)
 from .probe import first_failed_next
@@ -2726,11 +2727,12 @@ def cmd_evolve(a: argparse.Namespace) -> int:
     # whose status later reads as "process ended without reporting" (#342).
     runstore.require_budget_pair(a.budget, a.usd_per_call)
     # The run-level cap (#1166): refused here, before a run directory exists,
-    # with the field and the value named -- a bad flag is not a live run.
+    # with the field and the value named -- a bad flag is not a live run. The
+    # CLI passes its own hint: this caller can type the flag (#1196).
     try:
         build_call_limit(max_calls=getattr(a, "max_calls", None),
                          max_usd=getattr(a, "max_usd", None),
-                         usd_per_call=a.usd_per_call)
+                         usd_per_call=a.usd_per_call, usd_hint=CLI_CAP_HINT)
     except SpecError as e:
         return _spec_error(a, e)
     # Same gate as plan / MCP start: missing CLI binary must not report started (#346).
@@ -2768,6 +2770,11 @@ def cmd_evolve(a: argparse.Namespace) -> int:
                "test_tasks": getattr(result, "test_tasks", 0),
                "select_tasks": getattr(result, "select_tasks", 0),
                "outcomes": result.outcomes(), "error": result.error, "dir": rd.path}
+    # Which limit fired, in the machine output too: `stop_reason` alone cannot
+    # tell the operator ceiling from the caller's own cap (#1190). Present only
+    # when set, so an uncapped payload keeps yesterday's bytes.
+    if st.stop_detail:
+        payload["stop_detail"] = st.stop_detail
     from .diagnose import SEED_SOLVED_HINT, seed_already_solved
     seed_solved = seed_already_solved(init, result.final_reward, result.stop_reason)
     if seed_solved:
@@ -3091,20 +3098,24 @@ def _partial_show(rd: "runstore.RunDir", st: Any) -> Dict[str, Any]:
 
 
 def _refuse_plan_outside_write_dirs(payload: Dict[str, Any],
-                                   target: Optional[str]) -> None:
+                                    target: Optional[str],
+                                    written: Sequence[str] = (),
+                                    backup: Optional[str] = None) -> None:
     """Say so when the boundary would refuse the write ``apply_plan`` describes.
 
     ``show`` writes nothing, so it still renders the diff; what it must not do is
-    print a plan naming a file ``apply`` would then refuse (#1082).
+    print a plan naming a file ``apply`` would then refuse (#1082, #1188). The
+    check set is the one ``apply`` uses for a single-file artifact: the
+    destination, every path in ``written``, and the ``.bak-N`` slot when one
+    would be taken. A tree artifact gets the same set from ``_write_to`` called
+    with ``check_write``, which is the call ``apply`` makes for a tree.
     """
     plan = payload.get("apply_plan")
     if not target or not isinstance(plan, dict) or "error" in plan:
         return
-    guard = _operator_write_guard()
-    if guard is None:
-        return
     try:
-        guard(os.path.expanduser(target), "to")
+        _check_apply_paths(os.path.expanduser(target), list(written), backup,
+                           _operator_write_guard())
     except runstore.RunStoreError as e:
         payload["apply_plan"] = {"error": str(e)}
 
@@ -3117,6 +3128,10 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
     result = rd.result()
     payload: Dict[str, Any] = {"run_id": run_id, "state": st.state,
                                "stop_reason": st.stop_reason, "error": st.error}
+    # Same rule as `evolve --json` (#1190): name the cap only when one tripped,
+    # so a run that never hit a limit reports the shape it always had.
+    if st.stop_detail:
+        payload["stop_detail"] = st.stop_detail
     if result is None:
         # A failed, cancelled or still-running run has no artifact and no diff,
         # but what it did is on disk: the rounds that finished, the reflector
@@ -3181,8 +3196,12 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         return payload
     if spec.kind == "text":
         payload["rendered"] = result.rendered[:max_chars]
-        payload["apply_plan"] = _text_plan(os.path.expanduser(spec.target), result.rendered)
-        _refuse_plan_outside_write_dirs(payload, spec.target)
+        dest = os.path.expanduser(spec.target)
+        plan = _text_plan(dest, result.rendered)
+        payload["apply_plan"] = plan
+        _refuse_plan_outside_write_dirs(
+            payload, dest, plan["written"],
+            _backup_slot(dest) if not plan["noop"] and os.path.exists(dest) else None)
         return payload
     payload["files"] = sorted(result.state)
     if diff:
@@ -3192,11 +3211,15 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         except Exception as e:  # noqa: BLE001 - the original may have moved
             before, payload["diff_note"] = {}, f"could not read original {spec.target}: {e}"
         payload["diff"] = _tree_diff(before, result.state)[:max_chars]
+        # The call `apply` makes for a tree, with only `dry_run` differing:
+        # `_write_to` checks the destination, every written leaf and the
+        # directory backup slot before it returns the plan (#1188).
         try:
-            payload["apply_plan"] = result.write_to(os.path.expanduser(spec.target), dry_run=True)
+            payload["apply_plan"] = result._write_to(
+                os.path.expanduser(spec.target), dry_run=True,
+                check_write=_operator_write_guard())
         except Exception as e:  # noqa: BLE001
             payload["apply_plan"] = {"error": str(e)}
-        _refuse_plan_outside_write_dirs(payload, spec.target)
     return payload
 
 

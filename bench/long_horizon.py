@@ -95,6 +95,7 @@ from agentdescent.filetree import canonical
 from agentdescent.stats_eval import bootstrap_ci
 from bench.rsi_bench import (
     BenchmarkTask,
+    BenchStep,
     RSIBench,
     RSIBenchReport,
     TaskCurve,
@@ -335,74 +336,92 @@ def run_seed(seed: int, *, steps: int = 9,
     ledger.register(artifact)
     commits += 1  # the registration is the genesis node of the lineage
 
+    def step(current: EvolvingArtifact, step_no: int, budget: float
+             ) -> Tuple[EvolvingArtifact, BenchStep]:
+        """One sequential rewrite, as ``(artifact, BenchStep)``; never a raise.
+
+        The contract the issue asks for: the loop below is only a driver, so the
+        step can be read, tested and swapped on its own. A failing step comes
+        back as a ``BenchStep`` carrying the error, which is what lets a
+        15-step run that breaks at step 12 still report eleven steps of
+        evidence.
+        """
+        nonlocal state, evaluations, commits
+        phase = order[(step_no - 1) % len(order)]
+        effective = parse_playbook(state[PLAYBOOK])
+        rule, body = propose(phase, effective)
+        new_text = append_rule(state[PLAYBOOK], rule, body)
+        candidate_state = dict(state)
+        candidate_state[PLAYBOOK] = new_text
+        proposal = json.dumps({
+            "rationale": f"{phase} fails; set {rule}: {body}",
+            "edits": [{"path": PLAYBOOK, "content": new_text}],
+        })
+        diff = tree.to_diff(state, proposal, "scripted-proposer",
+                            current.version, current.id)
+        record: Dict[str, Any] = {
+            "step": step_no, "phase": phase, "rule": rule, "body": body,
+            "budget": budget, "ok": True, "error": None, "committed": False,
+            "parent_sha": content_sha(state), "child_sha": content_sha(state),
+            "version_before": current.version, "version_after": current.version,
+            "holdout_before": 0.0, "holdout_after": 0.0,
+            "p_improve": 0.0, "gate": "", "reason": "",
+        }
+        updated = current
+        try:
+            if fail_step == step_no:
+                raise RuntimeError(f"injected failure at step {step_no}")
+            base_counts = counts(holdout_set, effective)
+            candidate_effective = parse_playbook(new_text)
+            cand_counts = counts(holdout_set, candidate_effective)
+            candidate = EvolvingArtifact(current.id, candidate_state,
+                                        version=current.version + 1,
+                                        strategy=tree)
+            before = MergeContext.rate(base_counts)
+            after = MergeContext.rate(cand_counts)
+            decision = gate.accept(MergeContext(
+                artifact=current, candidate=candidate, cards=(),
+                base_counts=base_counts, cand_counts=cand_counts, diff=diff))
+            record.update({
+                "holdout_before": before, "holdout_after": after,
+                "p_improve": decision.p_improve,
+                "gate": decision.category,
+                "reason": decision.detail or decision.category,
+            })
+            if decision.accept:
+                head = ledger.head_version()
+                _, version = ledger.commit(
+                    candidate, head,
+                    message=(f"step {step_no}: {phase} -> {rule}: {body} "
+                             f"(held-out {before:.2f} -> {after:.2f})"))
+                commits += 1
+                updated = EvolvingArtifact(current.id, candidate_state,
+                                           version=version, strategy=tree)
+                state = candidate_state
+                record.update({
+                    "committed": True, "child_sha": content_sha(state),
+                    "version_after": version,
+                })
+        except Exception as exc:  # noqa: BLE001 - a failed step is a data point
+            record.update({"ok": False, "gate": "raised",
+                           "error": f"{type(exc).__name__}: {exc}",
+                           "reason": "step raised; state left unchanged"})
+        spent = 2 * len(holdout_set) + len(tasks)
+        evaluations += spent
+        step_scores = score_map(tasks, parse_playbook(state[PLAYBOOK]))
+        history.append(step_scores)
+        errors.append(record["error"])
+        phase_score = _mean([step_scores[task.task_id] for task in tasks
+                             if task.family == phase])
+        record.update({"score": phase_score, "cost": float(spent)})
+        records.append(record)
+        return updated, BenchStep(score=phase_score, cost=float(spent),
+                                  error=record["error"])
+
+    step_budget = 1.0
     try:
         for step_no in range(1, steps + 1):
-            phase = order[(step_no - 1) % len(order)]
-            effective = parse_playbook(state[PLAYBOOK])
-            rule, body = propose(phase, effective)
-            new_text = append_rule(state[PLAYBOOK], rule, body)
-            candidate_state = dict(state)
-            candidate_state[PLAYBOOK] = new_text
-            proposal = json.dumps({
-                "rationale": f"{phase} fails; set {rule}: {body}",
-                "edits": [{"path": PLAYBOOK, "content": new_text}],
-            })
-            diff = tree.to_diff(state, proposal, "scripted-proposer",
-                               artifact.version, artifact.id)
-            record: Dict[str, Any] = {
-                "step": step_no, "phase": phase, "rule": rule, "body": body,
-                "ok": True, "error": None, "committed": False,
-                "parent_sha": content_sha(state), "child_sha": content_sha(state),
-                "version_before": artifact.version, "version_after": artifact.version,
-                "holdout_before": 0.0, "holdout_after": 0.0,
-                "p_improve": 0.0, "gate": "", "reason": "",
-            }
-            try:
-                if fail_step == step_no:
-                    raise RuntimeError(f"injected failure at step {step_no}")
-                base_counts = counts(holdout_set, effective)
-                evaluations += len(holdout_set)
-                candidate_effective = parse_playbook(new_text)
-                cand_counts = counts(holdout_set, candidate_effective)
-                evaluations += len(holdout_set)
-                candidate = EvolvingArtifact(artifact.id, candidate_state,
-                                             version=artifact.version + 1,
-                                             strategy=tree)
-                before = MergeContext.rate(base_counts)
-                after = MergeContext.rate(cand_counts)
-                decision = gate.accept(MergeContext(
-                    artifact=artifact, candidate=candidate, cards=(),
-                    base_counts=base_counts, cand_counts=cand_counts, diff=diff))
-                record.update({
-                    "holdout_before": before, "holdout_after": after,
-                    "p_improve": decision.p_improve,
-                    "gate": decision.category,
-                    "reason": decision.detail or decision.category,
-                })
-                if decision.accept:
-                    head = ledger.head_version()
-                    _, version = ledger.commit(
-                        candidate, head,
-                        message=(f"step {step_no}: {phase} -> {rule}: {body} "
-                                 f"(held-out {before:.2f} -> {after:.2f})"))
-                    commits += 1
-                    artifact = EvolvingArtifact(artifact.id, candidate_state,
-                                                version=version, strategy=tree)
-                    state = candidate_state
-                    record.update({
-                        "committed": True, "child_sha": content_sha(state),
-                        "version_after": version,
-                    })
-            except Exception as exc:  # noqa: BLE001 - a failed step is a data point
-                record.update({"ok": False, "gate": "raised",
-                               "error": f"{type(exc).__name__}: {exc}",
-                               "reason": "step raised; state left unchanged"})
-            effective = parse_playbook(state[PLAYBOOK])
-            step_scores = score_map(tasks, effective)
-            evaluations += len(tasks)
-            history.append(step_scores)
-            errors.append(record["error"])
-            records.append(record)
+            artifact, _ = step(artifact, step_no, step_budget)
     finally:
         ledger.close()
 

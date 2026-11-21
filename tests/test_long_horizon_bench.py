@@ -19,6 +19,8 @@ this bench exists to measure.
 import json
 import time
 
+import pytest
+
 from bench.long_horizon import (
     FAMILIES,
     append_rule,
@@ -107,6 +109,24 @@ def test_a_held_out_split_that_misses_a_family_is_reported():
     # the gate could not see those families, and the loop still lost checks
     assert run["forgetting"] > 0.0
     assert run["verdict"] == "forgetting"
+
+
+def test_each_step_returns_a_bench_step_for_its_phase():
+    report = run_bench(seeds=1, steps=4, code_version="test")
+    run = report["runs"][0]
+    curves = run["report"]["tasks"]
+    for record in run["steps"]:
+        # a BenchStep: a finite score, a non-negative cost, an error slot
+        assert 0.0 <= record["score"] <= 1.0
+        assert record["cost"] > 0
+        assert record["budget"] > 0
+        # the score is the phase family's mean on that checkpoint, so the
+        # metric is defined in one place and the step cannot invent its own
+        family = [task for task in curves if task["family"] == record["phase"]]
+        assert family
+        mean = sum(task["scores"][record["step"]] for task in family) / len(family)
+        assert record["score"] == pytest.approx(mean)
+    assert len({record["phase"] for record in run["steps"]}) == 4
 
 
 def test_a_refused_step_leaves_the_artifact_alone():

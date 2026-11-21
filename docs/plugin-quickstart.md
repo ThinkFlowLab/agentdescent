@@ -285,6 +285,12 @@ Two habits worth keeping from the first run:
   prints the same pair, so one check works on both surfaces.
   CLI agents are reported as `probe: … skipped (cli agent)` because one
   call would cost a whole session.
+* `--max-calls N` on that same first run (`--max-usd` beside `--usd-per-call`
+  when a price is known; MCP `plan` / `start` take `max_calls` / `max_usd`).
+  This one holds **per call**: the call that would cross the number is never
+  made, so the first round cannot outspend it. Start at the plan's
+  `agent_calls_upper_bound`, or smaller for a trial. `--budget` below is the
+  weaker bound, not a replacement.
 * `--budget 5 --usd-per-call 0.02` on the first real run. A dollar budget
   needs a per-call price (the engine counts calls; a tool-using agent's price
   is not known in advance). The run stops **between rounds** once

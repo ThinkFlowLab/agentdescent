@@ -28,7 +28,11 @@ def test_algorithms_run_writes_spec_and_plans(tmp_path, capsys, monkeypatch):
     ]) == 0
     captured = capsys.readouterr()
     assert f"wrote {out}" in captured.out
-    assert "next: agentdescent evolve" in captured.out
+    # #1201: the next step is the preflight plus the per-call cap, not a bare
+    # `evolve` that names neither.
+    assert "next: agentdescent plan" in captured.out
+    assert "--probe" in captured.out
+    assert "--max-calls" in captured.out
     assert str(out) in captured.out
     spec = json.loads(out.read_text())
     assert spec["algorithm"] == "gepa"
@@ -49,7 +53,9 @@ def test_algorithms_run_default_out_path(tmp_path, capsys, monkeypatch):
     out = tmp_path / "agentdescent.gepa.spec.json"
     assert out.exists()
     assert json.loads(out.read_text())["algorithm"] == "gepa"
-    assert f"next: agentdescent evolve {out.name}" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert f"next: agentdescent plan {out.name} --probe" in printed
+    assert f"then agentdescent evolve {out.name} --max-calls " in printed
 
 
 def test_algorithms_run_json_one_object(tmp_path, capsys, monkeypatch):
@@ -65,7 +71,9 @@ def test_algorithms_run_json_one_object(tmp_path, capsys, monkeypatch):
     assert payload["ok"] is True
     assert payload["spec_path"] == str(out)
     assert payload["algorithm"]["name"] == "gepa"
-    assert payload["next"] == f"agentdescent evolve {out}"
+    nxt = payload["next"]
+    assert nxt.startswith(f"agentdescent plan {out} --probe, then ")
+    assert f"agentdescent evolve {out} --max-calls " in nxt
     assert payload["tasks"] >= 4
 
 
@@ -414,7 +422,9 @@ def test_algorithms_run_resolves_a_case_variant_to_the_registered_name(
     out = tmp_path / "agentdescent.gepa.spec.json"
     assert out.exists()
     assert json.loads(out.read_text())["algorithm"] == "gepa"
-    assert f"next: agentdescent evolve {out.name}" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert f"next: agentdescent plan {out.name} --probe" in printed
+    assert f"then agentdescent evolve {out.name} --max-calls " in printed
 
 
 def test_algorithms_run_plan_failure_keeps_backup_note(tmp_path, capsys, monkeypatch):

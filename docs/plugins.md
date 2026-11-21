@@ -728,6 +728,14 @@ One round (plus the seed held-out scan) can overshoot by up to its call bound;
 `plan` / `evolve` / MCP `start` warn when the budget is already below that
 bound so the first round alone can blow past it.
 
+The tighter bound is the **per-call cap** from
+[Get started](start.md#real-model): `--max-calls N` on `evolve` (`--max-usd`
+beside `--usd-per-call` when a price is known), or `max_calls` / `max_usd` on
+MCP `plan` / `start`. It refuses the call that would cross the number instead
+of stopping between rounds, so it cannot overshoot; a first trial can use the
+plan's `agent_calls_upper_bound` or less. `--budget` remains the dollar bound
+for a run whose price per call is known up front.
+
 ## Evolving the plugins themselves
 
 A host **plugin** — the DSH Cordis package that adds tools and skills to `dsh`,

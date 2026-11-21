@@ -124,7 +124,10 @@ def test_algorithms_run_plain_ends_with_the_human_form(tmp_path, capsys, monkeyp
         json.loads(out)
     assert f"wrote {out_path}" in out
     assert "plan: 8 tasks (2 held out), 1 round x 1 worker, up to 11 agent calls" in out
-    assert f"next: agentdescent evolve {out_path}" in out
+    # #1201: the preflight and the per-call cap on the line the user follows,
+    # at the plan's own bound (11 calls above).
+    assert f"next: agentdescent plan {out_path} --probe, then " in out
+    assert f"agentdescent evolve {out_path} --max-calls 11" in out
     assert "warning: the held-out set has only 2 task(s)" in err
     assert not (tmp_path / ".agentdescent" / "runs").exists()
 

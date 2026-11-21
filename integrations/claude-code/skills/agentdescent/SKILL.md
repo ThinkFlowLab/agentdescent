@@ -148,6 +148,13 @@ after `doctor`. Do not invent a keyless path for those cards.
    call `start` -- a refused probe is the run failing in round one, found one
    step earlier. A refusal prints `ok: false` and `ready: false` on both
    surfaces, so the same check reads the same answer whichever one you drive.
+   Give the first real run a **per-call cap** too: `max_calls` (and `max_usd`
+   with `usd_per_call` when a price is known) on the MCP `plan` / `start` call,
+   or `--max-calls N` (`--max-usd` beside `--usd-per-call`) on the CLI. The call
+   that would cross the cap is never made, so one round cannot outspend it;
+   start at the plan's `agent_calls_upper_bound`, smaller for a trial.
+   `--budget` is the older dollar bound: it is checked between rounds and can
+   overshoot by a whole round.
    To keep improving across sessions, offer `agentdescent campaign <spec>
    --sessions N`; it works on a copy, reports the workspace/final target and
    never touches the live target. Run its `--dry-run` first. A campaign has no

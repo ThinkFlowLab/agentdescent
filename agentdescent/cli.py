@@ -3199,6 +3199,13 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         dest = os.path.expanduser(spec.target)
         plan = _text_plan(dest, result.rendered)
         payload["apply_plan"] = plan
+        # Directory and symlink refusals apply makes first (#1204, #755, #977).
+        # Catch them so the preview stays read-only and exits 0.
+        try:
+            _refuse_text_dest(run_id, dest)
+        except runstore.RunStoreError as e:
+            payload["apply_plan"] = {"error": str(e)}
+            return payload
         _refuse_plan_outside_write_dirs(
             payload, dest, plan["written"],
             _backup_slot(dest) if not plan["noop"] and os.path.exists(dest) else None)
@@ -3214,9 +3221,14 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
         # The call `apply` makes for a tree, with only `dry_run` differing:
         # `_write_to` checks the destination, every written leaf and the
         # directory backup slot before it returns the plan (#1188).
+        dest = os.path.expanduser(spec.target)
         try:
+            # Same refusal apply makes before `_write_to` (#1204): a symlink
+            # root is never dereferenced. `_write_to` abspaths and would not
+            # see it.
+            _refuse_dest_link(dest, dest)
             payload["apply_plan"] = result._write_to(
-                os.path.expanduser(spec.target), dry_run=True,
+                dest, dry_run=True,
                 check_write=_operator_write_guard())
         except Exception as e:  # noqa: BLE001
             payload["apply_plan"] = {"error": str(e)}
@@ -3514,6 +3526,23 @@ def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
             notes, f"run {run_id}")
 
 
+def _refuse_text_dest(run_id: str, dest: str) -> None:
+    """Refuse a text destination ``apply`` would also refuse (#1204, #755, #977).
+
+    A directory cannot receive a single text artifact (the dry run used to
+    report it would write the directory, then apply traced back on
+    ``IsADirectoryError``), and a destination link is never dereferenced.
+    ``show_payload`` calls the same helper so the preview cannot drift from
+    the write; the message bytes are unchanged.
+    """
+    if os.path.isdir(dest):
+        raise runstore.RunStoreError(
+            f"{run_id} evolved a single text artifact and {dest!r} is a "
+            "directory; pass --to FILE to write it to a file, or read it "
+            "with `show`")
+    _refuse_dest_link(os.path.dirname(os.path.abspath(dest)) or os.sep, dest)
+
+
 def _refuse_dest_link(top: str, path: str) -> None:
     """Refuse a link planted in the destination, before any backup or write (#977).
 
@@ -3557,15 +3586,7 @@ def apply_payload(run_id: str, *, to: Optional[str] = None, store: Optional[str]
             "pass --to PATH to write the rule, or read it with `show`")
     dest = os.path.expanduser(to or spec.target)
     if spec.kind in ("text", "policy_slot"):
-        if os.path.isdir(dest):
-            # Same refusal for --dry-run and the real write: the dry run used to
-            # report it would write the directory, then apply traced back on
-            # IsADirectoryError (#755).
-            raise runstore.RunStoreError(
-                f"{run_id} evolved a single text artifact and {dest!r} is a "
-                "directory; pass --to FILE to write it to a file, or read it "
-                "with `show`")
-        _refuse_dest_link(os.path.dirname(os.path.abspath(dest)) or os.sep, dest)
+        _refuse_text_dest(run_id, dest)
         plan = _text_plan(dest, result.rendered)
         slot = (_backup_slot(dest)
                 if backup and not plan["noop"] and os.path.exists(dest) else None)

@@ -277,7 +277,11 @@ all ~39 tools as the primary path.
   (`AGENTDESCENT_NESTED=1`) the allowlist defaults to the run's cwd plus
   `$AGENTDESCENT_HOME` even when it is unset; outside a worker it is only
   enforced when the variable is set. A refused write exits 2 before anything,
-  including the `.bak-N` copy, touches disk.
+  including the `.bak-N` copy, touches disk. `show --diff` checks the same set
+  there -- the destination, every file its plan names, and the backup slot
+  (a directory artifact backs up under `$AGENTDESCENT_HOME/backups/...`) -- so
+  its `apply_plan` reports that refusal instead of a write `apply` would not
+  perform (#1188).
 * **Questions about an archive are read-only tools.** `safety` (safe to keep
   seeding from?), `portfolio` (layer ranking and a suggested budget split) and
   `audit_trace` (one adoption's evidence rings) return the same JSON as the

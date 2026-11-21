@@ -43,12 +43,15 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from .evolution import (
     EvolutionResult, Propose, Reward, Run, Strategy, Task, evolve,
 )
 from .sampling import TaskSampler
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .evolution import RoundInfo
 
 __all__ = ["Challenger", "ChallengerConfig", "FrontierSampler", "curriculum_evolve"]
 

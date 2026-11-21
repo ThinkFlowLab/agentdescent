@@ -54,6 +54,7 @@ refusal needs a type of its own to survive the merger thread.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import (
     Dict, List, Mapping, Optional, Protocol, Sequence, Set, Tuple,

@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .agents import Usage
-    from .budget import CallBudget
+    from .budget import CallBudget, CallLimit
     from .evolution import RoundInfo
     from .trajectory import TrajectoryStore
 

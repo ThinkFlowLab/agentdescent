@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = ["EvaluationReport", "EvaluationRow", "evaluate"]
 

@@ -35,7 +35,7 @@ import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from .advantage import GroupAdvantage
 from .agents import Usage
@@ -58,6 +58,10 @@ from .scheduler import DurationEstimator, ResumeItem, ResumeQueue
 from .selection import SingleHead
 from .pipeline import EarlyStop, FirstError, StallGuard, WorkerHealth, describe
 from .staleness import StaleAction, StalenessPolicy, get_policy
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .evolve_settings import BudgetSettings, ObservabilitySettings, RuntimeSettings
+    from .evolution import EvolvingArtifact
 
 
 def _async_allocator_context(diff, advantage, blast_radius: float = 0.2) -> Any:

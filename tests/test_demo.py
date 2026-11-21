@@ -464,7 +464,12 @@ def test_demo_algorithm_next_steps_keep_the_algorithm(tmp_path, monkeypatch, nam
     assert "agentdescent doctor" in out
     # #1145: that spec is not on disk yet; algorithms run prints evolve later.
     assert f"agentdescent evolve agentdescent.{name}.spec.json" not in out
-    assert "--out spec.json" not in out
+    # #1201: the demo does not claim the spec exists -- `--out spec.json` is
+    # where the user's own `algorithms run` above puts it, and the two steps
+    # that consume it name the preflight and the per-call cap.
+    assert "--out spec.json" in out
+    assert "agentdescent plan spec.json --probe" in out
+    assert "--max-calls" in out
 
     buf = io.StringIO()
     with redirect_stdout(buf):

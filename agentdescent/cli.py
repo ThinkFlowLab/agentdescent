@@ -813,9 +813,13 @@ def demo_payload(
         # #1145: do not point at evolve agentdescent.{algo}.spec.json — that
         # file is only written when `algorithms run` succeeds, and that
         # command already prints `evolve` with the absolute path it wrote.
+        # #1201: `--out spec.json` gives the next two steps a real path; the
+        # cap is a placeholder because the footer has no estimate yet.
         own_steps = [
             f"agentdescent algorithms run {algo} {target} <your-cases.jsonl> "
-            f"--model <model> [--base-url <url>] --rounds 1 --workers 1",
+            f"--model <model> [--base-url <url>] --rounds 1 --workers 1 --out spec.json",
+            "agentdescent plan spec.json --probe",
+            "agentdescent evolve spec.json --max-calls <N>",
             "agentdescent doctor",
         ]
     elif used_kind == "text":
@@ -4871,7 +4875,18 @@ def algorithms_run_payload(
     obj["warnings"] = list(payload.get("warnings") or []) + [
         t for k, t in report if k == "warning"]
     obj["notes"] = [t for k, t in report if k == "note"]
-    obj["next"] = f"agentdescent evolve {out}" if ok else retry_line
+    if ok:
+        # #1201: the line a user follows names the preflight and the per-call
+        # cap `docs/start.md` documents, at the plan's own upper bound -- the
+        # bare `evolve <spec>` was the one path that named neither.
+        calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
+        cap = (f" --max-calls {int(calls)}"
+               if isinstance(calls, (int, float)) and calls > 0
+               else " --max-calls <N>")
+        obj["next"] = (f"agentdescent plan {out} --probe, then "
+                       f"agentdescent evolve {out}{cap}")
+    else:
+        obj["next"] = retry_line
     obj["_stage"] = "done"
     obj["_report"] = report
     obj["_plan"] = payload

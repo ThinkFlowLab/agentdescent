@@ -76,6 +76,18 @@ class Usage:
     #: network outage mid-sweep and its 43-minute wall carried ~17 minutes of
     #: stall that had nothing to do with the architecture under test.
     failure_seconds: float = 0.0
+    #: Failed **attempts** whose provider reported usage -- a 4xx body or a
+    #: stream that died after the last chunk can carry the tokens already billed.
+    #: Their tokens are in ``prompt_tokens``/``completion_tokens`` like any other
+    #: call (money already spent, so the ``max_tokens`` meter must see it); these
+    #: two only make that part of the bill visible. "Attempts", not calls, is the
+    #: honest unit: on the direct path each record is a call, but a spec run's
+    #: sink sees provider attempts and one actor call can be retried, so this may
+    #: exceed ``calls`` there. A failure that reported nothing adds to neither.
+    failed_usage_attempts: int = 0
+    #: Tokens of the failures counted by ``failed_usage_attempts``; always a subset
+    #: of ``total_tokens`` (same ``record`` call, never recomputed).
+    failed_usage_tokens: int = 0
     #: In-flight invocations, token -> phase, in :meth:`begin` order. Read
     #: through :attr:`pending` / :attr:`phase`.
     _inflight: Dict[int, Optional[str]] = field(
@@ -153,10 +165,16 @@ class Usage:
 
     def record(self, *, prompt_tokens: int = 0, completion_tokens: int = 0,
                seconds: float = 0.0, failed: bool = False,
-               finishes: Optional[int] = None) -> None:
+               finishes: Optional[int] = None,
+               reported_usage: bool = False) -> None:
         """Account one finished call. ``finishes`` is the :meth:`begin` token
         of the invocation this record completes; without it, in-flight state
-        is left alone (an unpaired provider attempt is not the actor call)."""
+        is left alone (an unpaired provider attempt is not the actor call).
+
+        ``reported_usage`` says the provider returned usage numbers for this
+        call, so a failed call's tokens are in the totals *and* in the
+        failed-with-usage column. Both are incremented here, in one pass, so
+        the two can never disagree."""
         with self._lock:
             self.calls += 1
             self.prompt_tokens += prompt_tokens
@@ -165,6 +183,9 @@ class Usage:
             if failed:
                 self.failures += 1
                 self.failure_seconds += seconds
+                if reported_usage:
+                    self.failed_usage_attempts += 1
+                    self.failed_usage_tokens += prompt_tokens + completion_tokens
             if finishes is not None:
                 self._inflight.pop(finishes, None)
         self._notify()
@@ -177,6 +198,20 @@ class Usage:
         with self._lock:
             self.prompt_tokens += prompt_tokens
             self.completion_tokens += completion_tokens
+        self._notify()
+
+    def note_failed_usage(self, prompt_tokens: int = 0,
+                          completion_tokens: int = 0) -> None:
+        """Count a usage-bearing failed attempt without touching the totals.
+
+        The sink path has already added the tokens with :meth:`add_tokens`, so
+        adding them again here would double the bill. Used by
+        :class:`TokenSink` for a failed provider attempt that reported usage
+        (#1202); on that path the count is usage-bearing **attempts**, not
+        actor calls, because one call can be retried several times."""
+        with self._lock:
+            self.failed_usage_attempts += 1
+            self.failed_usage_tokens += prompt_tokens + completion_tokens
         self._notify()
 
     def token_sink(self) -> "TokenSink":
@@ -200,20 +235,33 @@ class Usage:
                 f"{self.completion_tokens:,} completion tokens, "
                 f"{self.seconds:.1f}s in the model"
                 + (f", {self.failures} failed ({self.failure_seconds:.1f}s lost)"
-                   if self.failures else ""))
+                   if self.failures else "")
+                + (f", {self.failed_usage_attempts:,} of them reported "
+                   f"{self.failed_usage_tokens:,} tokens"
+                   if self.failed_usage_attempts else ""))
 
 
 class TokenSink:
-    """What :meth:`Usage.token_sink` returns: ``record`` keeps only the tokens."""
+    """What :meth:`Usage.token_sink` returns: ``record`` keeps only the tokens.
+
+    The engine counts calls and seconds itself on a spec run, so this object
+    only forwards tokens -- plus, for a failed attempt that reported usage, the
+    failed-with-usage column (:meth:`Usage.note_failed_usage`). That column is
+    then a count of usage-bearing provider **attempts**: one actor call can be
+    retried, so it may exceed ``calls`` -- unlike the direct path, where every
+    provider record is also a call."""
 
     def __init__(self, target: Usage) -> None:
         self.target = target
 
     def record(self, *, prompt_tokens: int = 0, completion_tokens: int = 0,
                seconds: float = 0.0, failed: bool = False,
-               finishes: Optional[int] = None) -> None:
+               finishes: Optional[int] = None,
+               reported_usage: bool = False) -> None:
         if prompt_tokens or completion_tokens:
             self.target.add_tokens(prompt_tokens, completion_tokens)
+        if reported_usage and failed:
+            self.target.note_failed_usage(prompt_tokens, completion_tokens)
 
 
 def metered(completion: Completion, usage: Usage) -> Completion:
@@ -765,7 +813,45 @@ def claude(model: str = "claude-opus-4-8", max_tokens: int = 4096,
     return with_retries(complete, attempts=retries) if retries > 1 else complete
 
 
-def _read_sse(response: Any) -> Dict[str, Any]:
+def _usage_counts(payload: Any) -> Optional[Tuple[int, int]]:
+    """``(prompt, completion)`` tokens a provider reported, or ``None``.
+
+    Accepts the two shapes an error body uses -- ``{"usage": {...}}`` and a
+    top-level mapping -- and both wire formats (``prompt_tokens`` /
+    ``completion_tokens``, ``input_tokens`` / ``output_tokens``). Only
+    non-negative ints count: a proxy's string, a boolean or a negative number
+    must not move a budget. A body that carries only ``total_tokens`` is *not*
+    split into halves -- that would be a guess -- so it is no evidence.
+    """
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("usage")
+    counts = inner if isinstance(inner, dict) else payload
+
+    def _int(*names: str) -> Optional[int]:
+        for name in names:
+            value = counts.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        return None
+
+    prompt = _int("prompt_tokens", "input_tokens")
+    completion = _int("completion_tokens", "output_tokens")
+    if prompt is None and completion is None:
+        return None
+    return (prompt or 0, completion or 0)
+
+
+def _usage_from_body(body: str) -> Optional[Tuple[int, int]]:
+    """The usage an error body carries, parsed from the **whole** body."""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    return _usage_counts(payload)
+
+
+def _read_sse(response: Any, seen: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Reassemble an OpenAI-shaped SSE stream into the response it stands for.
 
     Returns the same shape the non-streaming path parses -- ``choices[0].message``
@@ -793,6 +879,10 @@ def _read_sse(response: Any) -> Dict[str, Any]:
             continue
         if isinstance(chunk.get("usage"), dict):
             usage_payload = chunk["usage"]
+            if seen is not None:
+                # A stream that dies after this chunk still billed these tokens;
+                # the caller reads `seen` on the way out of its error path.
+                seen["usage"] = usage_payload
         for choice in chunk.get("choices") or ():
             delta = choice.get("delta") or {}
             piece = delta.get("content")
@@ -932,21 +1022,32 @@ def openai_compatible(model: str, *, base_url_env: str = "OPENAI_BASE_URL",
             f"{base}/chat/completions", data=body,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         t0 = time.time()
+        seen: Dict[str, Any] = {}
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = _read_sse(resp) if stream else json.load(resp)
+                data = _read_sse(resp, seen) if stream else json.load(resp)
         except urllib.error.HTTPError as e:
             # The body carries the only useful part -- "rate limit: retry in 12s",
             # "context length exceeded", "insufficient quota" -- and it lives on
             # e.read(), so re-raising bare collapses every 4xx to "HTTP Error 429:
             # Too Many Requests". `_git` and `_CliAgent` both surface the
             # underlying detail; this was the one provider path that did not.
-            if usage is not None:
-                usage.record(seconds=time.time() - t0, failed=True)
+            #
+            # Read before `record` (a body reads once) and outside the
+            # `usage is not None` guard: a caller with no Usage still gets the
+            # detail in its message. A body that carries usage is money already
+            # billed, so its counts go into the same `record` call (#1202).
             try:
-                detail = e.read().decode("utf-8", "replace").strip()[:400]
+                body_text = e.read().decode("utf-8", "replace")
             except Exception:  # noqa: BLE001 - the body is best-effort
-                detail = ""
+                body_text = ""
+            detail = body_text.strip()[:400]
+            if usage is not None:
+                spent = _usage_from_body(body_text)
+                usage.record(prompt_tokens=spent[0] if spent else 0,
+                             completion_tokens=spent[1] if spent else 0,
+                             seconds=time.time() - t0, failed=True,
+                             reported_usage=spent is not None)
             message = (f"{base} returned HTTP {e.code} for model {model!r}"
                        + (f": {detail}" if detail else ""))
             if e.code in (429, 503):
@@ -984,8 +1085,14 @@ def openai_compatible(model: str, *, base_url_env: str = "OPENAI_BASE_URL",
                 raise ProviderConfigError(f"{message} -- {hint}") from e
             raise RuntimeError(message) from e
         except Exception as e:
+            # A stream can bill usage in a chunk and then die; `seen` holds the
+            # last usage the reader got before the transport failed.
+            spent = _usage_counts(seen.get("usage")) if seen else None
             if usage is not None:
-                usage.record(seconds=time.time() - t0, failed=True)
+                usage.record(prompt_tokens=spent[0] if spent else 0,
+                             completion_tokens=spent[1] if spent else 0,
+                             seconds=time.time() - t0, failed=True,
+                             reported_usage=spent is not None)
             if _is_timeout(e):
                 # A bare "The read operation timed out" names nothing (#467).
                 raise RuntimeError(_timeout_message(
@@ -1076,13 +1183,20 @@ def anthropic_compatible(model: str, *, base_url_env: str = "ANTHROPIC_BASE_URL"
                 data = json.load(resp)
         except urllib.error.HTTPError as e:
             # Same reasoning as `openai_compatible`: the body carries the only
-            # useful part of a 4xx and it lives on `e.read()`.
-            if usage is not None:
-                usage.record(seconds=time.time() - t0, failed=True)
+            # useful part of a 4xx and it lives on `e.read()`. Read it first,
+            # outside the usage guard, so a `usage=None` caller keeps its detail
+            # and a usage-bearing body lands in one `record` call (#1202).
             try:
-                detail = e.read().decode("utf-8", "replace").strip()[:400]
+                body_text = e.read().decode("utf-8", "replace")
             except Exception:  # noqa: BLE001 - the body is best-effort
-                detail = ""
+                body_text = ""
+            detail = body_text.strip()[:400]
+            if usage is not None:
+                spent = _usage_from_body(body_text)
+                usage.record(prompt_tokens=spent[0] if spent else 0,
+                             completion_tokens=spent[1] if spent else 0,
+                             seconds=time.time() - t0, failed=True,
+                             reported_usage=spent is not None)
             message = (f"{base} returned HTTP {e.code} for model {model!r}"
                        + (f": {detail}" if detail else ""))
             if e.code in (429, 503):

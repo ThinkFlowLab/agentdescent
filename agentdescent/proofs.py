@@ -38,7 +38,10 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .invariants import Invariant
 
 __all__ = [
     "ProofInvariant",

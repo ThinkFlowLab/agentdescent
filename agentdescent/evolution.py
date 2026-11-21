@@ -38,8 +38,8 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field, replace as _replace
 from typing import (
-    Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple,
-    runtime_checkable,
+    TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol,
+    Sequence, Tuple, runtime_checkable,
 )
 
 from .agents import Completion, Usage, claude
@@ -61,6 +61,13 @@ from .selection import SingleHead
 from .scheduler import AuditScheduler
 from .staleness import StalenessPolicy
 from .budget import BudgetGovernor, BudgetStop, CallBudget
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .budget import CallLimit
+    from .evolve_settings import BudgetSettings, ObservabilitySettings, RuntimeSettings
+    from .evolvable import VersionVector
+    from .parallel import ParallelStrategy
+    from .trajectory import TrajectoryStore
 
 
 # ---------------------------------------------------------------------------

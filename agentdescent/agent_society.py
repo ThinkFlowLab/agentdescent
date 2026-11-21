@@ -19,7 +19,7 @@ from __future__ import annotations
 import ast
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .evolution import EvolutionResult, Task, evolve
 from .meta import MetaOutcome, slot_reflector

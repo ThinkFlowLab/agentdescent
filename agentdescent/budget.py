@@ -36,7 +36,10 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .agents import Completion
 
 
 #: Where the fusion tournament stops being built: 75% of the budget spent.

@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, TYPE_CHECKING, Union
 
 from .calibrator import Calibrator, Rectification
 from .gate import RectifiedAcceptance, VerifierWatch
@@ -45,6 +45,9 @@ from .sampler import AuditPolicy, SamplePlan
 from .sources import GoldAnswer, NullOracle
 from .store import AuditStore
 from .tap import AuditedReward, RenderTap
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .boost import VerifierBoost
 
 __all__ = ["Audit", "attach"]
 

@@ -51,7 +51,7 @@ import math
 import os
 import shlex
 from dataclasses import dataclass, field, asdict, replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 
 from . import algorithms as _algorithms
 from .agents import Completion, Usage, WorkspaceAgent
@@ -70,6 +70,9 @@ from .skillspec import (SKILL_FILE, SkillLibraryValidator, SkillTreeValidator,
 from .staleness import get_policy
 from .treestrategy import FileTree, tree_reflector
 from .workspec import DEFAULT_ALLOWED_PREFIXES, Ref, RefError
+
+if TYPE_CHECKING:  # annotations only: no runtime import, no cycle risk
+    from .budget import CallLimit
 
 __all__ = [
     "KINDS",

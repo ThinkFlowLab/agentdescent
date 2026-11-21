@@ -1972,7 +1972,12 @@ class EvolutionResult:
                       "prompt_tokens": self.usage.prompt_tokens,
                       "completion_tokens": self.usage.completion_tokens,
                       "seconds": self.usage.seconds,
-                      "failures": self.usage.failures},
+                      "failures": self.usage.failures,
+                      # Additive: the part of the bill that came from failed
+                      # calls whose provider reported usage. Not a required
+                      # key for readers; absent in older payloads.
+                      "failed_usage_attempts": self.usage.failed_usage_attempts,
+                      "failed_usage_tokens": self.usage.failed_usage_tokens},
             "wallclock": self.wallclock,
             "rollouts": self.rollouts,
             "rollout_seconds": self.rollout_seconds,

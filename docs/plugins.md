@@ -281,7 +281,9 @@ all ~39 tools as the primary path.
   there -- the destination, every file its plan names, and the backup slot
   (a directory artifact backs up under `$AGENTDESCENT_HOME/backups/...`) -- so
   its `apply_plan` reports that refusal instead of a write `apply` would not
-  perform (#1188).
+  perform (#1188). The same preview also reports the destination refusals
+  `apply` raises before that check: a text artifact whose target is a
+  directory or a symlink, and a tree whose root is a symlink (#1204).
 * **Questions about an archive are read-only tools.** `safety` (safe to keep
   seeding from?), `portfolio` (layer ranking and a suggested budget split) and
   `audit_trace` (one adoption's evidence rings) return the same JSON as the

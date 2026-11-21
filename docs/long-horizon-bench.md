@@ -14,7 +14,7 @@ the commits.
 ```bash
 python -m bench.long_horizon                        # 9 steps × 3 seeds, human-readable
 python -m bench.long_horizon --json                 # machine-readable report
-python -m bench.long_horizon --steps 15 --seeds 3 \
+python -m bench.long_horizon --steps 9 --seeds 3 \
     --out bench/results/long-horizon-3seed.json     # the committed results
 ```
 

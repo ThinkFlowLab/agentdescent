@@ -1579,9 +1579,46 @@ def _file_tree_backup_path(dest: str) -> str:
     return os.path.join(base, f"bak-{n}")
 
 
+def _refuse_blocked_parent(dest: str) -> None:
+    """Refuse a destination whose nearest existing ancestor is not a directory (#1208).
+
+    ``apply`` creates a missing parent only after the plan is returned: the text
+    branch and ``--from`` call ``os.makedirs`` just before ``open``, and a tree
+    goes through ``filetree.materialize``. ``show --diff`` and ``apply
+    --dry-run`` therefore never reached the step that fails, and the real write
+    reported ``cannot write <dest>: File exists`` -- the parent's errno printed
+    against a destination that never existed. Name the blocker instead.
+
+    Walking up to the nearest *existing* ancestor, not just the immediate
+    parent, is what makes ``--to blocker/a/b/rule.md`` fail like
+    ``--to blocker/rule.md``. Called from ``_check_apply_paths`` so every
+    surface that plans (``show`` text, ``apply`` text, ``--from``,
+    ``--install-to`` and the tree writer) refuses before anything is created.
+    """
+    parent = os.path.dirname(dest.rstrip(os.sep)) or os.curdir
+    cur = parent
+    while not os.path.lexists(cur):
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            cur = os.curdir
+            break
+        cur = nxt
+    if os.path.lexists(cur) and not os.path.isdir(cur):
+        from . import runstore  # runstore imports this module at import time
+
+        raise runstore.RunStoreError(
+            f"cannot write {dest}: {cur!r} is a file, not a directory")
+
+
 def _check_apply_paths(dest: str, written: Sequence[str], backup: Optional[str],
                        check_write: Optional[Callable[[str, str], Any]]) -> None:
-    """Check the selected write set before any artifact or backup is changed."""
+    """Check the selected write set before any artifact or backup is changed.
+
+    The blocked-parent refusal runs before the operator allowlist guard: it is a
+    property of the filesystem, not of who is writing, so ``show`` and
+    ``--dry-run`` see it even when ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset.
+    """
+    _refuse_blocked_parent(dest)
     if check_write is not None:
         check_write(dest, "to")
         for path in written:

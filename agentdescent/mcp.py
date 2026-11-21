@@ -33,7 +33,7 @@ import inspect
 import json
 import os
 import secrets
-from typing import Annotated, Any, Dict, Optional, Sequence, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, runstore
 from .cli import (NESTED_ENV, NESTED_REFUSAL, apply_with_target, demo_payload,
@@ -432,8 +432,9 @@ def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
 
 
 def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
-                        usd_per_call: Optional[float]) -> Optional[Dict[str, Any]]:
-    """The run-level cap an MCP ``plan`` / ``start`` will enforce, or ``None`` (#1184).
+                        usd_per_call: Optional[float], *,
+                        spent: int = 0) -> Optional[Dict[str, Any]]:
+    """The cap an MCP ``plan`` / ``start`` will enforce, or ``None`` (#1184, #1082).
 
     Validated by the same :func:`~agentdescent.evolvespec.build_call_limit` the
     CLI and the run store use, so a bad number -- and a ``max_usd`` with no
@@ -446,6 +447,13 @@ def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
     binds, the same distinction ``AGENTDESCENT_MAX_CALLS_REQUESTED`` carries
     into the child: without them a host cannot tell "the ceiling lowered your 9
     to 2" from "you asked for 2".
+
+    ``spent`` is what this Ticket's earlier runs already charged (``#1082``
+    row 2). The ceiling is a Ticket budget, not a per-run number the worker can
+    ask for again: the second run of one worker session is clamped to what is
+    left, and ``ticket`` reports the arithmetic so the host can show it. A
+    worker that runs outside an MCP server -- a plain CLI ``evolve`` -- passes
+    no ``spent`` and keeps the per-run ceiling ``runstore.launch`` applies.
     """
     limit = build_call_limit(max_calls=max_calls, max_usd=max_usd,
                              usd_per_call=usd_per_call)
@@ -455,13 +463,22 @@ def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
     enforced = None if limit is None else limit.max_calls
     payload: Dict[str, Any] = {"max_calls": enforced,
                               "max_usd": None if limit is None else limit.max_usd}
-    if ceiling is not None and (enforced is None or ceiling < enforced):
-        # A run that names no cap still gets the ceiling -- and then the reply
-        # has to say so, or `start` would look unbounded while it is capped.
-        payload["max_calls"] = ceiling
-        payload["source"] = runstore.OPERATOR_MAX_CALLS_ENV
-        if max_calls is not None:
-            payload["max_calls_requested"] = int(max_calls)
+    if ceiling is not None:
+        remaining = max(0, int(ceiling) - max(0, int(spent)))
+        if spent > 0:
+            # Shape stability: a fresh session's first run hears exactly what it
+            # heard before this key existed; only a Ticket with earlier spend
+            # reports the arithmetic nobody could otherwise see.
+            payload["ticket"] = {"ceiling": int(ceiling), "spent": int(spent),
+                                 "remaining": remaining}
+        if enforced is None or remaining < enforced:
+            # A run that names no cap still gets the ceiling -- and then the
+            # reply has to say so, or `start` would look unbounded while it is
+            # capped. Same for what earlier runs of this Ticket left.
+            payload["max_calls"] = remaining
+            payload["source"] = runstore.OPERATOR_MAX_CALLS_ENV
+            if max_calls is not None:
+                payload["max_calls_requested"] = int(max_calls)
     return payload
 
 
@@ -502,6 +519,10 @@ class Tools:
         #: The host's own CLI (`claude_code`, `codex`, `dsh`, `opencode`), from
         #: the name it sent at `initialize`. The fallback route for `host_model`.
         self.host_cli: Optional[str] = None
+        #: Runs this server started: one worker session is one Ticket, so the
+        #: operator ceiling is spent across them instead of re-granted per run
+        #: (#1082 row 2). Empty on a fresh server.
+        self._ticket_runs: List[str] = []
 
     def host_model_env(self) -> Dict[str, str]:
         """What a launched run needs to reach the host's model, by either route.
@@ -518,6 +539,26 @@ class Tools:
 
             return {HOST_CLI_ENV: self.host_cli}
         return {}
+
+    def _ticket_spent(self) -> int:
+        """Model calls this Ticket's earlier runs already charged (#1082 row 2).
+
+        One worker session is one Ticket (``docs/dsh-super-agent.md``), so the
+        operator ceiling is that session's budget: a second ``start`` hears the
+        remainder, not the ceiling again. ``pending_calls`` counts as spent
+        while a run is still in flight -- work already started is not budget
+        the next run may hand out twice. A run whose status cannot be read
+        counts as 0, so a store that lost one run does not make the Ticket
+        unstartable forever.
+        """
+        spent = 0
+        for run_id in self._ticket_runs:
+            try:
+                st = runstore.get(run_id, store=self.store).status()
+            except (runstore.RunStoreError, ValueError, OSError):
+                continue
+            spent += int(st.calls) + int(st.pending_calls)
+        return spent
 
     # -- read-only -------------------------------------------------------------
 
@@ -715,7 +756,8 @@ class Tools:
             es = EvolveSpec.from_dict(spec).absolutise()
             payload = plan_payload(es, usd_per_call=usd_per_call,
                                    budget_usd=budget_usd)
-            limit = _call_limit_payload(max_calls, max_usd, usd_per_call)
+            limit = _call_limit_payload(max_calls, max_usd, usd_per_call,
+                                        spent=self._ticket_spent())
         except SpecError as e:
             return {"ok": False, "error": str(e)}
         except runstore.RunStoreError as e:
@@ -770,11 +812,28 @@ class Tools:
             runstore.require_budget_pair(budget_usd, usd_per_call)
             # A bad cap is a refusal too, not a run whose log.txt explains it
             # later; same sentence the CLI prints (#1184).
-            limit = _call_limit_payload(max_calls, max_usd, usd_per_call)
+            limit = _call_limit_payload(max_calls, max_usd, usd_per_call,
+                                        spent=self._ticket_spent())
         except SpecError as e:
             return {"ok": False, "error": str(e)}
         except runstore.RunStoreError as e:
             return {"ok": False, "error": str(e)}
+        ticket = (limit or {}).get("ticket") or {}
+        if ticket.get("remaining") == 0:
+            # The ceiling is spent: refuse before a run exists, with the
+            # arithmetic in the sentence, instead of starting one that cannot
+            # charge a single call or, worse, one that treats 0 as "no cap".
+            # A caller's own `max_calls=0` is not this case and keeps its
+            # existing path.
+            return {"ok": False, "error": (
+                f"{runstore.OPERATOR_MAX_CALLS_ENV}={ticket['ceiling']} is "
+                f"already spent by this worker's Ticket ({ticket['spent']} "
+                f"call{'s' if ticket['spent'] != 1 else ''} over "
+                f"{len(self._ticket_runs)} run"
+                f"{'s' if len(self._ticket_runs) != 1 else ''}); no run may "
+                "start. Start the next Ticket in a new server session, or "
+                "raise the ceiling."),
+                    "call_limit": limit}
         if os.environ.get(NESTED_ENV):
             # This server is running inside a worker of another run (the plugin
             # that hosts it is being evolved). The transcript should still show
@@ -814,6 +873,9 @@ class Tools:
                                  env=self.host_model_env())
         except runstore.RunStoreError as e:
             return {"ok": False, "error": str(e), "run_id": rd.run_id, "dir": rd.path}
+        # The Ticket's spend is read from the store, so this only has to name
+        # the runs it may count; a resumed or CLI-started run is not one.
+        self._ticket_runs.append(rd.run_id)
         out = {"ok": True, "run_id": rd.run_id, "state": st.state, "pid": st.pid,
                 "dir": rd.path, "notes": rd.status().notes,
                 # Whether a `host_model` reference in this spec can work. A run

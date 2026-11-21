@@ -108,6 +108,12 @@ your tree, under the operator's write allowlist).
   the Ticket.
 - `plan` is the budget line: it estimates cost without executing. Read it before
   `start`, and put the number in the Ticket.
+- A Ticket's ceiling is the session's, not the run's. With
+  `AGENTDESCENT_MAX_CALLS` set, the server spends it across the runs it starts:
+  a second `start` is clamped to the remainder, its reply says
+  `ticket: {ceiling, spent, remaining}`, and once the ceiling is spent `start`
+  refuses. Start the next Ticket in a new server session (or raise the
+  ceiling) rather than reusing the spent one (#1082).
 - A detached run no longer inherits the worker session: `launch` drops the
   host-session markers it lists, except the four host config roots it keeps
   (`DETACHED_KEEP_VARS`: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`,

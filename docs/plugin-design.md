@@ -604,7 +604,12 @@ Two guards keep this from folding in on itself:
   the environment, not by review. The MCP surface takes the same numbers —
   `plan` / `start` accept `max_calls` / `max_usd` and report `call_limit` with
   what was asked for and what will be enforced, so a host sees a request of 9
-  come back as 2 with `source: AGENTDESCENT_MAX_CALLS` (#1184).
+  come back as 2 with `source: AGENTDESCENT_MAX_CALLS` (#1184). One worker
+  session is one Ticket, so the server does not hand the ceiling out again per
+  run: a second `start` is clamped to what the Ticket has left, `call_limit`
+  then carries `ticket: {ceiling, spent, remaining}`, and a spent Ticket
+  refuses another `start` instead of launching a run that cannot charge a
+  single call (#1082).
 * **The controller never hot-swaps itself.** A self-evolved plugin reaches the
   user's real installation only through `apply`, which is a human decision on
   a diff, after an L1 oracle gate, with a backup. The loop can improve its own

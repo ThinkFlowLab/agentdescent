@@ -1598,7 +1598,8 @@ def _refuse_blocked_parent(dest: str) -> None:
 
     Walking up to the nearest *existing* ancestor, not just the immediate
     parent, is what makes ``--to blocker/a/b/rule.md`` fail like
-    ``--to blocker/rule.md``. Called from ``_check_apply_paths`` so every
+    ``--to blocker/rule.md``. Called from ``_check_apply_paths`` on ``dest``
+    and every path in ``written`` (tree children included, #1221) so every
     surface that plans (``show`` text, ``apply`` text, ``--from``,
     ``--install-to`` and the tree writer) refuses before anything is created.
     """
@@ -1624,8 +1625,13 @@ def _check_apply_paths(dest: str, written: Sequence[str], backup: Optional[str],
     The blocked-parent refusal runs before the operator allowlist guard: it is a
     property of the filesystem, not of who is writing, so ``show`` and
     ``--dry-run`` see it even when ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset.
+    It covers ``dest`` and every path in ``written`` (tree children included):
+    a regular file sitting at an intermediate path blocks a leaf the same way
+    a file sitting at the destination's parent does (#1221, #1208).
     """
     _refuse_blocked_parent(dest)
+    for path in written:
+        _refuse_blocked_parent(path)
     if check_write is not None:
         check_write(dest, "to")
         for path in written:

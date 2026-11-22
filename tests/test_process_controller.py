@@ -1,8 +1,9 @@
 """The label-only controller (AGENTS.md › Controller).
 
 It runs on ``pull_request`` ``opened`` / ``ready_for_review`` /
-``reopened`` (same-repo) and on a four-a-day cron backstop, with a write
-token, so its contract is tested offline: it touches only the labels it
+``reopened`` (same-repo), on the ``issues`` events that can void an approval,
+and on a four-a-day cron backstop, with a write token, so its contract is
+tested offline: it touches only the labels it
 manages, only in the allowed direction, never adds ``agent-ready``, stops
 entirely on ``AGENT_PAUSE`` and is a dry run unless ``CONTROLLER_LIVE`` is
 exactly ``true``.
@@ -275,13 +276,19 @@ def test_workflow_shape():
     text = WORKFLOW.read_text(encoding="utf-8")
     wf = yaml.safe_load(text)
     on = wf.get("on", wf.get(True))
-    assert set(on) == {"schedule", "workflow_dispatch", "pull_request"}
+    assert set(on) == {"schedule", "workflow_dispatch", "pull_request", "issues"}
     assert on["schedule"] == [{"cron": "17 */6 * * *"}], (
         "four slots a day: the half-hourly cron only ran two or three times a day, "
-        "so immediacy comes from the pull_request events, not the schedule"
+        "so immediacy comes from the event triggers, not the schedule"
     )
     assert on["pull_request"] == {"types": ["opened", "ready_for_review", "reopened"]}, \
         "label a PR when it becomes reviewable, not on every push to its head"
+    assert on["issues"] == {"types": ["labeled", "unlabeled", "edited"]}, (
+        "the demotion path is the safety-critical one: a label set by a non-maintainer "
+        "or an edit after the approval has to be read in the same minute, not at the "
+        "next tick. The schedule alone skipped 14 h 16 min (19 Nov 18:10 -> 20 Nov "
+        "08:26 UTC), and an approval voided by an edit stays usable for that long."
+    )
     assert wf["permissions"] == {}
     plan, apply = wf["jobs"]["plan"], wf["jobs"]["apply"]
     assert plan["permissions"] == {"contents": "read", "issues": "read", "pull-requests": "read"}

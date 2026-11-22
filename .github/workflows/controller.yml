@@ -18,9 +18,18 @@ name: controller
 # so immediacy comes from these events and manual dispatch, and the cron is a
 # four-a-day backstop only. A `pull_request` run from a fork head carries a
 # read-only token, so both jobs skip it: the fallback cron still labels fork PRs.
+#
+# The demotion half is the safety-critical one and it had no event at all: a
+# label set by a non-maintainer, or an edit after the approval, was only read at
+# the next tick. The schedule skipped 14 h 16 min once (19 Nov 18:10 -> 20 Nov
+# 08:26 UTC), and for that whole window an approval someone had just voided was
+# still usable. So `issues` `labeled` / `unlabeled` / `edited` wake it too. The
+# run the controller's own removal triggers plans nothing, so this cannot loop.
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
+  issues:
+    types: [labeled, unlabeled, edited]
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:

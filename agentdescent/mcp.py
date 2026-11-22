@@ -566,16 +566,22 @@ class Tools:
         the cap it was started with, so two overlapping starts cannot both take
         the same remainder. A finished run is charged what it used, so an
         under-spending run gives the rest of the Ticket back. A run whose
-        status cannot be read counts as 0, so a store that lost one run does
-        not make the Ticket unstartable forever.
+        status cannot be read is not free: this raises instead of counting it
+        as 0, because a remainder computed over a run nobody can read may
+        already be spent, and granting it would start the run that breaks the
+        ceiling (#1082).
         """
         spent = 0
         for run_id in self._ticket_runs:
             reserved = max(0, int(self._ticket_reserved.get(run_id, 0)))
             try:
                 st = runstore.get(run_id, store=self.store).status()
-            except (runstore.RunStoreError, ValueError, OSError):
-                continue
+            except (runstore.RunStoreError, ValueError, OSError) as e:
+                raise runstore.RunStoreError(
+                    f"run {run_id} cannot be accounted: its status cannot be "
+                    f"read ({e}), so what this Ticket has spent is unknown; "
+                    "no run may start until the run store is readable again. "
+                    "Fix or remove that run directory, then retry.") from e
             charged = int(st.calls) + int(st.pending_calls)
             if st.state in ("done", "failed", "cancelled"):
                 spent += charged
@@ -619,10 +625,22 @@ class Tools:
         cap counts that ledger (``execute`` seeds ``Usage`` from it), so the
         number it is relaunched with is ``prior + remaining``: passing the
         remainder alone would stop it at once having "reached" a cap it already
-        went past. The reply says the same number it gave the child.
+        went past. The reply says the same number it gave the child. A run whose
+        status cannot be read refuses here too, with its own sentence: that is
+        an unreadable ledger, not a spent one.
         """
-        limit = _call_limit_payload(max_calls, max_usd, usd_per_call,
-                                    spent=self._ticket_spent())
+        # Both of these raise reasons a host must hear as a refusal, not as a
+        # traceback: `start` reaches this under the lock, outside the try that
+        # wraps its argument parsing, so an escaping SpecError would bypass the
+        # `ok: false` answer the CLI and `plan` already give (#1082, #1196).
+        try:
+            spent = self._ticket_spent()
+        except runstore.RunStoreError as e:
+            return None, None, {"ok": False, "error": str(e)}
+        try:
+            limit = _call_limit_payload(max_calls, max_usd, usd_per_call, spent=spent)
+        except SpecError as e:
+            return None, None, {"ok": False, "error": str(e)}
         ticket = (limit or {}).get("ticket") or {}
         if ticket.get("remaining") == 0:
             return limit, None, self._ticket_refusal(ticket, limit)

@@ -12,6 +12,8 @@ of silently starting an uncapped one.
 
 from __future__ import annotations
 
+import os
+import re
 import threading
 import time
 
@@ -51,6 +53,19 @@ def _wait_more(rd, before_calls, timeout=120):
     return rd.status()
 
 
+def _cap_in_detail(st):
+    """The `cap N` a capped run actually stopped at, read from its own status.
+
+    The reply is not the enforcement: a run whose ``stop_detail`` names a
+    different number than the reply handed out is the grant mismatch this file
+    exists to pin (#1082). Only a run that stopped on the call budget has one.
+    """
+    assert st.stop_reason == "budget", st
+    m = re.search(r"cap (\d+)\s*$", st.stop_detail or "")
+    assert m, st.stop_detail
+    return int(m.group(1))
+
+
 def _start_in(tmp_path, tools, name, **kwargs):
     sub = tmp_path / name
     sub.mkdir()
@@ -81,6 +96,10 @@ def test_second_run_is_clamped_to_what_the_ticket_has_left(store, tmp_path, monk
     assert st2.state == "done", st2
     assert st2.calls <= 1, st2
     assert st.calls + st2.calls <= 2, (st.calls, st2.calls)
+    # The child stopped where the reply said it would: `stop_detail` names the
+    # same cap the host was told, so the number a host shows is the number that
+    # was enforced.
+    assert _cap_in_detail(st2) == second["call_limit"]["max_calls"], st2.stop_detail
 
 
 def test_a_spent_ticket_refuses_another_start(store, tmp_path, monkeypatch):
@@ -256,3 +275,46 @@ def test_a_resumed_run_is_charged_to_the_ticket(store, tmp_path, monkeypatch):
     # Ticket bills 4 of 3.
     assert st_a2.calls - st_a.calls == 1, (st_a.calls, st_a2.calls)
     assert st_a2.calls + st_b.calls == 3, (st_a2.calls, st_b.calls)
+
+def test_a_ceiling_bound_run_is_stopped_at_the_cap_the_reply_quotes(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    # The caller asks for nine, the ceiling grants three. The reply says 3, so
+    # the child has to stop at 3: a reply that says 3 over a child stopped
+    # anywhere else is the grant mismatch this file pins, not a display bug.
+    first = _start_in(tmp_path, tools, "t0", max_calls=9)
+    assert first["call_limit"]["max_calls"] == 3, first["call_limit"]
+    assert first["call_limit"]["source"] == runstore.OPERATOR_MAX_CALLS_ENV
+    st = _wait(runstore.get(first["run_id"], store=store))
+    assert st.calls == 3, st
+    assert _cap_in_detail(st) == first["call_limit"]["max_calls"], st.stop_detail
+
+
+def test_an_unreadable_run_refuses_instead_of_granting_the_rest(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=1)
+    st = _wait(runstore.get(first["run_id"], store=store))
+    assert st.calls == 1, st
+
+    # A store that lost one run's status cannot say what this Ticket spent.
+    # Reading it as 0 hands the next run the rest of a budget that may already
+    # be gone, so the Ticket refuses until the store is readable again.
+    os.remove(runstore.get(first["run_id"], store=store).status_path)
+    sub = tmp_path / "t1"
+    sub.mkdir()
+    refused = tools.start(_dir_spec(str(sub)).to_dict())
+    assert refused["ok"] is False, refused
+    assert first["run_id"] in refused["error"], refused["error"]
+    assert "cannot be accounted" in refused["error"], refused["error"]
+    # Refused before the run existed: one run directory, not two.
+    assert len(os.listdir(store)) == 1, os.listdir(store)
+
+    # `plan` says the same thing, so a host that plans before starting is not
+    # told a remainder the Ticket is not willing to grant.
+    plan_sub = tmp_path / "t2"
+    plan_sub.mkdir()
+    plan = tools.plan(_dir_spec(str(plan_sub)).to_dict())
+    assert plan["ok"] is False, plan
+    assert first["run_id"] in plan["error"], plan["error"]
+    assert "cannot be accounted" in plan["error"], plan["error"]

@@ -284,8 +284,9 @@ all ~39 tools as the primary path.
   perform (#1188). The same preview also reports the destination refusals
   `apply` raises before that check: a text artifact whose target is a
   directory or a symlink, a tree whose root is a symlink (#1204), a
-  destination whose nearest existing ancestor is a file (#1208), and a
-  tree child blocked by a regular file on the way to a leaf (#1221).
+  destination whose nearest existing ancestor is a file (#1208), a
+  tree child blocked by a regular file on the way to a leaf (#1221),
+  and a tree leaf that is already a directory (#1223).
 * **Questions about an archive are read-only tools.** `safety` (safe to keep
   seeding from?), `portfolio` (layer ranking and a suggested budget split) and
   `audit_trace` (one adoption's evidence rings) return the same JSON as the

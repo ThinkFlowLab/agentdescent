@@ -175,7 +175,8 @@ def test_force_quotes_the_run_anyway(tmp_path, endpoint):
     assert code == 0, (out, err)
     assert "no headroom" in err and "--force" in err
     assert "up to 11 agent calls" in out
-    assert "next: agentdescent evolve" in out
+    assert "next: " in out and "agentdescent evolve" in out
+    assert "--max-calls" in out
     assert _Handler.hits == 4
 
 

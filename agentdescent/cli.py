@@ -826,19 +826,24 @@ def demo_payload(
         own_steps = [
             f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
-            "agentdescent plan spec.json",
+            "agentdescent plan spec.json --probe",
+            "agentdescent evolve spec.json --max-calls <N>",
         ]
     elif kind == "skill_library":
         own_steps = [
             f"agentdescent init {target} --kind skill_library --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
-            "agentdescent plan spec.json",
+            "agentdescent plan spec.json --probe",
+            "agentdescent evolve spec.json --max-calls <N>",
         ]
     else:
+        # #1217: the README demo path must name the same preflight and
+        # per-call cap that #1201 already put on `demo --algorithm`.
         own_steps = [
             f"agentdescent init {target} --data <your-cases.jsonl> --out spec.json",
             "agentdescent doctor",
-            "agentdescent plan spec.json",
+            "agentdescent plan spec.json --probe",
+            "agentdescent evolve spec.json --max-calls <N>",
         ]
     next_steps = [
         f"agentdescent show  {rd.run_id}",
@@ -2422,6 +2427,26 @@ def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
 
 
 
+def _capped_evolve_next(spec_path: str, calls: Any, *,
+                        already_probed: bool = False,
+                        extra_flags: str = "") -> str:
+    """The first-run ``next:`` line: preflight, then evolve with a per-call cap.
+
+    #1201 / #1217: a new user or host following ``next`` must see
+    ``plan --probe`` (unless this invocation already probed) and
+    ``evolve --max-calls N``, with N from the plan's own
+    ``agent_calls_upper_bound``. ``<N>`` is the placeholder when no
+    bound is known yet (the default demo footer has no user estimate).
+    """
+    cap = (f" --max-calls {int(calls)}"
+           if isinstance(calls, (int, float)) and calls > 0
+           else " --max-calls <N>")
+    evolve = f"agentdescent evolve {spec_path}{extra_flags}{cap}"
+    if already_probed:
+        return evolve
+    return (f"agentdescent plan {spec_path} --probe{extra_flags}, then "
+            f"{evolve}")
+
 
 def _print_plan(payload: Dict[str, Any], *, spec_path: str,
                 next_line: Optional[str] = None,
@@ -2573,16 +2598,20 @@ def cmd_plan(a: argparse.Namespace) -> int:
         print(f"error: {payload.get('error', 'plan failed')}", file=sys.stderr)
         return 2
     probe = _probe_if_asked(a, spec) if payload.get("ok", True) else None
-    # Default next is evolve; a refused probe replaces it with the repair
-    # action so a reader (or a host following `next`) does not start a run
-    # that cannot work (#1093), and flips `ok` too (#1175) -- see below.
-    next_line = f"agentdescent evolve {a.spec}"
-    # Keep an ad-hoc `--algorithm` / `--param` override in the suggested
-    # command: it lives in memory, not in the spec file.
+    # Default next names the preflight and the per-call cap (#1217);
+    # a refused probe replaces it with the repair action so a reader
+    # (or a host following `next`) does not start a run that cannot
+    # work (#1093), and flips `ok` too (#1175) -- see below.
+    extra_flags = ""
     if getattr(a, "algorithm", None):
-        next_line += f" --algorithm {a.algorithm}"
+        # Keep an ad-hoc `--algorithm` / `--param` override in the
+        # suggested command: it lives in memory, not in the spec file.
+        extra_flags += f" --algorithm {a.algorithm}"
         for param in getattr(a, "param", None) or []:
-            next_line += f" --param {param}"
+            extra_flags += f" --param {param}"
+    calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
+    next_line = _capped_evolve_next(
+        a.spec, calls, already_probed=False, extra_flags=extra_flags)
     then_line = None
     probe_refused = False
     if probe is not None:
@@ -2600,6 +2629,11 @@ def cmd_plan(a: argparse.Namespace) -> int:
             next_line = first_failed_next(probe)
             payload["next"] = next_line
             then_line = f"agentdescent plan {a.spec} --probe"
+        else:
+            # This invocation already probed; `next:` is the capped evolve
+            # only (#1217). A refusal keeps the repair + `then:` above.
+            next_line = _capped_evolve_next(
+                a.spec, calls, already_probed=True, extra_flags=extra_flags)
     # `--baseline-sample` spends real calls, so it runs last: a broken spec or a
     # refused probe must not first pay for N rollouts (#1113). The sample's own
     # call count is printed before the first one; it is opt-in, and plain `plan`
@@ -2660,12 +2694,18 @@ def cmd_plan(a: argparse.Namespace) -> int:
                 payload["ready"] = False
                 if not forced:
                     refused_headroom = True
+    # #1217: `--json` carries the same `next` string the human form prints,
+    # including after a successful `--probe` (the capped evolve) and on a
+    # plain plan (probe, then the cap). A withheld quote, or a repair
+    # already stored for a refused probe / failed baseline, is left as-is.
+    if (payload.get("ok", True) and not refused_headroom
+            and not baseline_failed):
+        payload["next"] = next_line
     if a.json:
         _out(payload, as_json=True)
     else:
-        # The human form is the default; `--json` above is the machine form and
-        # stays exactly the object it always was (#919) when the probe is not
-        # asked. `ready` is added only when `--probe` ran.
+        # The human form is the default; `--json` above is the machine form.
+        # `ready` is added only when `--probe` ran.
         from .probe import probe_lines as _probe_lines
 
         _print_plan(payload, spec_path=a.spec, next_line=next_line,
@@ -4880,11 +4920,7 @@ def algorithms_run_payload(
         # cap `docs/start.md` documents, at the plan's own upper bound -- the
         # bare `evolve <spec>` was the one path that named neither.
         calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
-        cap = (f" --max-calls {int(calls)}"
-               if isinstance(calls, (int, float)) and calls > 0
-               else " --max-calls <N>")
-        obj["next"] = (f"agentdescent plan {out} --probe, then "
-                       f"agentdescent evolve {out}{cap}")
+        obj["next"] = _capped_evolve_next(out, calls)
     else:
         obj["next"] = retry_line
     obj["_stage"] = "done"

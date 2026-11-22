@@ -121,3 +121,66 @@ def test_demo_algorithm_footer_names_the_probe_then_the_cap(tmp_path, monkeypatc
     steps = json.loads(text)["next"]
     assert "agentdescent plan spec.json --probe" in steps
     assert "agentdescent evolve spec.json --max-calls <N>" in steps
+
+def test_default_demo_footer_names_the_probe_then_the_cap(tmp_path, monkeypatch):
+    # #1217: the README path (`demo`, then "your own run") had the same
+    # gap #1201 closed for `demo --algorithm` / `algorithms run`.
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    code, text = _run(["--store", str(tmp_path / "runs"), "demo",
+                       "--dir", str(tmp_path / "work")])
+    assert code == 0, text
+    assert "agentdescent plan spec.json --probe" in text
+    assert "agentdescent evolve spec.json --max-calls <N>" in text
+    assert "--out spec.json" in text
+    assert "agentdescent doctor" in text
+
+    code, text = _run(["--store", str(tmp_path / "runs2"), "demo",
+                       "--dir", str(tmp_path / "work2"), "--json"])
+    assert code == 0, text
+    steps = json.loads(text)["next"]
+    assert "agentdescent plan spec.json --probe" in steps
+    assert "agentdescent evolve spec.json --max-calls <N>" in steps
+
+
+def test_demo_kind_skill_library_footer_names_the_probe_then_the_cap(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    code, text = _run(["--store", str(tmp_path / "runs"), "demo",
+                       "--kind", "skill_library",
+                       "--dir", str(tmp_path / "work"), "--json"])
+    assert code == 0, text
+    steps = json.loads(text)["next"]
+    assert "agentdescent plan spec.json --probe" in steps
+    assert "agentdescent evolve spec.json --max-calls <N>" in steps
+    assert any("--kind skill_library" in s for s in steps)
+
+
+def test_bare_plan_next_names_the_probe_then_the_cap(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    prompt, cases = _prompt_and_cases(tmp_path)
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "kind": "text", "target": str(prompt),
+        "data": {"path": str(cases)}, "score": "contains",
+        "agent": "echo", "reflect": "echo",
+        "evolve": {"rounds": 1, "n_workers": 1, "seed": 0},
+    }), encoding="utf-8")
+
+    code, text = _run(["plan", str(spec)])
+    assert code == 0, text
+    nxt = [line for line in text.splitlines() if line.startswith("next:")]
+    assert nxt, text
+    line = nxt[-1]
+    assert "plan" in line and "--probe" in line
+    bound = re.search(r"up to (\d+) agent calls", text)
+    assert bound, text
+    assert f"--max-calls {bound.group(1)}" in line
+
+    code, text = _run(["--json", "plan", str(spec)])
+    assert code == 0, text
+    payload = json.loads(text)
+    assert payload["next"] == (
+        f"agentdescent plan {spec} --probe, then "
+        f"agentdescent evolve {spec} --max-calls {bound.group(1)}")
+    assert "ready" not in payload and "probe" not in payload
+

@@ -52,7 +52,8 @@ def test_plain_plan_is_short_and_human(tmp_path, capsys):
     assert len(out.splitlines()) <= 15, out
     assert "plan: 8 tasks (2 held out), 1 round x 1 worker, up to 11 agent calls" in out
     assert "no $ estimate: pass --usd-per-call" in out
-    assert f"next: agentdescent evolve {path}" in out
+    assert (f"next: agentdescent plan {path} --probe, then "
+            f"agentdescent evolve {path} --max-calls 11") in out
     # The sentence `evolve()` warns with, as a warning a person sees on stderr.
     assert "warning: the held-out set has only 2 task(s)" in err
 
@@ -97,15 +98,22 @@ def test_plain_plan_next_keeps_an_ad_hoc_algorithm(tmp_path, capsys):
     path = _spec(tmp_path)
     assert cli.main(["plan", path, "--algorithm", "gepa"]) == 0
     out = capsys.readouterr().out
-    assert f"next: agentdescent evolve {path} --algorithm gepa" in out
+    assert (f"next: agentdescent plan {path} --probe --algorithm gepa, then "
+            f"agentdescent evolve {path} --algorithm gepa --max-calls 11") in out
 
 
-def test_plan_json_is_unchanged(tmp_path, capsys):
+def test_plan_json_carries_the_capped_next(tmp_path, capsys):
+    # #1217: `--json` publishes the same `next` string the human form
+    # prints; the rest of the plan document stays `plan_payload`.
     path = _spec(tmp_path)
     assert cli.main(["plan", path, "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     expected = plan_payload(load_spec(path))
-    assert payload == json.loads(json.dumps(expected, default=str))
+    assert payload["next"] == (
+        f"agentdescent plan {path} --probe, then "
+        f"agentdescent evolve {path} --max-calls 11")
+    body = {k: v for k, v in payload.items() if k != "next"}
+    assert body == json.loads(json.dumps(expected, default=str))
     assert payload["estimate"]["agent_calls_upper_bound"] == 11
 
 

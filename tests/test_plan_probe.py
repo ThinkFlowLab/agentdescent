@@ -371,7 +371,9 @@ def test_a_successful_probe_still_recommends_evolve(tmp_path, endpoint):
 
     code, out, err = _run(["plan", spec, "--probe"])
     assert code == 0, (out, err)
-    assert out.strip().splitlines()[-1].startswith("next: agentdescent evolve ")
+    last = out.strip().splitlines()[-1]
+    assert last.startswith("next: agentdescent evolve "), last
+    assert "--max-calls" in last
     assert "then: " not in out
 
     json_code, json_out, json_err = _run(["plan", spec, "--json", "--probe"])
@@ -380,7 +382,10 @@ def test_a_successful_probe_still_recommends_evolve(tmp_path, endpoint):
     assert payload["ok"] is True
     assert payload["ready"] is True
     assert payload["probe"]["ok"] is True
-    assert "next" not in payload
+    # #1217: after a successful probe, `next` is the capped evolve only.
+    assert payload["next"].startswith(f"agentdescent evolve {spec}")
+    assert "--max-calls" in payload["next"]
+    assert "--probe" not in payload["next"]
 
 
 def test_without_the_flag_json_has_no_ready_field(tmp_path, endpoint):
@@ -392,4 +397,7 @@ def test_without_the_flag_json_has_no_ready_field(tmp_path, endpoint):
     payload = json.loads(out)
     assert "probe" not in payload
     assert "ready" not in payload
-    assert "next" not in payload
+    # #1217: plain `plan --json` now carries `next` (probe, then the cap);
+    # `ready` stays probe-only.
+    assert "--probe" in payload["next"]
+    assert "--max-calls" in payload["next"]

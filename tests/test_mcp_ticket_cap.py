@@ -12,6 +12,7 @@ of silently starting an uncapped one.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -39,6 +40,17 @@ def _wait(rd, timeout=120):
     raise AssertionError(rd.status())
 
 
+def _wait_more(rd, before_calls, timeout=120):
+    """Wait for a resumed run to stop again, past the calls it already had."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = rd.status()
+        if st.state in ("done", "failed", "cancelled") and st.calls > before_calls:
+            return st
+        time.sleep(0.2)
+    return rd.status()
+
+
 def _start_in(tmp_path, tools, name, **kwargs):
     sub = tmp_path / name
     sub.mkdir()
@@ -62,7 +74,13 @@ def test_second_run_is_clamped_to_what_the_ticket_has_left(store, tmp_path, monk
     assert second["call_limit"]["source"] == runstore.OPERATOR_MAX_CALLS_ENV
     assert second["call_limit"]["max_calls_requested"] == 5
     assert second["call_limit"]["ticket"] == {"ceiling": 2, "spent": 1, "remaining": 1}
-    _wait(runstore.get(second["run_id"], store=store))
+    st2 = _wait(runstore.get(second["run_id"], store=store))
+    # The reply is not the enforcement: the child has to be launched with the
+    # same number, or the run-level clamp hands it the whole ceiling again and
+    # this Ticket bills 3 against a ceiling of 2.
+    assert st2.state == "done", st2
+    assert st2.calls <= 1, st2
+    assert st.calls + st2.calls <= 2, (st.calls, st2.calls)
 
 
 def test_a_spent_ticket_refuses_another_start(store, tmp_path, monkeypatch):
@@ -81,6 +99,68 @@ def test_a_spent_ticket_refuses_another_start(store, tmp_path, monkeypatch):
     assert "1" in refused["error"], refused["error"]
     # Nothing was created: a spent Ticket is refused before the run exists.
     assert len(runstore.list_runs(store=store)) == 1
+
+
+def test_a_second_start_with_no_cap_spends_only_the_remainder(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=1)
+    st1 = _wait(runstore.get(first["run_id"], store=store))
+    assert st1.calls == 1, st1
+
+    # A host that names no cap of its own is the wider hole: the run-level
+    # clamp turns "no number" into the full ceiling, so the remainder has to be
+    # the number that crosses the detach boundary.
+    second = _start_in(tmp_path, tools, "t1")
+    assert second["call_limit"]["max_calls"] == 2, second["call_limit"]
+    assert second["call_limit"]["source"] == runstore.OPERATOR_MAX_CALLS_ENV
+    assert "max_calls_requested" not in second["call_limit"], second["call_limit"]
+    st2 = _wait(runstore.get(second["run_id"], store=store))
+    # The child, not the reply: it has to stop at the 2 calls that are left. At
+    # `115edc74` it runs the full ceiling of 3 and this Ticket bills 4 of 3,
+    # which is the overrun this test exists to pin.
+    assert st2.calls == 2, st2
+    assert st2.stop_reason == "budget", st2
+    assert st1.calls + st2.calls == 3, (st1.calls, st2.calls)
+
+
+def test_a_started_run_reserves_its_cap_before_it_spends(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=3)
+    # A run that has been launched but has not written status yet has charged
+    # nothing, so two overlapping starts would both take the remainder and the
+    # Ticket would spend twice the ceiling. The cap it was launched with is the
+    # reservation until the run reports.
+    assert tools._ticket_spent() >= 3, tools._ticket_spent()
+
+    sub = tmp_path / "t1"
+    sub.mkdir()
+    second = tools.start(_dir_spec(str(sub)).to_dict())
+    assert second["ok"] is False, second
+    assert "AGENTDESCENT_MAX_CALLS" in second["error"], second["error"]
+    st1 = _wait(runstore.get(first["run_id"], store=store))
+    assert st1.calls <= 3, st1
+    # Refused before a run existed: one run, not two.
+    assert len(runstore.list_runs(store=store)) == 1
+
+
+def test_a_finished_run_gives_back_what_it_did_not_spend(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "20")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=20)
+    # The reservation is the launched cap; this spec finishes well below it.
+    assert tools._ticket_spent() == 20, tools._ticket_spent()
+    st1 = _wait(runstore.get(first["run_id"], store=store))
+    assert st1.calls < 20, st1
+    # A finished run is charged what it actually used, not what it reserved:
+    # otherwise an under-spending run would burn the rest of the Ticket.
+    assert tools._ticket_spent() == st1.calls, (tools._ticket_spent(), st1.calls)
+
+    second = _start_in(tmp_path, tools, "t1")
+    assert second["call_limit"]["max_calls"] == 20 - st1.calls, second["call_limit"]
+    st2 = _wait(runstore.get(second["run_id"], store=store))
+    assert st1.calls + st2.calls <= 20, (st1.calls, st2.calls)
 
 
 def test_plan_reports_what_the_ticket_has_left(store, tmp_path, monkeypatch):
@@ -113,3 +193,66 @@ def test_a_callers_own_zero_cap_is_not_the_spent_ticket_refusal(store, tmp_path,
     # ticket arithmetic or the refusal.
     assert plan["call_limit"]["max_calls"] == 0, plan["call_limit"]
     assert "ticket" not in plan["call_limit"], plan["call_limit"]
+
+
+def test_two_starts_at_once_cannot_both_take_the_remainder(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    subs = []
+    for name in ("t0", "t1"):
+        sub = tmp_path / name
+        sub.mkdir()
+        subs.append(sub)
+    out = []
+
+    def go(sub):
+        out.append(tools.start(_dir_spec(str(sub)).to_dict()))
+
+    # `start` is dispatched off the event loop (`anyio.to_thread.run_sync`), so
+    # two hosts calling it in the same tick is a real interleaving, not a
+    # hypothetical: without one locked gate both read `spent: 0`, both take the
+    # ceiling, and the Ticket bills twice it (#1082).
+    threads = [threading.Thread(target=go, args=(sub,)) for sub in subs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok = [r for r in out if r["ok"]]
+    refused = [r for r in out if not r["ok"]]
+    assert len(ok) == 1, out
+    assert refused and "AGENTDESCENT_MAX_CALLS" in refused[0]["error"], refused
+    assert sum(r["call_limit"]["max_calls"] for r in ok) == 3, out
+    total = sum(_wait(runstore.get(r["run_id"], store=store)).calls for r in ok)
+    # One of the two took the whole ceiling and the other was refused: at
+    # `115edc74` both are admitted and the Ticket bills 6 of 3.
+    assert total == 3, total
+
+
+def test_a_resumed_run_is_charged_to_the_ticket(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=1)
+    st_a = _wait(runstore.get(first["run_id"], store=store))
+    second = _start_in(tmp_path, tools, "t1", max_calls=1)
+    st_b = _wait(runstore.get(second["run_id"], store=store))
+    assert st_a.calls + st_b.calls == 2, (st_a.calls, st_b.calls)
+
+    # `resume` is the second entry point to the same ceiling: relaunching a run
+    # is not a new Ticket, so it is clamped to the one call that is left and
+    # charged for what it spends. Left ungated it got the full ceiling and was
+    # never counted -- one `resume` and this Ticket billed 4 of 3 (#1082).
+    resumed = tools.resume(first["run_id"])
+    # The child's cap counts the ledger it resumes (1 call already made), so the
+    # number it is relaunched with is 1 + 1 -- and the reply quotes the same
+    # number, not the remainder it would then stop at immediately.
+    assert resumed["call_limit"]["max_calls"] == 2, resumed
+    assert resumed["call_limit"]["source"] == runstore.OPERATOR_MAX_CALLS_ENV
+    assert resumed["call_limit"]["ticket"] == {"ceiling": 3, "spent": 2,
+                                               "remaining": 1}
+    st_a2 = _wait_more(runstore.get(first["run_id"], store=store), st_a.calls)
+    assert st_a2.state == "done", st_a2
+    # The resumed child stops at the one call that is left. At `115edc74` it
+    # relaunches with the full ceiling of 3, so this run reaches 3 and the
+    # Ticket bills 4 of 3.
+    assert st_a2.calls - st_a.calls == 1, (st_a.calls, st_a2.calls)
+    assert st_a2.calls + st_b.calls == 3, (st_a2.calls, st_b.calls)

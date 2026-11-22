@@ -816,7 +816,11 @@ def cancel(run_id: str, *, store: Optional[str] = None, grace: float = 5.0) -> R
     st = rd.status()
     if st.pid is None or not st.alive():
         if st.state == "running":
-            st = rd.update_status(state="cancelled", finished=time.time())
+            # Clear `pending_calls` with the state: a cancelled run that kept a
+            # call in flight would hold a phantom charge against its Ticket
+            # forever (#1082).
+            st = rd.update_status(state="cancelled", finished=time.time(),
+                                  pending_calls=0)
         return st
     pgid = None
     try:
@@ -830,7 +834,7 @@ def cancel(run_id: str, *, store: Optional[str] = None, grace: float = 5.0) -> R
     if st.alive():
         _signal(st.pid, pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
     return rd.update_status(state="cancelled", finished=time.time(),
-                            stop_reason="cancelled")
+                            stop_reason="cancelled", pending_calls=0)
 
 
 def _signal(pid: int, pgid: Optional[int], sig: int) -> None:

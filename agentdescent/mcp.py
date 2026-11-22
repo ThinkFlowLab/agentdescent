@@ -33,6 +33,7 @@ import inspect
 import json
 import os
 import secrets
+import threading
 from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, runstore
@@ -525,6 +526,17 @@ class Tools:
         #: operator ceiling is spent across them instead of re-granted per run
         #: (#1082 row 2). Empty on a fresh server.
         self._ticket_runs: List[str] = []
+        #: Floor of calls each of those runs will have spent before it reports:
+        #: for a fresh run the cap it was launched with, for a resumed one what
+        #: its ledger already holds plus that cap. Without it a run that has
+        #: written no status yet (`calls` and `pending_calls` still 0) lets a
+        #: second, overlapping `start` take the same remainder (#1082).
+        self._ticket_reserved: Dict[str, int] = {}
+        #: One lock around "read the spend -> reserve -> launch -> register":
+        #: `start` and `resume` run in worker threads
+        #: (`anyio.to_thread.run_sync`), so two of them in the same tick would
+        #: otherwise read the same remainder and both take it (#1082).
+        self._ticket_lock = threading.Lock()
 
     def host_model_env(self) -> Dict[str, str]:
         """What a launched run needs to reach the host's model, by either route.
@@ -549,18 +561,108 @@ class Tools:
         operator ceiling is that session's budget: a second ``start`` hears the
         remainder, not the ceiling again. ``pending_calls`` counts as spent
         while a run is still in flight -- work already started is not budget
-        the next run may hand out twice. A run whose status cannot be read
-        counts as 0, so a store that lost one run does not make the Ticket
-        unstartable forever.
+        the next run may hand out twice. ``self._ticket_reserved`` goes
+        further: a run that was launched but has written no status yet holds
+        the cap it was started with, so two overlapping starts cannot both take
+        the same remainder. A finished run is charged what it used, so an
+        under-spending run gives the rest of the Ticket back. A run whose
+        status cannot be read counts as 0, so a store that lost one run does
+        not make the Ticket unstartable forever.
         """
         spent = 0
         for run_id in self._ticket_runs:
+            reserved = max(0, int(self._ticket_reserved.get(run_id, 0)))
             try:
                 st = runstore.get(run_id, store=self.store).status()
             except (runstore.RunStoreError, ValueError, OSError):
                 continue
-            spent += int(st.calls) + int(st.pending_calls)
+            charged = int(st.calls) + int(st.pending_calls)
+            if st.state in ("done", "failed", "cancelled"):
+                spent += charged
+            else:
+                # Launched, not finished: its cap is already committed.
+                spent += max(charged, reserved)
         return spent
+
+    def _ticket_refusal(self, ticket: Dict[str, Any],
+                        limit: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The reply for a spent Ticket, shared by ``start`` and ``resume``.
+
+        One sentence for both entry points: a resumed run would otherwise take
+        the full ceiling again, which is the same bypass a second ``start`` was
+        (#1082).
+        """
+        return {"ok": False, "error": (
+            f"{runstore.OPERATOR_MAX_CALLS_ENV}={ticket['ceiling']} is "
+            f"already spent by this worker's Ticket ({ticket['spent']} "
+            f"call{'s' if ticket['spent'] != 1 else ''} over "
+            f"{len(self._ticket_runs)} run"
+            f"{'s' if len(self._ticket_runs) != 1 else ''}); no run may "
+            "start. Start the next Ticket in a new server session, or "
+            "raise the ceiling."),
+            "call_limit": limit}
+
+    def _ticket_open(self, max_calls: Optional[int], max_usd: Optional[float],
+                     usd_per_call: Optional[float], *,
+                     prior_calls: int = 0) -> Tuple[
+                         Optional[Dict[str, Any]], Optional[int], Optional[Dict[str, Any]]]:
+        """``(limit, applied, refusal)`` for one ``start`` / ``resume`` (#1082).
+
+        Caller holds :attr:`_ticket_lock`: the spend read and the reservation
+        that follows it have to be one step, or two runs in the same tick both
+        take the same remainder. ``applied`` is the enforced number the child is
+        started with -- ``min(caller, remaining)``, ``remaining`` when the caller
+        named none, the caller's own number with no ceiling, ``None`` when
+        neither -- and the refusal is the spent-Ticket reply.
+
+        ``prior_calls`` is the ledger a resumed run already carries. The child's
+        cap counts that ledger (``execute`` seeds ``Usage`` from it), so the
+        number it is relaunched with is ``prior + remaining``: passing the
+        remainder alone would stop it at once having "reached" a cap it already
+        went past. The reply says the same number it gave the child.
+        """
+        limit = _call_limit_payload(max_calls, max_usd, usd_per_call,
+                                    spent=self._ticket_spent())
+        ticket = (limit or {}).get("ticket") or {}
+        if ticket.get("remaining") == 0:
+            return limit, None, self._ticket_refusal(ticket, limit)
+        applied = None if limit is None else limit.get("max_calls")
+        if applied is not None and prior_calls > 0:
+            applied += max(0, int(prior_calls))
+            limit = {**(limit or {}), "max_calls": applied}
+        return limit, applied, None
+
+    def _ticket_reserve(self, run_id: str, applied: Optional[int],
+                        prior_calls: int = 0) -> None:
+        """Register a run and the calls it holds until it reports (#1082).
+
+        ``prior_calls`` is what the ledger already holds: a resumed run is
+        charged for the calls it spent before this relaunch plus the cap it is
+        relaunched with. Registering a run this server already knows must not
+        list it twice, or the Ticket would charge it twice.
+        """
+        held = max(0, int(applied or 0)) + max(0, int(prior_calls))
+        if run_id not in self._ticket_runs:
+            self._ticket_runs.append(run_id)
+        self._ticket_reserved[run_id] = max(self._ticket_reserved.get(run_id, 0), held)
+
+    def _ticket_env(self, limit: Optional[Dict[str, Any]],
+                    max_calls: Optional[int]) -> Dict[str, str]:
+        """The child environment, carrying what the caller asked for (#1184).
+
+        Because ``start`` launches the run with the enforced number rather than
+        the caller's, ``launch`` cannot recover the request and would stop
+        labelling the run ``AGENTDESCENT_MAX_CALLS`` when the ceiling bound it.
+        The reply still says so, so the run's own ``stop_detail`` has to as
+        well: write the request into the variable that label is read from,
+        exactly as ``launch`` does for a per-run clamp ("" = none named).
+        """
+        env = self.host_model_env()
+        if limit is not None and limit.get("source") == runstore.OPERATOR_MAX_CALLS_ENV:
+            env = {**env, runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV:
+                   "" if max_calls is None else str(int(max_calls))}
+        return env
+
 
     # -- read-only -------------------------------------------------------------
 
@@ -812,30 +914,10 @@ class Tools:
             # Before create: same rule as CLI -- budget without price must not
             # return ok/started and then fail only in log.txt (#342).
             runstore.require_budget_pair(budget_usd, usd_per_call)
-            # A bad cap is a refusal too, not a run whose log.txt explains it
-            # later; same sentence the CLI prints (#1184).
-            limit = _call_limit_payload(max_calls, max_usd, usd_per_call,
-                                        spent=self._ticket_spent())
         except SpecError as e:
             return {"ok": False, "error": str(e)}
         except runstore.RunStoreError as e:
             return {"ok": False, "error": str(e)}
-        ticket = (limit or {}).get("ticket") or {}
-        if ticket.get("remaining") == 0:
-            # The ceiling is spent: refuse before a run exists, with the
-            # arithmetic in the sentence, instead of starting one that cannot
-            # charge a single call or, worse, one that treats 0 as "no cap".
-            # A caller's own `max_calls=0` is not this case and keeps its
-            # existing path.
-            return {"ok": False, "error": (
-                f"{runstore.OPERATOR_MAX_CALLS_ENV}={ticket['ceiling']} is "
-                f"already spent by this worker's Ticket ({ticket['spent']} "
-                f"call{'s' if ticket['spent'] != 1 else ''} over "
-                f"{len(self._ticket_runs)} run"
-                f"{'s' if len(self._ticket_runs) != 1 else ''}); no run may "
-                "start. Start the next Ticket in a new server session, or "
-                "raise the ceiling."),
-                    "call_limit": limit}
         if os.environ.get(NESTED_ENV):
             # This server is running inside a worker of another run (the plugin
             # that hosts it is being evolved). The transcript should still show
@@ -858,26 +940,38 @@ class Tools:
         # plan still hear that budget_usd only binds between rounds.
         budget_warn = budget_round_overshoot_warning(
             estimate(comp, usd_per_call=usd_per_call), budget_usd, usd_per_call)
-        rd = runstore.create(es.to_dict(), store=self.store)
-        # Recorded before the child is up, so the reply below and the first
-        # `status` poll carry what `plan` said -- a too-small held-out set among
-        # it -- instead of an empty list until the child has composed (#414).
-        rd.update_status(notes=comp.notes)
-        try:
-            # The run is a detached process, so a `host_model` reference in the
-            # spec resolves there, not here -- it needs the bridge's address in
-            # its environment or it has no session to borrow.
-            # The caller's own numbers go in, not `limit`'s clamped ones:
-            # `launch` applies the same min and is what records what was asked
-            # for across the detach boundary (#1184).
-            st = runstore.launch(rd, budget_usd=budget_usd, usd_per_call=usd_per_call,
-                                 max_calls=max_calls, max_usd=max_usd,
-                                 env=self.host_model_env())
-        except runstore.RunStoreError as e:
-            return {"ok": False, "error": str(e), "run_id": rd.run_id, "dir": rd.path}
-        # The Ticket's spend is read from the store, so this only has to name
-        # the runs it may count; a resumed or CLI-started run is not one.
-        self._ticket_runs.append(rd.run_id)
+        # The gate is one step with the launch it authorises (#1082): `start`
+        # runs in a worker thread, so two calls in the same tick would otherwise
+        # read the same remainder, both take it, and bill the ceiling twice.
+        # Under the lock: read the spend, reserve the cap, hand the child the
+        # reserved number (not the caller's, which `launch` clamps only against
+        # the full ceiling), then register the run so it holds that number
+        # until it reports. The number is `limit`'s enforced one, so the reply
+        # and the child cannot disagree; a caller's own `max_usd` stays per run,
+        # because the operator ceiling is the only per-Ticket budget.
+        with self._ticket_lock:
+            limit, applied, refused = self._ticket_open(max_calls, max_usd,
+                                                        usd_per_call)
+            if refused is not None:
+                return refused
+            rd = runstore.create(es.to_dict(), store=self.store)
+            # Recorded before the child is up, so the reply below and the first
+            # `status` poll carry what `plan` said -- a too-small held-out set
+            # among it -- instead of an empty list until the child has composed
+            # (#414).
+            rd.update_status(notes=comp.notes)
+            try:
+                # The run is a detached process, so a `host_model` reference in
+                # the spec resolves there, not here -- it needs the bridge's
+                # address in its environment or it has no session to borrow.
+                st = runstore.launch(rd, budget_usd=budget_usd,
+                                     usd_per_call=usd_per_call,
+                                     max_calls=applied, max_usd=max_usd,
+                                     env=self._ticket_env(limit, max_calls))
+            except runstore.RunStoreError as e:
+                return {"ok": False, "error": str(e), "run_id": rd.run_id,
+                        "dir": rd.path}
+            self._ticket_reserve(rd.run_id, applied)
         out = {"ok": True, "run_id": rd.run_id, "state": st.state, "pid": st.pid,
                 "dir": rd.path, "notes": rd.status().notes,
                 # Whether a `host_model` reference in this spec can work. A run
@@ -943,9 +1037,32 @@ class Tools:
             if not force:
                 require_resume_not_quota_exhausted(run_id, store=self.store)
             require_resume_host_on_path(run_id, store=self.store)
-            return runstore.resume(run_id, store=self.store, budget_usd=budget_usd,
-                                   usd_per_call=usd_per_call,
-                                   env=self.host_model_env()).to_dict()
+            # One gate for both entry points (#1082): a resumed run belongs to
+            # this Ticket too, so it is clamped to what is left and charged for
+            # what it spends. It already carries a ledger, so the reservation is
+            # what that ledger holds plus the cap it is relaunched with -- the
+            # number the child gets, for the same reason `start` hands over the
+            # enforced one: `launch` clamps only against the full ceiling.
+            with self._ticket_lock:
+                before = runstore.get(run_id, store=self.store).status()
+                prior = int(before.calls) + int(before.pending_calls)
+                limit, applied, refused = self._ticket_open(None, None,
+                                                            usd_per_call,
+                                                            prior_calls=prior)
+                if refused is not None:
+                    return refused
+                st = runstore.resume(
+                    run_id, store=self.store, budget_usd=budget_usd,
+                    usd_per_call=usd_per_call, max_calls=applied,
+                    env=self._ticket_env(limit, None))
+                # `applied` already carries the ledger when it is bounded; with
+                # no ceiling the ledger is all this run holds.
+                self._ticket_reserve(run_id, applied,
+                                     0 if applied is not None else prior)
+            out = st.to_dict()
+            if limit is not None:
+                out["call_limit"] = limit
+            return out
         except (runstore.RunStoreError, SpecError) as e:
             return {"error": str(e)}
 

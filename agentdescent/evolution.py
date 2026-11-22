@@ -1602,6 +1602,8 @@ def _refuse_blocked_parent(dest: str) -> None:
     and every path in ``written`` (tree children included, #1221) so every
     surface that plans (``show`` text, ``apply`` text, ``--from``,
     ``--install-to`` and the tree writer) refuses before anything is created.
+    The inverse -- a directory already sitting at a written leaf -- is
+    ``_refuse_blocked_leaf`` (#1223).
     """
     parent = os.path.dirname(dest.rstrip(os.sep)) or os.curdir
     cur = parent
@@ -1618,20 +1620,47 @@ def _refuse_blocked_parent(dest: str) -> None:
             f"cannot write {dest}: {cur!r} is a file, not a directory")
 
 
+def _refuse_blocked_leaf(path: str) -> None:
+    """Refuse a write whose leaf already exists as a directory (#1223).
+
+    ``_refuse_blocked_parent`` catches a regular file sitting on an intermediate
+    path. The inverse is a directory sitting where the artifact wants a file:
+    ``dest`` is valid, ``dest/alpha`` is a directory, and the tree writes
+    ``alpha``. ``show --diff`` and ``apply --dry-run`` then advertised the leaf
+    as ``written`` while the real ``apply`` died at ``open`` with
+    ``cannot write <dest>: Is a directory`` -- the tree root, not the blocking
+    leaf. ``apply --from`` was worse: ``shutil.copy2`` nested the bytes at
+    ``dest/alpha/alpha`` and reported success.
+
+    Called from ``_check_apply_paths`` on every path in ``written`` (not on
+    ``dest`` itself: a tree root *is* a directory). A symlink at the leaf is
+    left to ``_refuse_dest_link`` / ``dest_problem``; this helper names only a
+    real directory.
+    """
+    if os.path.lexists(path) and not os.path.islink(path) and os.path.isdir(path):
+        from . import runstore  # runstore imports this module at import time
+
+        raise runstore.RunStoreError(
+            f"cannot write {path}: {path!r} is a directory, not a file")
+
+
 def _check_apply_paths(dest: str, written: Sequence[str], backup: Optional[str],
                        check_write: Optional[Callable[[str, str], Any]]) -> None:
     """Check the selected write set before any artifact or backup is changed.
 
-    The blocked-parent refusal runs before the operator allowlist guard: it is a
-    property of the filesystem, not of who is writing, so ``show`` and
-    ``--dry-run`` see it even when ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset.
-    It covers ``dest`` and every path in ``written`` (tree children included):
-    a regular file sitting at an intermediate path blocks a leaf the same way
-    a file sitting at the destination's parent does (#1221, #1208).
+    The blocked-parent and blocked-leaf refusals run before the operator
+    allowlist guard: they are a property of the filesystem, not of who is
+    writing, so ``show`` and ``--dry-run`` see them even when
+    ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset. The helper covers ``dest``
+    and every path in ``written`` (tree children included): a regular file
+    sitting at an intermediate path blocks a leaf the same way a file sitting
+    at the destination's parent does (#1221, #1208), and a directory already
+    sitting at a written leaf is refused the other way around (#1223).
     """
     _refuse_blocked_parent(dest)
     for path in written:
         _refuse_blocked_parent(path)
+        _refuse_blocked_leaf(path)
     if check_write is not None:
         check_write(dest, "to")
         for path in written:

@@ -2434,16 +2434,22 @@ def _declared_cap(spec: Any) -> Tuple[bool, Optional[int]]:
     (``runstore.py``: "an explicit run option is the sharper instruction"), so
     naming the structural bound there silently raised a cap the user had
     written down. ``(True, n)`` is ``evolve.max_calls``; ``(True, None)`` is a
-    priced dollar cap the advice cannot express in calls; ``(False, None)``
-    means the spec declares neither and the bound is still the advice.
+    priced dollar cap the advice cannot express in calls -- and it wins when a
+    spec declares both, because an explicit flag replaces the whole
+    ``CallLimit``. ``(False, None)`` means the spec declares neither and the
+    bound is still the advice.
     """
     evolve = getattr(spec, "evolve", None)
     knobs = evolve if isinstance(evolve, dict) else {}
+    # The dollar pair is checked first: an explicit `--max-calls` replaces the
+    # spec's whole `CallLimit` (`overrides["call_limit"]`, `runstore.py`), so
+    # advising one for a spec that also declares `max_usd` + `usd_per_call`
+    # would drop that dollar cap. The spec governs; no flag is advised.
+    if knobs.get("max_usd") is not None and knobs.get("usd_per_call") is not None:
+        return True, None
     calls = knobs.get("max_calls")
     if isinstance(calls, (int, float)) and not isinstance(calls, bool):
         return True, int(calls)
-    if knobs.get("max_usd") is not None and knobs.get("usd_per_call") is not None:
-        return True, None
     return False, None
 
 

@@ -86,6 +86,20 @@ def test_a_declared_dollar_cap_suppresses_the_call_cap(tmp_path):
     assert doc["next"] == text_next
 
 
+
+def test_a_spec_declaring_both_caps_keeps_the_dollar_cap(tmp_path):
+    # An explicit `--max-calls` builds its own CallLimit and the CLI's
+    # `overrides["call_limit"]` replaces the spec's (`runstore.py:1017-1021`),
+    # so advising one here would drop the declared *dollar* cap. When a spec
+    # names both, the dollar pair governs and the advice adds no flag.
+    path, text_next, doc = _plan(
+        tmp_path, max_calls=5, max_usd=0.05, usd_per_call=0.01)
+    assert "--max-calls" not in text_next, text_next
+    assert text_next == (
+        f"agentdescent plan {path} --probe, then "
+        f"agentdescent evolve {path}"), text_next
+    assert doc["next"] == text_next
+
 def test_without_a_declared_cap_the_bound_is_still_named(tmp_path):
     # The #1201 / #1217 contract, unchanged.
     path, text_next, doc = _plan(tmp_path)

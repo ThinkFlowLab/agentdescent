@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import threading
 import time
 
@@ -319,6 +320,17 @@ def test_an_unreadable_run_refuses_instead_of_granting_the_rest(store, tmp_path,
     assert first["run_id"] in plan["error"], plan["error"]
     assert "cannot be accounted" in plan["error"], plan["error"]
 
+    # Deleting the run does not free the budget: the Ticket still cannot prove
+    # what was spent, and the refusal has to say so instead of suggesting it.
+    shutil.rmtree(runstore.get(first["run_id"], store=store).path)
+    gone_sub = tmp_path / "t3"
+    gone_sub.mkdir()
+    gone = tools.start(_dir_spec(str(gone_sub)).to_dict())
+    assert gone["ok"] is False, gone
+    assert "Restore a valid status.json" in gone["error"], gone["error"]
+    assert "start a new server session" in gone["error"], gone["error"]
+    assert "remove that run directory" not in gone["error"], gone["error"]
+
 
 def _external_run(tmp_path, store, name, max_calls):
     """A run in the store that this server did not start: another process did.
@@ -396,3 +408,34 @@ def test_a_resumed_external_run_with_no_room_is_refused(store, tmp_path, monkeyp
     assert "pid" not in refused, refused
     after = runstore.get(run_id, store=store).status()
     assert (after.state, after.calls) == ("done", 3), after
+
+
+def test_resume_refuses_when_the_run_status_cannot_be_read(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=1)
+    st = _wait(runstore.get(first["run_id"], store=store))
+    assert st.calls == 1, st
+
+    rd = runstore.get(first["run_id"], store=store)
+    good = open(rd.status_path, encoding="utf-8").read()
+    with open(rd.status_path, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    # `resume`'s pre-gates read the run's status before the Ticket gate does: a
+    # corrupt file must come back as a refusal naming the run, not as the
+    # `JSONDecodeError` the file itself raises.
+    refused = tools.resume(first["run_id"])
+    assert refused.get("ok") is False, refused
+    assert first["run_id"] in refused["error"], refused["error"]
+    assert "cannot be accounted" in refused["error"], refused["error"]
+    # Not relaunched: the corrupt status was not rewritten into a `running` one.
+    assert open(rd.status_path, encoding="utf-8").read() == "{not json"
+
+    # Restoring the file is the way back, and `resume` works again.
+    with open(rd.status_path, "w", encoding="utf-8") as fh:
+        fh.write(good)
+    resumed = tools.resume(first["run_id"])
+    assert resumed.get("ok") is not False, resumed
+    after = _wait(runstore.get(first["run_id"], store=store))
+    assert after.state == "done", after
+    assert after.calls == 3, after

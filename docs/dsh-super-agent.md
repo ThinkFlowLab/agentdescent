@@ -125,6 +125,11 @@ your tree, under the operator's write allowlist).
   before plus 1 after counts as 3 spent, and the next `start` is refused -- and
   its child is still clamped by the absolute ceiling, never by the remainder
   alone.
+  A run whose status cannot be read is fail-closed: while its `status.json` is
+  missing or corrupt, `start`, `plan` and `resume` refuse rather than guess what
+  the Ticket spent, and the way back is to restore that file or start a new
+  session -- deleting the run directory does not help, because the budget it
+  freed cannot be verified.
   `AGENTDESCENT_MAX_CALLS` is the only operator ceiling and it is per-Ticket; a
   caller's `max_calls` and `max_usd` stay per-run flags, and only `max_calls` is
   clamped by what the Ticket has left (#1082).

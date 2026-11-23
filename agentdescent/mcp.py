@@ -485,6 +485,19 @@ def _call_limit_payload(max_calls: Optional[int], max_usd: Optional[float],
     return payload
 
 
+def _unreadable_run_error(run_id: str, e: BaseException) -> str:
+    """The sentence for a run whose status cannot be read (#1082).
+
+    Fail-closed: a remainder computed over a run nobody can read may already be
+    spent. Restoring the status is the way back -- deleting the directory is
+    not, because the budget it freed cannot be verified.
+    """
+    return (f"run {run_id} cannot be accounted: its status cannot be read "
+            f"({e}), so this Ticket's spend is unknown; no run may start or "
+            "resume until the run store is readable again. Restore a valid "
+            "status.json, or start a new server session.")
+
+
 class Tools:
     """The tool bodies, SDK-free. One instance per server, bound to a run store."""
 
@@ -578,10 +591,7 @@ class Tools:
                 st = runstore.get(run_id, store=self.store).status()
             except (runstore.RunStoreError, ValueError, OSError) as e:
                 raise runstore.RunStoreError(
-                    f"run {run_id} cannot be accounted: its status cannot be "
-                    f"read ({e}), so what this Ticket has spent is unknown; "
-                    "no run may start until the run store is readable again. "
-                    "Fix or remove that run directory, then retry.") from e
+                    _unreadable_run_error(run_id, e)) from e
             charged = int(st.calls) + int(st.pending_calls)
             if st.state in ("done", "failed", "cancelled"):
                 spent += charged
@@ -1070,10 +1080,16 @@ class Tools:
             # a run that died on a spent quota is not relaunched into the same
             # 429 (#926, `force` opts out), and an absent plugin host must not
             # relaunch and report running (#370).
-            require_resume_not_solved(run_id, store=self.store)
-            if not force:
-                require_resume_not_quota_exhausted(run_id, store=self.store)
-            require_resume_host_on_path(run_id, store=self.store)
+            try:
+                require_resume_not_solved(run_id, store=self.store)
+                if not force:
+                    require_resume_not_quota_exhausted(run_id, store=self.store)
+                require_resume_host_on_path(run_id, store=self.store)
+            except (ValueError, OSError) as e:
+                # These gates read the run's status too. A corrupt one is a
+                # refusal with a reason, not a traceback out of `resume`
+                # (#1082); a missing run stays a RunStoreError as before.
+                return {"ok": False, "error": _unreadable_run_error(run_id, e)}
             # One gate for both entry points (#1082): a resumed run belongs to
             # this Ticket too, so it is clamped to what is left and charged for
             # what it spends. It already carries a ledger, so the reservation is
@@ -1081,7 +1097,11 @@ class Tools:
             # number the child gets, for the same reason `start` hands over the
             # enforced one: `launch` clamps only against the full ceiling.
             with self._ticket_lock:
-                before = runstore.get(run_id, store=self.store).status()
+                try:
+                    before = runstore.get(run_id, store=self.store).status()
+                except (ValueError, OSError) as e:
+                    return {"ok": False,
+                            "error": _unreadable_run_error(run_id, e)}
                 prior = int(before.calls) + int(before.pending_calls)
                 limit, applied, refused = self._ticket_open(
                     None, None, usd_per_call, prior_calls=prior,

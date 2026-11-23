@@ -149,8 +149,13 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "allowed root; `agentdescent.<name>.spec.json`) unless `out` names "
         "another path under one of those roots -- never inside "
         "a directory target -- and returns the plan estimate plus `spec`, the dict "
-        "to pass to start. It "
-        "starts nothing: show the user the estimate and get a yes before start. "
+        "to pass to start after a probed plan and a yes. It starts nothing and "
+        "does not probe or set a per-call cap: after it returns, call "
+        "`plan(spec, probe=true)` (or `plan --probe`); if the probe refuses, "
+        "give the user `next` and do not start (`ok: false`, `ready: false`). "
+        "Show the estimate, get a yes, then `start` with `max_calls` (and "
+        "`max_usd` beside `usd_per_call` when a price is known), starting at "
+        "the plan's `agent_calls_upper_bound` (or smaller for a trial). "
         "`model`/`base_url` come from the user, never guess them."),
     "plan": (
         "Validate an EvolveSpec and estimate its cost WITHOUT running anything. Resolves "

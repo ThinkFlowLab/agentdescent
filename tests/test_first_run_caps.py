@@ -22,7 +22,7 @@ from contextlib import redirect_stdout
 import pytest
 
 from agentdescent import cli
-from agentdescent.integrations import skill_text
+from agentdescent.integrations import ALGORITHMS_COMMAND, EVOLVE_COMMAND, skill_text
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALGORITHMS = ("gepa", "archive_selection")
@@ -55,6 +55,21 @@ def test_shared_host_skill_names_the_per_call_cap():
     assert "--max-calls" in text
     assert "--max-usd" in text
     assert "--probe" in text            # the preflight stays the first step
+
+
+def test_slash_commands_name_the_probe_and_the_cap():
+    """#1228: /evolve and /algorithms run must name the same first-run
+    preflight and per-call cap as SKILL.md / the CLI next: line."""
+    for text in (EVOLVE_COMMAND, ALGORITHMS_COMMAND):
+        assert "probe" in text
+        assert "max_calls" in text or "--max-calls" in text
+    run_branch = ALGORITHMS_COMMAND.split("**`run", 1)[1]
+    assert "probe" in run_branch
+    assert "--max-calls" in run_branch
+    assert "max_calls" in run_branch
+    # The run branch must not still tell the host to start from
+    # algorithm_spec / a bare algorithms run with no cap.
+    assert "then `evolve` after yes" not in run_branch
 
 
 def test_plugin_quickstart_habits_name_the_per_call_cap():

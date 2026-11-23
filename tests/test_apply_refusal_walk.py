@@ -112,7 +112,7 @@ def test_a_symlinked_leaf_is_named_on_every_surface(tmp_path, capsys):
     leaf = dest / "alpha"
     os.symlink(str(victim), str(leaf))
 
-    expected = f"cannot write {leaf}: {str(leaf)!r} is a symlink"
+    expected = f"cannot write {leaf}: 'alpha' is a symlink"
     _same_refusal_on_every_surface(
         tmp_path, capsys, dest, {"alpha": "evolved\n"}, expected)
     assert os.path.islink(str(leaf))

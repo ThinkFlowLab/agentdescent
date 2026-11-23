@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from agentdescent import cli
+from agentdescent import cli, runstore
 from agentdescent.evolution import EvolutionResult
 from agentdescent.filetree import canonical, load_tree
 
@@ -68,6 +68,24 @@ def test_extra_files_alone_do_not_make_an_apply_worth_doing(tmp_path):
     # ...but pruning them is a change
     plan = _result({"rules.md": "x\n"}).write_to(dest, prune=True)
     assert plan["noop"] is False and plan["deleted"] == ["notes.md"] and plan["backup"]
+
+
+def test_prune_refuses_to_delete_a_symlink_it_did_not_evolve(tmp_path):
+    # `prune=True` deletes what the run did not evolve, but a link is refused
+    # before anything is removed (#1230): deleting it would have been a silent
+    # success over a leaf the rest of the walk refuses to write.
+    outside = tmp_path / "outside.md"
+    outside.write_text("keep me\n", encoding="utf-8")
+    dest = _tree(tmp_path, {"rules.md": "x\n"})
+    stray = os.path.join(dest, "stray")
+    os.symlink(str(outside), stray)
+
+    with pytest.raises(runstore.RunStoreError) as exc:
+        _result({"rules.md": "x\n"}).write_to(dest, prune=True)
+    assert str(exc.value) == f"cannot write {stray}: 'stray' is a symlink"
+    assert os.path.islink(stray) and os.readlink(stray) == str(outside)
+    assert outside.read_text(encoding="utf-8") == "keep me\n"
+    assert _baks(dest) == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX exec bit")

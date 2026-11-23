@@ -1651,16 +1651,26 @@ def _check_apply_paths(dest: str, written: Sequence[str], backup: Optional[str],
     The blocked-parent and blocked-leaf refusals run before the operator
     allowlist guard: they are a property of the filesystem, not of who is
     writing, so ``show`` and ``--dry-run`` see them even when
-    ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset. The helper covers ``dest``
-    and every path in ``written`` (tree children included): a regular file
-    sitting at an intermediate path blocks a leaf the same way a file sitting
-    at the destination's parent does (#1221, #1208), and a directory already
-    sitting at a written leaf is refused the other way around (#1223).
+    ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset. The helper covers ``dest``,
+    every path in ``written`` (tree children included) and the backup slot: a
+    regular file sitting at an intermediate path blocks a leaf the same way a
+    file sitting at the destination's parent does (#1221, #1208), and a
+    directory already sitting at a written leaf is refused the other way
+    around (#1223).
+
+    The backup slot is on that list because it is a path the walk writes and
+    it is not always beside ``dest``: a text artifact's ``.bak-N`` is, but a
+    tree's copy lives under ``$AGENTDESCENT_HOME/backups`` (#758), so a file
+    sitting at that root passed both previews and then failed the real write
+    with the errno of the *backup* printed against ``dest`` -- a destination
+    that is a perfectly good directory (#1226).
     """
     _refuse_blocked_parent(dest)
     for path in written:
         _refuse_blocked_parent(path)
         _refuse_blocked_leaf(path)
+    if backup is not None:
+        _refuse_blocked_parent(backup)
     if check_write is not None:
         check_write(dest, "to")
         for path in written:

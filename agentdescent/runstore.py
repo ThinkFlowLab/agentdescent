@@ -121,6 +121,14 @@ OPERATOR_MAX_CALLS_REQUESTED_ENV = "AGENTDESCENT_MAX_CALLS_REQUESTED"
 #: run that was given anything else. Label only: it changes nothing enforced.
 OPERATOR_MAX_CALLS_REMAINDER_ENV = "AGENTDESCENT_MAX_CALLS_REMAINDER"
 
+#: Says the remainder above arrived through ``launch``'s ``env`` (#1241). Only
+#: ``launch`` writes it, so a foreground run cannot be told it was launched: a
+#: process that inherits a *consistent* pair (ceiling 5, remainder 1, requested
+#: 5) looks exactly like a clamped child from the numbers alone, and no numeric
+#: test can separate them. ``execute`` has no ``env`` parameter, so an
+#: in-process run's clamp cannot have come from a parent's ``launch``.
+OPERATOR_MAX_CALLS_FROM_LAUNCH_ENV = "AGENTDESCENT_MAX_CALLS_FROM_LAUNCH"
+
 
 def operator_max_calls(environ: Optional[Mapping[str, str]] = None
                        ) -> Optional[int]:
@@ -829,8 +837,10 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # server says "this launch is a remainder".
     wanted_remainder = (env or {}).get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
     child_env.pop(OPERATOR_MAX_CALLS_REMAINDER_ENV, None)
+    child_env.pop(OPERATOR_MAX_CALLS_FROM_LAUNCH_ENV, None)
     if wanted_remainder is not None:
         child_env[OPERATOR_MAX_CALLS_REMAINDER_ENV] = wanted_remainder
+        child_env[OPERATOR_MAX_CALLS_FROM_LAUNCH_ENV] = "1"
     if operator_bound:
         # After the scrub, so it survives; label only, nothing here is enforced.
         child_env[OPERATOR_MAX_CALLS_REQUESTED_ENV] = (
@@ -963,6 +973,17 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     from .agents import Usage
     from .evolvespec import EvolveSpec, SpecError, build_call_limit, compose
     from .filetree import materialize
+
+    # The remainder marker is a ``launch`` handoff, not ambient state (#1241):
+    # ``launch`` carries ``..._FROM_LAUNCH`` alongside it, and ``execute`` has no
+    # ``env`` parameter, so a pair found here without that marker was inherited
+    # by this process rather than handed to this run. Dropping it keeps a
+    # foreground run that legitimately asks for the inherited number bare --
+    # which no numeric test in ``_clamped_max_calls`` could do, because the
+    # inherited pair is self-consistent. Only the remainder: the requested
+    # value is #1082's evidence and keeps its existing foreground labelling.
+    if not os.environ.get(OPERATOR_MAX_CALLS_FROM_LAUNCH_ENV):
+        os.environ.pop(OPERATOR_MAX_CALLS_REMAINDER_ENV, None)
 
     # Refuse before marking running: a missing usd_per_call must not look like a
     # live run that later "ended without reporting".

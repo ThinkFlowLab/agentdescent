@@ -207,3 +207,87 @@ def test_launch_drops_an_inherited_remainder_from_the_child_environment(
     runstore.launch(rd, max_calls=4)
     assert seen["env"].get(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV) in (None, ""), \
         seen["env"].get(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV)
+
+
+def test_an_inherited_pair_cannot_label_a_foreground_run(tmp_path, monkeypatch):
+    """A foreground run cannot inherit a *consistent* pair and call it a clamp.
+
+    The pair here is exactly what a remainder-clamped parent would have in its
+    own environment (ceiling 5, one call spent, caller asked 5): both halves
+    agree, so no numeric test can tell it from a real handoff. ``execute`` has
+    no ``env`` parameter, so an in-process run's clamp cannot have come from a
+    parent's ``launch`` -- the pair is stale and the run must stay bare.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV, "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "1")
+    sub = tmp_path / "fg1"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    result = runstore.execute(rd, max_calls=1)
+    st = rd.status()
+    assert result.stop_reason is None or result.stop_reason == "budget", result
+    assert st.calls == 1, st
+    assert st.stop_detail == "max_calls: 1 call(s) made, cap 1", st.stop_detail
+
+
+def test_an_inherited_pair_cannot_label_a_foreground_run_at_two(
+        tmp_path, monkeypatch):
+    """The same shape at other numbers: asked 9, remainder 2, applied 2 (#1241)."""
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV, "9")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "2")
+    sub = tmp_path / "fg2"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    result = runstore.execute(rd, max_calls=2)
+    st = rd.status()
+    assert result.stop_reason is None or result.stop_reason == "budget", result
+    assert st.calls == 2, st
+    assert st.stop_detail == "max_calls: 2 call(s) made, cap 2", st.stop_detail
+
+
+def test_a_pair_that_names_the_ceiling_cannot_label_at_the_ceiling(
+        tmp_path, monkeypatch):
+    """Control: asked 5, remainder 5, applied 5 -- the caller's own number.
+
+    The pair is consistent with a clamp *at* the ceiling, but the caller asked
+    for exactly 5, so the ceiling never lowered anything: bare, before and after.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV, "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "5")
+    sub = tmp_path / "fg3"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    result = runstore.execute(rd, max_calls=5)
+    st = rd.status()
+    assert result.stop_reason is None or result.stop_reason == "budget", result
+    assert st.calls == 5, st
+    assert st.stop_detail == "max_calls: 5 call(s) made, cap 5", st.stop_detail
+
+
+def test_a_launch_says_the_remainder_is_a_handoff(tmp_path, monkeypatch):
+    """``launch`` marks the pair it hands over, so a foreground run can refuse it.
+
+    Without the marker the child would have to guess from the numbers, and the
+    guess is what the rows above show goes wrong.
+    """
+    import subprocess
+
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.delenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, raising=False)
+    sub = tmp_path / "det2"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout="4243", stderr="")
+
+    monkeypatch.setattr(runstore.subprocess, "run", fake_run)
+    runstore.launch(rd, max_calls=2,
+                    env={runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV: "2"})
+    assert seen["env"][runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV] == "2", seen["env"]
+    assert seen["env"][runstore.OPERATOR_MAX_CALLS_FROM_LAUNCH_ENV] == "1", seen["env"]

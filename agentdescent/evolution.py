@@ -1682,12 +1682,21 @@ def _check_apply_paths(dest: str, written: Sequence[str], backup: Optional[str],
     sitting at a written leaf is refused the other way around (#1223), and a
     link at a leaf or on the way to one is refused by the writer's own rule
     (#1230).
+
+    The backup slot is on that list because it is a path the walk writes and
+    it is not always beside ``dest``: a text artifact's ``.bak-N`` is, but a
+    tree's copy lives under ``$AGENTDESCENT_HOME/backups`` (#758), so a file
+    sitting at that root passed both previews and then failed the real write
+    with the errno of the *backup* printed against ``dest`` -- a destination
+    that is a perfectly good directory (#1226).
     """
     _refuse_blocked_parent(dest)
     for path in written:
         _refuse_blocked_parent(path)
         _refuse_blocked_leaf(path)
         _refuse_link_in_dest(dest, path)
+    if backup is not None:
+        _refuse_blocked_parent(backup)
     if check_write is not None:
         check_write(dest, "to")
         for path in written:

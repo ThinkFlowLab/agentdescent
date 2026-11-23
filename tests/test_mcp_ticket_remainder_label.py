@@ -173,20 +173,6 @@ def test_an_inherited_remainder_cannot_label_a_caller_capped_run(
     assert st.stop_detail == "max_calls: 4 call(s) made, cap 4", st.stop_detail
 
 
-def test_a_stale_remainder_cannot_label_a_foreground_run(tmp_path, monkeypatch):
-    """The same coincidence without a detach boundary: ``execute`` in-process."""
-    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
-    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "4")
-    sub = tmp_path / "fg"
-    sub.mkdir()
-    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
-    result = runstore.execute(rd, max_calls=4)
-    st = rd.status()
-    assert result.stop_reason is None or result.stop_reason == "budget", result
-    assert st.calls == 4, st
-    assert st.stop_detail == "max_calls: 4 call(s) made, cap 4", st.stop_detail
-
-
 def test_launch_drops_an_inherited_remainder_from_the_child_environment(
         tmp_path, monkeypatch):
     """The detach boundary itself: only this call's ``env`` may carry the marker."""
@@ -267,11 +253,13 @@ def test_a_pair_that_names_the_ceiling_cannot_label_at_the_ceiling(
     assert st.stop_detail == "max_calls: 5 call(s) made, cap 5", st.stop_detail
 
 
-def test_a_launch_says_the_remainder_is_a_handoff(tmp_path, monkeypatch):
-    """``launch`` marks the pair it hands over, so a foreground run can refuse it.
+def test_a_launch_scopes_the_remainder_to_the_run_it_starts(
+        tmp_path, monkeypatch):
+    """The handoff names the run it was applied to, so inheriting it proves nothing.
 
-    Without the marker the child would have to guess from the numbers, and the
-    guess is what the rows above show goes wrong.
+    Only this launch knows ``rd.run_id``; the MCP server keeps handing over the
+    bare number, and the scope is added exactly where the ``--max-calls`` value
+    is turned into that child's argv.
     """
     import subprocess
 
@@ -289,5 +277,64 @@ def test_a_launch_says_the_remainder_is_a_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(runstore.subprocess, "run", fake_run)
     runstore.launch(rd, max_calls=2,
                     env={runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV: "2"})
-    assert seen["env"][runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV] == "2", seen["env"]
-    assert seen["env"][runstore.OPERATOR_MAX_CALLS_FROM_LAUNCH_ENV] == "1", seen["env"]
+    assert seen["env"][runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV] == \
+        f"{rd.run_id}:2", seen["env"]
+    # A launch that was not handed a remainder carries nothing, scoped or not.
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "9")
+    sub2 = tmp_path / "det3"
+    sub2.mkdir()
+    other = runstore.create(_dir_spec(str(sub2)).to_dict(),
+                            store=str(tmp_path / "runs"))
+    runstore.launch(other, max_calls=2)
+    assert seen["env"].get(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV) is None, seen["env"]
+
+
+def test_a_descendant_cannot_inherit_its_ancestors_handoff(tmp_path, monkeypatch):
+    """A run started inside a clamped run is a different run, with its own id.
+
+    The env is exactly what ``launch`` leaves in run A's process, and the
+    foreground run here is run B: the marker names A, so it is not evidence
+    about B, however consistent the pair looks.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    sub = tmp_path / "a"
+    sub.mkdir()
+    run_a = runstore.create(_dir_spec(str(sub)).to_dict(),
+                            store=str(tmp_path / "runs"))
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV, "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV,
+                       f"{run_a.run_id}:1")
+    assert runstore._remainder_calls(run_a.run_id) == (1, True)
+
+    sub_b = tmp_path / "b"
+    sub_b.mkdir()
+    run_b = runstore.create(_dir_spec(str(sub_b)).to_dict(),
+                            store=str(tmp_path / "runs"))
+    result = runstore.execute(run_b, max_calls=1)
+    st = run_b.status()
+    assert result.stop_reason is None or result.stop_reason == "budget", result
+    assert st.calls == 1, st
+    assert st.stop_detail == "max_calls: 1 call(s) made, cap 1", st.stop_detail
+
+
+def test_an_inherited_marker_cannot_label_through_a_boolean_handoff(
+        tmp_path, monkeypatch):
+    """Whatever extra marker an ancestor's environment carries, it labels nothing.
+
+    ``AGENTDESCENT_MAX_CALLS_FROM_LAUNCH`` is the boolean an earlier round of
+    this fix used, and the inherited value is the unscoped number that round
+    wrote beside it: an inherited copy must not label a run it was not applied
+    to, so this row stays bare with both present.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV, "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "1")
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS_FROM_LAUNCH", "1")
+    sub = tmp_path / "fg4"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    result = runstore.execute(rd, max_calls=1)
+    st = rd.status()
+    assert result.stop_reason is None or result.stop_reason == "budget", result
+    assert st.calls == 1, st
+    assert st.stop_detail == "max_calls: 1 call(s) made, cap 1", st.stop_detail

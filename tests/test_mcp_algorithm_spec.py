@@ -108,6 +108,9 @@ def test_same_object_as_algorithms_run_json(tmp_path, capsys):
 def test_description_is_written_for_the_model():
     text = TOOL_DESCRIPTIONS["algorithm_spec"]
     assert "algorithms run" in text and "start" in text and "never guess" in text
+    # #1228: the tool itself still only builds + plans; the description must
+    # require a follow-up probe and a capped start, not a bare start.
+    assert "probe=true" in text and "max_calls" in text
 
 
 def test_params_object_is_passed_through_not_re_split(tmp_path):

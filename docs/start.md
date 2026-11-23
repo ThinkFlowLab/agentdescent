@@ -67,7 +67,8 @@ print(result.rendered, result.final_reward, result.error)
 ```bash
 agentdescent init ./my-skill --data cases.jsonl --out spec.json
 agentdescent plan spec.json            # validates and prices it; runs nothing
-agentdescent evolve spec.json --detach
+agentdescent plan spec.json --probe    # one minimal call per model; if it refuses, stop
+agentdescent evolve spec.json --max-calls N --detach  # N from the plan's upper bound
 agentdescent status                    # then: show <run_id>, apply <run_id> --dry-run, apply <run_id>
 ```
 

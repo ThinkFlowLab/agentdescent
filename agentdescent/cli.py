@@ -2427,9 +2427,36 @@ def _plan_agent_line(spec: Dict[str, Any]) -> Optional[str]:
 
 
 
+def _declared_cap(spec: Any) -> Tuple[bool, Optional[int]]:
+    """The call cap a spec already declares, for the advice (#1219).
+
+    An explicit ``--max-calls`` in ``next:`` wins over the spec's own knobs
+    (``runstore.py``: "an explicit run option is the sharper instruction"), so
+    naming the structural bound there silently raised a cap the user had
+    written down. ``(True, n)`` is ``evolve.max_calls``; ``(True, None)`` is a
+    priced dollar cap the advice cannot express in calls -- and it wins when a
+    spec declares both, because an explicit flag replaces the whole
+    ``CallLimit``. ``(False, None)`` means the spec declares neither and the
+    bound is still the advice.
+    """
+    evolve = getattr(spec, "evolve", None)
+    knobs = evolve if isinstance(evolve, dict) else {}
+    # The dollar pair is checked first: an explicit `--max-calls` replaces the
+    # spec's whole `CallLimit` (`overrides["call_limit"]`, `runstore.py`), so
+    # advising one for a spec that also declares `max_usd` + `usd_per_call`
+    # would drop that dollar cap. The spec governs; no flag is advised.
+    if knobs.get("max_usd") is not None and knobs.get("usd_per_call") is not None:
+        return True, None
+    calls = knobs.get("max_calls")
+    if isinstance(calls, (int, float)) and not isinstance(calls, bool):
+        return True, int(calls)
+    return False, None
+
+
 def _capped_evolve_next(spec_path: str, calls: Any, *,
                         already_probed: bool = False,
-                        extra_flags: str = "") -> str:
+                        extra_flags: str = "",
+                        declared: Optional[Tuple[bool, Optional[int]]] = None) -> str:
     """The first-run ``next:`` line: preflight, then evolve with a per-call cap.
 
     #1201 / #1217: a new user or host following ``next`` must see
@@ -2437,10 +2464,23 @@ def _capped_evolve_next(spec_path: str, calls: Any, *,
     ``evolve --max-calls N``, with N from the plan's own
     ``agent_calls_upper_bound``. ``<N>`` is the placeholder when no
     bound is known yet (the default demo footer has no user estimate).
+
+    #1219: when the spec declares its own cap, the advice may not raise it --
+    ``min(bound, declared)``, or no flag at all for a dollar cap the command
+    line cannot express in calls.
     """
-    cap = (f" --max-calls {int(calls)}"
-           if isinstance(calls, (int, float)) and calls > 0
-           else " --max-calls <N>")
+    declared_flag, declared_calls = declared or (False, None)
+    if not declared_flag:
+        cap = (f" --max-calls {int(calls)}"
+               if isinstance(calls, (int, float)) and calls > 0
+               else " --max-calls <N>")
+    elif declared_calls is None:
+        cap = ""
+    else:
+        number = declared_calls
+        if isinstance(calls, (int, float)) and calls > 0:
+            number = min(int(calls), declared_calls)
+        cap = f" --max-calls {number}"
     evolve = f"agentdescent evolve {spec_path}{extra_flags}{cap}"
     if already_probed:
         return evolve
@@ -2611,7 +2651,8 @@ def cmd_plan(a: argparse.Namespace) -> int:
             extra_flags += f" --param {param}"
     calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
     next_line = _capped_evolve_next(
-        a.spec, calls, already_probed=False, extra_flags=extra_flags)
+        a.spec, calls, already_probed=False, extra_flags=extra_flags,
+        declared=_declared_cap(spec))
     then_line = None
     probe_refused = False
     if probe is not None:
@@ -2633,7 +2674,8 @@ def cmd_plan(a: argparse.Namespace) -> int:
             # This invocation already probed; `next:` is the capped evolve
             # only (#1217). A refusal keeps the repair + `then:` above.
             next_line = _capped_evolve_next(
-                a.spec, calls, already_probed=True, extra_flags=extra_flags)
+                a.spec, calls, already_probed=True, extra_flags=extra_flags,
+                declared=_declared_cap(spec))
     # `--baseline-sample` spends real calls, so it runs last: a broken spec or a
     # refused probe must not first pay for N rollouts (#1113). The sample's own
     # call count is printed before the first one; it is opt-in, and plain `plan`
@@ -3848,9 +3890,9 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                             "source": src, "dest": dest}
     # Every leaf, before the backup is taken: a link planted in --to must not
     # redirect the `.bak-N` copy either, or the backup holds the target's
-    # bytes inside a directory host scanners read (#977).
-    for rel in changed:
-        _refuse_dest_link(dest, os.path.join(dest, rel.replace("/", os.sep)))
+    # bytes inside a directory host scanners read (#977). The funnel below owns
+    # that rule now (`_refuse_link_in_dest`, #1230), so this surface and
+    # `apply <run_id>` name the same block with the same sentence.
     slot = (_file_tree_backup_path(dest)
             if backup and not plan["noop"] and os.path.isdir(dest) else None)
     _check_apply_paths(dest, [os.path.join(dest, rel.replace("/", os.sep))
@@ -4920,7 +4962,8 @@ def algorithms_run_payload(
         # cap `docs/start.md` documents, at the plan's own upper bound -- the
         # bare `evolve <spec>` was the one path that named neither.
         calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
-        obj["next"] = _capped_evolve_next(out, calls)
+        obj["next"] = _capped_evolve_next(
+            out, calls, declared=_declared_cap(spec))
     else:
         obj["next"] = retry_line
     obj["_stage"] = "done"

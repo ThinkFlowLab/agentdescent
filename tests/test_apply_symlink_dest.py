@@ -17,7 +17,7 @@ import os
 
 import pytest
 
-from agentdescent import cli
+from agentdescent import cli, runstore
 from agentdescent.evolution import EvolutionResult
 from agentdescent.filetree import TreeError, canonical
 
@@ -145,7 +145,14 @@ def test_a_dangling_link_in_the_backup_dir_is_skipped(tmp_path, capsys,
 
 
 def test_apply_of_a_run_refuses_a_planted_destination_link(tmp_path, monkeypatch):
-    """The run-id path writes through `filetree.materialize`; same refusal."""
+    """The run-id path refuses the link in the funnel, before `materialize`.
+
+    The sentence and the rule stay `materialize`'s (`dest_problem`), but the
+    exception is the funnel's: every other blocked leaf there (a file on the
+    way, a directory at the leaf) is refused with ``RunStoreError``, and the
+    CLI turns that into the exit-2 JSON refusal instead of a traceback
+    (#1230).
+    """
     real_home = os.path.join(os.path.expanduser("~"), ".agentdescent")
     home_before = sorted(os.listdir(real_home)) if os.path.isdir(real_home) else None
     monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "ad-home"))
@@ -157,7 +164,7 @@ def test_apply_of_a_run_refuses_a_planted_destination_link(tmp_path, monkeypatch
     result = EvolutionResult(state={"SKILL.md": "evolved\n"},
                              rendered=canonical({"SKILL.md": "evolved\n"}),
                              final_reward=0.0, history=[], ledger_log=[])
-    with pytest.raises(TreeError, match="symlink"):
+    with pytest.raises(runstore.RunStoreError, match="symlink"):
         result.write_to(str(dest))
     assert outside.read_text(encoding="utf-8") == "PRIVATE KEY\n"
     # The run-id path must not fall back to the developer's own home.

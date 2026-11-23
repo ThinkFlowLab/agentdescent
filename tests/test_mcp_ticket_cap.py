@@ -439,3 +439,42 @@ def test_resume_refuses_when_the_run_status_cannot_be_read(store, tmp_path, monk
     after = _wait(runstore.get(first["run_id"], store=store))
     assert after.state == "done", after
     assert after.calls == 3, after
+
+
+def test_a_solved_run_still_refuses_as_solved_not_unreadable(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=1)
+    rd = runstore.get(first["run_id"], store=store)
+    st = _wait(rd)
+    assert st.calls == 1, st
+    rd.update_status(state="done", stop_reason="target_reward")
+
+    # The status file is readable, so the refusal has to stay the #900 one:
+    # `SpecError` is a `ValueError`, and the wrap that turns an unreadable
+    # status into a refusal must not swallow it and send the operator to
+    # restore a file that is fine (#1082).
+    refused = tools.resume(first["run_id"])
+    err = refused.get("error") or ""
+    assert "already reached its target" in err, refused
+    assert "cannot be accounted" not in err, refused
+    after = rd.status()
+    assert (after.state, after.stop_reason) == ("done", "target_reward"), after
+
+
+def test_a_quota_spent_run_still_refuses_as_quota_not_unreadable(store, tmp_path,
+                                                               monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    tools = Tools(store)
+    first = _start_in(tmp_path, tools, "t0", max_calls=1)
+    rd = runstore.get(first["run_id"], store=store)
+    assert _wait(rd).calls == 1
+    rd.update_status(state="failed", stop_reason="error",
+                     error="QuotaExhausted: the quota resets at 2026-11-24 "
+                           "00:00:00 +0800 CST")
+
+    refused = tools.resume(first["run_id"])
+    err = refused.get("error") or ""
+    assert "failed on QuotaExhausted" in err, refused
+    assert "cannot be accounted" not in err, refused
+    assert rd.status().state == "failed", rd.status()

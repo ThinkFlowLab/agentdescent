@@ -1085,6 +1085,12 @@ class Tools:
                 if not force:
                     require_resume_not_quota_exhausted(run_id, store=self.store)
                 require_resume_host_on_path(run_id, store=self.store)
+            except SpecError:
+                # The gates refuse with `SpecError`, a `ValueError`: the status
+                # is readable and the refusal is decided (solved, quota, host),
+                # so it keeps its own sentence instead of becoming "cannot be
+                # accounted" (#1082).
+                raise
             except (ValueError, OSError) as e:
                 # These gates read the run's status too. A corrupt one is a
                 # refusal with a reason, not a traceback out of `resume`
@@ -1099,6 +1105,10 @@ class Tools:
             with self._ticket_lock:
                 try:
                     before = runstore.get(run_id, store=self.store).status()
+                except SpecError:
+                    # Same reason as the gates above: a decided `SpecError`
+                    # out of the store is not an unreadable status (#1082).
+                    raise
                 except (ValueError, OSError) as e:
                     return {"ok": False,
                             "error": _unreadable_run_error(run_id, e)}

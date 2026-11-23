@@ -222,7 +222,7 @@ agentdescent plan spec.json          # validates and prices it; runs nothing
 agentdescent plan spec.json --probe  # + one minimal call per model, so a dead
                                      #   key/endpoint/model/subscription is
                                      #   refused here, before any run exists
-agentdescent evolve spec.json --detach
+agentdescent evolve spec.json --max-calls N --detach  # N from the plan's upper bound
 agentdescent status
 ```
 

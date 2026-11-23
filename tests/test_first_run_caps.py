@@ -199,3 +199,59 @@ def test_bare_plan_next_names_the_probe_then_the_cap(tmp_path, monkeypatch):
         f"agentdescent evolve {spec} --max-calls {bound.group(1)}")
     assert "ready" not in payload and "probe" not in payload
 
+def _first_init_my_skill_block(text):
+    """The first fenced command block that contains the README-style init line."""
+    parts = text.split("```")
+    for i, part in enumerate(parts):
+        if "init ./my-skill" in part:
+            body = part
+            if body.startswith("bash"):
+                body = body.split("\n", 1)[1]
+            return body
+    raise AssertionError("no init ./my-skill command block")
+
+
+def _section_after(text, heading):
+    assert heading in text, heading
+    return text.split(heading, 1)[1]
+
+
+def test_readme_quickstart_names_the_probe_and_the_cap():
+    # #1232: the README "your own run" block still started uncapped after #1229.
+    block = _first_init_my_skill_block(_read("README.md"))
+    assert "plan spec.json --probe" in block
+    assert "evolve spec.json --max-calls" in block
+
+
+def test_start_page_opening_cli_block_names_the_probe_and_the_cap():
+    # The later --probe / --max-calls sections on this page do not count:
+    # the opening CLI path is what a new user copies.
+    opening = _read("docs", "start.md").split("## With a real model", 1)[0]
+    block = _first_init_my_skill_block(opening)
+    assert "plan spec.json --probe" in block
+    assert "evolve spec.json --max-calls" in block
+
+
+def test_plugin_quickstart_command_block_names_the_cap():
+    # Habits paragraphs already named --max-calls; the copied block did not.
+    block = _first_init_my_skill_block(_read("docs", "plugin-quickstart.md"))
+    assert "plan spec.json --probe" in block
+    assert "evolve spec.json --max-calls" in block
+
+
+def test_skill_without_mcp_cheatsheet_names_the_probe_and_the_cap():
+    cheat = _section_after(skill_text(), "## Without MCP")
+    fence = cheat.split("```", 2)[1]
+    assert "--probe" in fence
+    assert "--max-calls" in fence
+    # The bare evolve line must not remain in this cheatsheet.
+    assert "evolve spec.json --detach\n" not in fence
+
+
+def test_grok_bot_host_md_names_the_probe_and_the_cap():
+    from agentdescent.integrations import grok_bot_host_md
+    drive = _section_after(grok_bot_host_md(), "Drive AgentDescent")
+    drive = drive.split("MCP (optional", 1)[0]
+    assert "plan --probe" in drive
+    assert "evolve --max-calls" in drive
+    assert "evolve the written" not in drive

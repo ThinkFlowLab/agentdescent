@@ -713,7 +713,9 @@ class Tools:
         is the *remainder*, below the ceiling -- and the requested-value rule
         cannot see a clamp there, because nothing equals the ceiling (#1241).
         Carry the applied remainder too, so that run names the ceiling its
-        remainder came from instead of looking like a caller's own cap.
+        remainder came from instead of looking like a caller's own cap. Only
+        that case writes it: an inherited copy is dropped at the detach
+        boundary, so a launch that is not a remainder carries nothing.
         """
         env = self.host_model_env()
         if limit is not None and limit.get("source") == runstore.OPERATOR_MAX_CALLS_ENV:

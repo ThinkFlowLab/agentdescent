@@ -148,3 +148,62 @@ def test_the_label_does_not_change_what_the_ticket_spends(
     assert st0.calls + st1.calls == 3, (st0.calls, st1.calls)
     m = re.search(r"cap (\d+)\s*$", st1.stop_detail or "")
     assert m and int(m.group(1)) == 2, st1.stop_detail
+
+
+def test_an_inherited_remainder_cannot_label_a_caller_capped_run(
+        store, tmp_path, monkeypatch):
+    """The marker is inherited, not scoped: ceiling 5, stale remainder 4, caller asks 4.
+
+    The interesting coincidence: the applied number equals both the caller's
+    request and the stale marker. It is not a clamp -- the ceiling (5) did not
+    lower 4 -- so the run must stay bare, and the parent must not pass the
+    inherited value on.
+    """
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "4")
+    tools = Tools(store)
+
+    started = _start_in(tmp_path, tools, "t0", max_calls=4)
+    assert started["call_limit"]["max_calls"] == 4, started["call_limit"]
+    assert "source" not in started["call_limit"], started["call_limit"]
+
+    st = _wait(runstore.get(started["run_id"], store=store))
+    assert st.state == "done", st
+    assert st.calls == 4, st
+    assert st.stop_detail == "max_calls: 4 call(s) made, cap 4", st.stop_detail
+
+
+def test_a_stale_remainder_cannot_label_a_foreground_run(tmp_path, monkeypatch):
+    """The same coincidence without a detach boundary: ``execute`` in-process."""
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "4")
+    sub = tmp_path / "fg"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    result = runstore.execute(rd, max_calls=4)
+    st = rd.status()
+    assert result.stop_reason is None or result.stop_reason == "budget", result
+    assert st.calls == 4, st
+    assert st.stop_detail == "max_calls: 4 call(s) made, cap 4", st.stop_detail
+
+
+def test_launch_drops_an_inherited_remainder_from_the_child_environment(
+        tmp_path, monkeypatch):
+    """The detach boundary itself: only this call's ``env`` may carry the marker."""
+    import subprocess
+
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "5")
+    monkeypatch.setenv(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV, "4")
+    sub = tmp_path / "det"
+    sub.mkdir()
+    rd = runstore.create(_dir_spec(str(sub)).to_dict(), store=str(tmp_path / "runs"))
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout="4242", stderr="")
+
+    monkeypatch.setattr(runstore.subprocess, "run", fake_run)
+    runstore.launch(rd, max_calls=4)
+    assert seen["env"].get(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV) in (None, ""), \
+        seen["env"].get(runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV)

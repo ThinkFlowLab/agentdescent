@@ -188,15 +188,19 @@ def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
         return max_calls, False
     if max_calls is None or cap < max_calls:
         return cap, True
+    requested, present = _requested_calls()
     remainder, remainder_present = _remainder_calls()
     if (remainder_present and max_calls is not None
-            and max_calls == remainder and max_calls < cap):
+            and max_calls == remainder and max_calls < cap
+            and present and (requested is None or requested > max_calls)):
         # The Ticket's remainder lowered the caller's number, so the ceiling
         # bound this run even though the applied value is below it (#1241).
-        # The remainder must match what was applied, or an inherited value
-        # would label a run the parent never clamped.
+        # Both halves are needed against inheritance: the number must be the
+        # one the parent applied, *and* the parent must have recorded a caller
+        # request -- a stale pair in the environment (ceiling 5, remainder 4,
+        # caller legitimately asking 4) is not a clamp, so `launch` also strips
+        # the remainder variable from the ambient environment.
         return max_calls, True
-    requested, present = _requested_calls()
     # The label follows the clamp, not the variable: only a run whose applied
     # value *is* the ceiling can say the ceiling bound it, so a hand-set or
     # stale request cannot blame a ceiling that never bit (#1082).
@@ -816,6 +820,17 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # prefix, so it survives either way.
     child_env = scrub_host_env({**os.environ, "PYTHONPATH": _child_pythonpath(),
                                 **(env or {})})
+    # The remainder marker is inherited, not scoped: a process that was itself
+    # launched below its ceiling would hand that number to every later child,
+    # and a caller who legitimately asks for exactly that number would be
+    # labelled ceiling-clamped (#1241). The scrub keeps ``AGENTDESCENT_*`` (that
+    # is why the requested value works), so this one is dropped here and only
+    # restored from the ``env`` this launch was given -- which is how the MCP
+    # server says "this launch is a remainder".
+    wanted_remainder = (env or {}).get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
+    child_env.pop(OPERATOR_MAX_CALLS_REMAINDER_ENV, None)
+    if wanted_remainder is not None:
+        child_env[OPERATOR_MAX_CALLS_REMAINDER_ENV] = wanted_remainder
     if operator_bound:
         # After the scrub, so it survives; label only, nothing here is enforced.
         child_env[OPERATOR_MAX_CALLS_REQUESTED_ENV] = (

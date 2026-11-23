@@ -457,11 +457,38 @@ class RunDir:
     # -- reads ---------------------------------------------------------------
 
     def spec_dict(self) -> Dict[str, Any]:
-        return _read_json(self.spec_path)
+        try:
+            raw = _read_json(self.spec_path)
+        except json.JSONDecodeError as e:
+            raise RunStoreError(f"cannot read run {self.run_id!r}: {e}") from None
+        if not isinstance(raw, dict):
+            raise RunStoreError(
+                f"cannot read run {self.run_id!r}: spec.json is not an object")
+        return raw
+
+    def _status_from_file(self) -> RunStatus:
+        """Load ``status.json``, or raise if it is unreadable (#1236).
+
+        Missing files stay ``FileNotFoundError`` so ``status`` and
+        ``update_status`` can keep their existing not-found behaviour.
+        A damaged or wrong-shape file becomes ``RunStoreError`` with
+        ``cannot read run …``, which MCP already turns into ``{"error": …}``
+        and the CLI already prints as exit 2.
+        """
+        try:
+            raw = _read_json(self.status_path)
+        except json.JSONDecodeError as e:
+            raise RunStoreError(f"cannot read run {self.run_id!r}: {e}") from None
+        try:
+            if not isinstance(raw, dict):
+                raise TypeError("status.json is not an object")
+            return RunStatus.from_dict(raw)
+        except (TypeError, KeyError, AttributeError, ValueError) as e:
+            raise RunStoreError(f"cannot read run {self.run_id!r}: {e}") from None
 
     def status(self) -> RunStatus:
         try:
-            st = RunStatus.from_dict(_read_json(self.status_path))
+            st = self._status_from_file()
         except FileNotFoundError:
             raise RunStoreError(f"{self.run_id}: no status.json; not a run directory") from None
         # A process that died without writing a terminal state -- killed, OOM,
@@ -526,7 +553,7 @@ class RunDir:
     def update_status(self, **changes: Any) -> RunStatus:
         with self.status_lock():
             try:
-                st = RunStatus.from_dict(_read_json(self.status_path))
+                st = self._status_from_file()
             except FileNotFoundError:
                 st = RunStatus(run_id=self.run_id)
             for k, v in changes.items():

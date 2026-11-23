@@ -81,7 +81,8 @@ To point the same loop at a file or directory:
 ```bash
 agentdescent init ./my-skill --data cases.jsonl --out spec.json
 agentdescent plan spec.json            # validates and prices it; runs nothing
-agentdescent evolve spec.json --detach
+agentdescent plan spec.json --probe    # one minimal call per model; if it refuses, stop
+agentdescent evolve spec.json --max-calls N --detach  # N from the plan's upper bound
 agentdescent status                    # then: show, apply --dry-run, apply
 ```
 

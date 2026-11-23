@@ -426,8 +426,8 @@ to the user rather than looking for a tool.
 ```
 agentdescent demo [--algorithm NAME] --json   # zero-key smoke; try this first
 agentdescent doctor
-agentdescent plan   spec.json
-agentdescent evolve spec.json --detach
+agentdescent plan   spec.json --probe
+agentdescent evolve spec.json --max-calls N --detach
 agentdescent status <run_id>
 agentdescent show   <run_id>
 agentdescent apply  <run_id> --dry-run

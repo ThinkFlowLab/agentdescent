@@ -1113,11 +1113,12 @@ launcher will not reach the Bot from Cursor's backend.
    dropping this folder into the Bot's managed-skills tree by hand is not a
    supported install route.
 2. **Drive AgentDescent.** Prefer the CLI on the Bot's computer (the shared
-   box): `agentdescent doctor`, `plan`, `evolve`, `status`, `apply`. Named
-   methods: `agentdescent algorithms list` / `show <name>`, then
+   box): `agentdescent doctor`, `plan --probe`, `evolve --max-calls N`,
+   `status`, `apply`. Named methods: `agentdescent algorithms list` /
+   `show <name>`, then
    `agentdescent algorithms run NAME PATH [cases.jsonl]` (init + plan in one
-   step; add `--rounds 1 --workers 1` for a quick trial; `evolve` the written
-   spec after yes) — or MCP `list_algorithms` /
+   step; add `--rounds 1 --workers 1` for a quick trial; then `plan --probe`
+   and `evolve --max-calls N` after yes) — or MCP `list_algorithms` /
    `describe_algorithm` when the HTTP MCP below is wired. The skill
    falls back to those verbs when MCP tools are absent.
 3. **MCP (optional, not auto-wired).** Serve the tools over HTTP on loopback

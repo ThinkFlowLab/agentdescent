@@ -318,3 +318,81 @@ def test_an_unreadable_run_refuses_instead_of_granting_the_rest(store, tmp_path,
     assert plan["ok"] is False, plan
     assert first["run_id"] in plan["error"], plan["error"]
     assert "cannot be accounted" in plan["error"], plan["error"]
+
+
+def _external_run(tmp_path, store, name, max_calls):
+    """A run in the store that this server did not start: another process did.
+
+    Its calls are real -- it is in a run directory -- but it is not in any
+    ``Tools._ticket_runs``, which is what makes it "external" to the Ticket the
+    resuming server holds (#1082).
+    """
+    other = Tools(store)
+    started = _start_in(tmp_path, other, name, max_calls=max_calls)
+    st = _wait(runstore.get(started["run_id"], store=store))
+    return started["run_id"], st
+
+
+def test_a_resumed_external_run_cannot_exceed_the_ceiling(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    run_id, before = _external_run(tmp_path, store, "ext", max_calls=1)
+    assert before.calls == 1, before
+
+    tools = Tools(store)
+    assert tools._ticket_spent() == 0, tools._ticket_spent()
+    resumed = tools.resume(run_id)
+    assert resumed.get("ok") is not False, resumed
+    # The remainder is the grant. The child counts the ledger it resumes (one
+    # call), so a cap of 3 lets it spend 2 more and stop the Ticket at 3. Today
+    # the reply says 4 -- the remainder plus a ledger that is not in `spent` --
+    # while `launch` clamps the child back to the ceiling: the same grant
+    # mismatch this PR removes for `start`, re-entered through `resume`.
+    assert resumed["call_limit"]["max_calls"] == 3, resumed["call_limit"]
+    after = _wait_more(runstore.get(run_id, store=store), before.calls)
+    assert after.state == "done", after
+    assert _cap_in_detail(after) == resumed["call_limit"]["max_calls"], after.stop_detail
+    assert after.calls - before.calls <= 2, (before.calls, after.calls)
+    assert tools._ticket_spent() <= 3, tools._ticket_spent()
+
+
+def test_a_resumed_external_run_is_charged_inside_the_ceiling(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    run_id, before = _external_run(tmp_path, store, "ext", max_calls=1)
+    assert before.calls == 1, before
+
+    tools = Tools(store)
+    own = _start_in(tmp_path, tools, "own", max_calls=1)
+    own_st = _wait(runstore.get(own["run_id"], store=store))
+    assert own_st.calls == 1, own_st
+    assert tools._ticket_spent() == 1, tools._ticket_spent()
+
+    resumed = tools.resume(run_id)
+    # One call of the ceiling is this server's own, so two are left. The
+    # external ledger is not in `spent`: its grant is the 2 that remain, inside
+    # which its earlier call is counted, so the child spends 1 more and the
+    # Ticket totals 3. Today the ledger is added to the remainder the reply
+    # shows (3) and the child spends 2 more: the Ticket bills 4 of 3.
+    assert resumed["call_limit"]["max_calls"] == 2, resumed["call_limit"]
+    after = _wait_more(runstore.get(run_id, store=store), before.calls)
+    assert after.state == "done", after
+    assert _cap_in_detail(after) == resumed["call_limit"]["max_calls"], after.stop_detail
+    assert after.calls - before.calls == 1, (before.calls, after.calls)
+    assert tools._ticket_spent() <= 3, tools._ticket_spent()
+
+
+def test_a_resumed_external_run_with_no_room_is_refused(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDESCENT_MAX_CALLS", "3")
+    run_id, before = _external_run(tmp_path, store, "ext", max_calls=3)
+    assert before.calls == 3, before
+
+    tools = Tools(store)
+    # Its ledger already fills the ceiling the Ticket has left, and it is not
+    # charged to the Ticket, so there is no remainder to grant: relaunching it
+    # would hand out the ceiling a second time. Refuse, naming the run.
+    refused = tools.resume(run_id)
+    assert refused.get("ok") is False, refused
+    assert run_id in refused["error"], refused["error"]
+    assert "already carries 3 call(s)" in refused["error"], refused["error"]
+    assert "pid" not in refused, refused
+    after = runstore.get(run_id, store=store).status()
+    assert (after.state, after.calls) == ("done", 3), after

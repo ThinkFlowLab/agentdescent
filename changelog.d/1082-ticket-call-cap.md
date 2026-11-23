@@ -12,3 +12,8 @@ refuses to start or resume anything until the run store is readable again,
 instead of granting a remainder that may already be spent. A `max_usd` without
 `usd_per_call` is still refused with the argument named in the message, now
 from inside the same gate (#1196).
+
+`resume` shares the same Ticket remainder as `start`: a run this server started
+is relaunched with its ledger plus what is left, and a run it did not start is
+registered and charged on its first resume here, its whole earlier ledger
+counted, with no grant once that ledger fills the remainder.

@@ -112,12 +112,19 @@ your tree, under the operator's write allowlist).
   `AGENTDESCENT_MAX_CALLS` set, the server spends it across the runs it starts:
   a second `start` is clamped to the remainder, its reply says
   `ticket: {ceiling, spent, remaining}`, and once the ceiling is spent `start`
-  refuses, and `resume` is held to the same remainder. Start the next Ticket in
-  a new server session (or raise the ceiling) rather than reusing the spent one
-  (#1082).
+  refuses. `resume` is held to the same remainder: a run this server started is
+  relaunched with its own ledger plus what is left, while a run it did not start
+  is relaunched with the remainder itself, its earlier calls counted inside that
+  number, and a run whose ledger already fills the remainder is refused instead
+  of relaunched. Start the next Ticket in a new server session (or raise the
+  ceiling) rather than reusing the spent one (#1082).
   Only the runs this server started are charged: a run it did not start (a CLI
   `evolve`, a run from another process) is outside the accounting unless it is
   resumed here, so mixing CLI and MCP runs inside one session is not covered.
+  Once an external run is resumed here its whole ledger is charged -- 2 calls
+  before plus 1 after counts as 3 spent, and the next `start` is refused -- and
+  its child is still clamped by the absolute ceiling, never by the remainder
+  alone.
   `AGENTDESCENT_MAX_CALLS` is the only operator ceiling and it is per-Ticket; a
   caller's `max_calls` and `max_usd` stay per-run flags, and only `max_calls` is
   clamped by what the Ticket has left (#1082).

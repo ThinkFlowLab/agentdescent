@@ -610,7 +610,8 @@ class Tools:
 
     def _ticket_open(self, max_calls: Optional[int], max_usd: Optional[float],
                      usd_per_call: Optional[float], *,
-                     prior_calls: int = 0) -> Tuple[
+                     prior_calls: int = 0, registered: bool = True,
+                     run_id: Optional[str] = None) -> Tuple[
                          Optional[Dict[str, Any]], Optional[int], Optional[Dict[str, Any]]]:
         """``(limit, applied, refusal)`` for one ``start`` / ``resume`` (#1082).
 
@@ -621,13 +622,20 @@ class Tools:
         named none, the caller's own number with no ceiling, ``None`` when
         neither -- and the refusal is the spent-Ticket reply.
 
-        ``prior_calls`` is the ledger a resumed run already carries. The child's
-        cap counts that ledger (``execute`` seeds ``Usage`` from it), so the
-        number it is relaunched with is ``prior + remaining``: passing the
-        remainder alone would stop it at once having "reached" a cap it already
-        went past. The reply says the same number it gave the child. A run whose
-        status cannot be read refuses here too, with its own sentence: that is
-        an unreadable ledger, not a spent one.
+        ``prior_calls`` is the ledger a resumed run already carries, and
+        ``registered`` says whether that ledger is already inside ``spent``.
+
+        A run this server started (``registered``) is relaunched with
+        ``prior + remaining``: the child counts the ledger it resumes, and the
+        ledger is already charged to the Ticket, so this number stays inside the
+        ceiling and the reply says exactly what the child was given. A run it
+        did not start is not in ``spent``, so adding its ledger would grant the
+        ceiling twice over: its grant is the remainder itself, its earlier calls
+        counted inside that number, and a ledger that already fills the
+        remainder is refused by name instead of relaunched (#1082).
+
+        A run whose status cannot be read refuses here too, with its own
+        sentence: that is an unreadable ledger, not a spent one.
         """
         # Both of these raise reasons a host must hear as a refusal, not as a
         # traceback: `start` reaches this under the lock, outside the try that
@@ -646,18 +654,29 @@ class Tools:
             return limit, None, self._ticket_refusal(ticket, limit)
         applied = None if limit is None else limit.get("max_calls")
         if applied is not None and prior_calls > 0:
-            applied += max(0, int(prior_calls))
-            limit = {**(limit or {}), "max_calls": applied}
+            if registered:
+                applied += max(0, int(prior_calls))
+                limit = {**(limit or {}), "max_calls": applied}
+            elif int(prior_calls) >= int(applied):
+                # Its ledger is not in `spent` and already fills what is left:
+                # there is nothing to grant, and relaunching would bill the
+                # ceiling a second time (#1082).
+                return limit, None, {"ok": False, "error": (
+                    f"run {run_id or 'this run'} already carries "
+                    f"{int(prior_calls)} call(s); this Ticket has "
+                    f"{int(applied)} left. Retry in a new server session, or "
+                    "raise the ceiling."), "call_limit": limit}
         return limit, applied, None
 
     def _ticket_reserve(self, run_id: str, applied: Optional[int],
                         prior_calls: int = 0) -> None:
         """Register a run and the calls it holds until it reports (#1082).
 
-        ``prior_calls`` is what the ledger already holds: a resumed run is
-        charged for the calls it spent before this relaunch plus the cap it is
-        relaunched with. Registering a run this server already knows must not
-        list it twice, or the Ticket would charge it twice.
+        ``held`` is the grant itself: a registered run was given its ledger
+        plus the remainder, an external one only the remainder (its earlier
+        calls are counted inside that number). Registering a run this server
+        already knows must not list it twice, or the Ticket would charge it
+        twice.
         """
         held = max(0, int(applied or 0)) + max(0, int(prior_calls))
         if run_id not in self._ticket_runs:
@@ -1064,9 +1083,9 @@ class Tools:
             with self._ticket_lock:
                 before = runstore.get(run_id, store=self.store).status()
                 prior = int(before.calls) + int(before.pending_calls)
-                limit, applied, refused = self._ticket_open(None, None,
-                                                            usd_per_call,
-                                                            prior_calls=prior)
+                limit, applied, refused = self._ticket_open(
+                    None, None, usd_per_call, prior_calls=prior,
+                    registered=run_id in self._ticket_runs, run_id=run_id)
                 if refused is not None:
                     return refused
                 st = runstore.resume(

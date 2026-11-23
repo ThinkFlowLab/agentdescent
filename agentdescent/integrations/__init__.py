@@ -401,8 +401,12 @@ argument-hint: <path> [cases.jsonl]
 ---
 
 Use the agentdescent skill. The target is `$ARGUMENTS` (a path, optionally
-followed by a cases file). Run `doctor`, build the spec, `plan` it, show me the
-spec and the estimate, and wait for my yes before `start`.
+followed by a cases file). Run `doctor`, build the spec, then `plan` it with
+`--probe` / `probe=true`. If the probe refuses, give me its `next` and do not
+`start`. Show me the spec and the estimate, and wait for my yes before
+`start` / `evolve` with `max_calls` (and `max_usd` beside `usd_per_call` when
+a price is known), starting at the plan's `agent_calls_upper_bound` (or
+smaller for a trial).
 
 If I named a method that is in `agentdescent algorithms list` (for example RRSI
 or archive_selection), set `algorithm` in the spec (or pass `--algorithm` to
@@ -439,12 +443,16 @@ Parse `$ARGUMENTS` (trim; empty means `list`):
   call `algorithm_spec` with the name, the absolute path, the absolute cases
   file and only the params they gave (validate with `describe_algorithm` /
   `show` first); it writes and plans the spec and returns `spec`. Run `doctor`
-  first, show the resolved algorithm card (including fidelity / surface) and
-  estimate, and wait for my yes before `start` with that `spec`. Same
+  first, then `plan` that `spec` with `--probe` / `probe=true`. If the probe
+  refuses, give me its `next` and do not `start`. Show the resolved algorithm
+  card (including fidelity / surface) and estimate, and wait for my yes
+  before `start` with that `spec` and `max_calls` (and `max_usd` beside
+  `usd_per_call` when a price is known), starting at the plan's
+  `agent_calls_upper_bound` (or smaller for a trial). Same
   apply/cancel/resume rules as `/evolve`. Without MCP: `agentdescent algorithms
   run <name> <path> [cases.jsonl] [--param k=v...] [--rounds N] [--workers N]`
-  (init + plan; then `evolve` after yes). For a quick trial pass
-  `--rounds 1 --workers 1`.
+  (init + plan), then `plan <spec> --probe` and `evolve --max-calls N` after
+  yes. For a quick trial pass `--rounds 1 --workers 1`.
 
 If they only named a method with no path, `show` it and ask whether to `run`.
 """

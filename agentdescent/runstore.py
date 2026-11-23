@@ -112,6 +112,15 @@ OPERATOR_MAX_CALLS_ENV = "AGENTDESCENT_MAX_CALLS"
 #: for exactly this". Label only: it never changes what is enforced.
 OPERATOR_MAX_CALLS_REQUESTED_ENV = "AGENTDESCENT_MAX_CALLS_REQUESTED"
 
+#: The remainder a Ticket left, carried across the detach boundary (#1241).
+#: A Ticket that already spent part of the ceiling launches the next run
+#: *below* the ceiling, and there the applied value never equals the ceiling, so
+#: the requested-value rule below cannot see that the ceiling bound it: the run
+#: printed the same bare ``cap N`` as a caller who asked for that very number.
+#: The value is the number the parent applied, so a stale copy cannot label a
+#: run that was given anything else. Label only: it changes nothing enforced.
+OPERATOR_MAX_CALLS_REMAINDER_ENV = "AGENTDESCENT_MAX_CALLS_REMAINDER"
+
 
 def operator_max_calls(environ: Optional[Mapping[str, str]] = None
                        ) -> Optional[int]:
@@ -150,6 +159,23 @@ def _requested_calls() -> Tuple[Optional[int], bool]:
     return (value, True) if value >= 0 else (None, False)
 
 
+def _remainder_calls() -> Tuple[Optional[int], bool]:
+    """``(the remainder the parent applied, whether it recorded one)`` (#1241).
+
+    Label only, like :func:`_requested_calls`: a malformed value is ignored
+    rather than refused, because the child already started with its argv and
+    this must not change anything but the wording of ``stop_detail``.
+    """
+    raw = os.environ.get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
+    if raw is None:
+        return None, False
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None, False
+    return (value, True) if value >= 0 else (None, False)
+
+
 def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
     """``(max_calls, whether the operator's ceiling is what bound it)`` (#1082).
 
@@ -162,6 +188,14 @@ def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
         return max_calls, False
     if max_calls is None or cap < max_calls:
         return cap, True
+    remainder, remainder_present = _remainder_calls()
+    if (remainder_present and max_calls is not None
+            and max_calls == remainder and max_calls < cap):
+        # The Ticket's remainder lowered the caller's number, so the ceiling
+        # bound this run even though the applied value is below it (#1241).
+        # The remainder must match what was applied, or an inherited value
+        # would label a run the parent never clamped.
+        return max_calls, True
     requested, present = _requested_calls()
     # The label follows the clamp, not the variable: only a run whose applied
     # value *is* the ceiling can say the ceiling bound it, so a hand-set or

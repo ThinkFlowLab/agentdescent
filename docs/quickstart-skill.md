@@ -21,7 +21,7 @@ mkdir -p my-skills && agentdescent init my-skills --kind skill_library \
   --data cases.jsonl --algorithm archive_selection --out spec.json
 # fill cases.jsonl, pin reflect/agent, then:
 agentdescent plan spec.json --probe
-# agentdescent evolve spec.json --max-calls N
+# agentdescent evolve spec.json --max-calls N   (N from the plan's upper bound)
 ```
 
 Offline library teaching (two `*/SKILL.md`, no key):

@@ -196,8 +196,13 @@ def _status_line(st: runstore.RunStatus) -> str:
         perr = f" propose_errors={st.propose_errors}"
         if st.propose_error and not st.error:
             perr += f" (first: {st.propose_error})"
+    # The cap the run enforces, beside the spend (#1249): `calls=137/200` says
+    # how far along it is before `stop_detail` exists, and an uncapped run keeps
+    # the bare `calls=137` it always printed.
+    calls = (f"{st.calls}/{st.calls_cap}" if st.calls_cap is not None
+             else f"{st.calls}")
     return (f"{st.run_id}  {st.state:<9} round {rounds:<6} "
-            f"calls={st.calls}{pending}{tok}{perr}{reward}{usd}"
+            f"calls={calls}{pending}{tok}{perr}{reward}{usd}"
             f"  {st.kind or '?'}:{st.target or '?'}{tail}{err}")
 
 

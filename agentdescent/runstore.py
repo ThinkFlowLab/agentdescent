@@ -322,6 +322,14 @@ class RunStatus:
     propose_errors: int = 0
     propose_error: Optional[str] = None
     calls: int = 0
+    #: The call cap this run enforces, written before the first call (#1249).
+    #: Without it a live line read ``calls=137`` with no denominator: 137 of 200
+    #: and 137 of 20,000 looked the same, though the cap was known before the
+    #: run started. ``None`` when the run has no *call* cap (uncapped, or capped
+    #: in dollars only), and then omitted from ``to_dict`` so an uncapped run
+    #: writes yesterday's file byte for byte -- the shape rule ``stop_detail``
+    #: already follows.
+    calls_cap: Optional[int] = None
     #: Work started but not yet finished: actor invocations, and the merge step
     #: (``phase="merge"``). Non-zero means work is in flight even when ``calls``
     #: is still 0 or has stopped moving (long first propose #358; a reflective
@@ -357,6 +365,9 @@ class RunStatus:
         # wrote before this field existed, so the key is omitted when unset.
         if d.get("stop_detail") is None:
             d.pop("stop_detail", None)
+        # Same rule for the live denominator (#1249): no call cap, no key.
+        if d.get("calls_cap") is None:
+            d.pop("calls_cap", None)
         return d
 
     @classmethod
@@ -1190,8 +1201,14 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     try:
         comp = compose(spec, usage=usage, on_round=on_round, repo_path=rd.ledger_path,
                        **overrides)
+        # The cap this run really enforces -- the run option, or the one
+        # `compose` built from the spec's knobs (#1166) -- onto the live line
+        # before the first call (#1249). A dollar-only cap has no call number,
+        # so it writes no denominator.
+        cap = limit if limit is not None else getattr(comp, "call_limit", None)
         rd.update_status(rounds=comp.kwargs.get("rounds"), notes=comp.notes,
-                         usd=None if usd_per_call is None else 0.0)
+                         usd=None if usd_per_call is None else 0.0,
+                         calls_cap=(None if cap is None else cap.max_calls))
         with _plain_cli_warnings():
             result = comp.run()
     except BaseException as e:  # noqa: BLE001 - the child must report before dying
@@ -1206,8 +1223,8 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     final = _finite_or_none(result.final_reward)
     initial = _finite_or_none(getattr(result, "initial_reward", None))
     # Which limit fired, from whichever cap this run actually had: the run
-    # option, or the one `compose` built from the spec's knobs (#1166).
-    cap = limit if limit is not None else getattr(comp, "call_limit", None)
+    # option, or the one `compose` built from the spec's knobs (#1166). `cap`
+    # is the same object the live write above put on the line (#1249).
     detail = cap.detail() if cap is not None else None
     rd.update_status(
         state="failed" if result.error else "done", finished=time.time(),

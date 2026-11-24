@@ -558,6 +558,29 @@ def build_tasks(spec: EvolveSpec) -> List[Task]:
         raise SpecError(f"data: {e}") from None
 
 
+def text_dropped_fixtures(tasks: Sequence[Task]) -> List[str]:
+    """Fixture file names a ``kind='text'`` prompt never shows (#1251).
+
+    :func:`build_tasks` maps a case's ``fixtures`` column into ``task.meta``,
+    and the directory runners stage it into the workspace. A text rollout is
+    ``{skill} + {prompt}`` with no workspace, so the body never reaches the
+    model: the plan said ``ok`` and the run learned nothing. A body already
+    written into its own prompt is not dropped, so an inlined case stays quiet.
+    """
+    dropped: List[str] = []
+    for task in tasks:
+        staged = (getattr(task, "meta", None) or {}).get("fixtures")
+        if not isinstance(staged, Mapping):
+            continue
+        prompt = getattr(task, "prompt", "") or ""
+        for name, body in staged.items():
+            if not isinstance(body, str) or not body or body in prompt:
+                continue
+            if str(name) not in dropped:
+                dropped.append(str(name))
+    return dropped
+
+
 def build_reward(spec: EvolveSpec) -> Callable:
     score = spec.score
     if isinstance(score, str):
@@ -1341,6 +1364,22 @@ def compose(spec: EvolveSpec, *, usage: Optional[Usage] = None,
             notes.append(
                 f"target {spec.target!r} is not a file; kind=text will use the "
                 "path string itself as the prompt text")
+        # A skill_dir cases file reused as `--kind text` keeps a green plan
+        # while the CSV never reaches the prompt (#1251); name the dropped
+        # files and the two repairs, so the hinted command is not a dead end.
+        dropped = text_dropped_fixtures(tasks)
+        if dropped:
+            files = ", ".join(repr(n) for n in dropped[:3])
+            if len(dropped) > 3:
+                files += f" and {len(dropped) - 3} more"
+            repair = "inline each file's body into its prompt"
+            if chosen is not None:
+                repair += (f", or start from the cases `agentdescent demo "
+                           f"--algorithm {chosen[0].name} --dir <dir>` writes")
+            notes.append(
+                f"kind='text': the cases carry fixtures ({files}) that the text "
+                f"runner never stages -- it sends {{skill}} + {{prompt}} only, so "
+                f"the model cannot read them; {repair} (#1251)")
         defaults = {"rounds": 8, "held_out_frac": 0.3, "patience": 3,
                     "target_reward": 0.98}
         default_workers = 8

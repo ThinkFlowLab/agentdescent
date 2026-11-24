@@ -30,6 +30,8 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -270,19 +272,31 @@ def test_a_socket_leaf_is_refused(tmp_path, capsys):
     """The same rule one object over: a bound ``AF_UNIX`` socket at the leaf."""
     if not hasattr(socket, "AF_UNIX"):
         pytest.skip("no AF_UNIX sockets on this platform")
-    dest = tmp_path / "lib"
-    dest.mkdir()
-    leaf = dest / "agent.sock"
-    with socket.socket(socket.AF_UNIX) as bound:
-        bound.bind(str(leaf))
-        store, rid = _tree_run(tmp_path, dest, {"agent.sock": "evolved\n"})
-        expected = _sentence(leaf, "a socket")
-        plan = _show_plan(store, rid, capsys)
-        assert plan.get("error") == expected
-        assert "written" not in plan
-        assert _apply_error(
-            ["--store", store, "apply", rid, "--dry-run", "--json"], capsys
-        ) == expected
-        assert _apply_error(
-            ["--store", store, "apply", rid, "--json"], capsys) == expected
-        assert stat.S_ISSOCK(os.lstat(str(leaf)).st_mode)
+    # ``sun_path`` caps a bind at 108 bytes and ``tmp_path`` rides on TMPDIR, so
+    # a long TMPDIR pushes ``tmp_path/lib/agent.sock`` over the cap before the
+    # product is exercised (#1245). Move this one row under a short root when
+    # the fixture's path is long; the socket still sits at ``lib/agent.sock``.
+    relocated = len(str(tmp_path / "lib" / "agent.sock")) > 100
+    if relocated and not os.path.isdir("/tmp"):
+        pytest.skip("AF_UNIX leaf path exceeds sun_path and there is no short /tmp")
+    root = Path(tempfile.mkdtemp(prefix="ad-sock-", dir="/tmp")) if relocated else tmp_path
+    try:
+        dest = root / "lib"
+        dest.mkdir()
+        leaf = dest / "agent.sock"
+        with socket.socket(socket.AF_UNIX) as bound:
+            bound.bind(str(leaf))
+            store, rid = _tree_run(root, dest, {"agent.sock": "evolved\n"})
+            expected = _sentence(leaf, "a socket")
+            plan = _show_plan(store, rid, capsys)
+            assert plan.get("error") == expected
+            assert "written" not in plan
+            assert _apply_error(
+                ["--store", store, "apply", rid, "--dry-run", "--json"], capsys
+            ) == expected
+            assert _apply_error(
+                ["--store", store, "apply", rid, "--json"], capsys) == expected
+            assert stat.S_ISSOCK(os.lstat(str(leaf)).st_mode)
+    finally:
+        if relocated:
+            shutil.rmtree(root, ignore_errors=True)

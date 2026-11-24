@@ -708,11 +708,25 @@ class Tools:
         The reply still says so, so the run's own ``stop_detail`` has to as
         well: write the request into the variable that label is read from,
         exactly as ``launch`` does for a per-run clamp ("" = none named).
+
+        When this Ticket already spent part of the ceiling, the number applied
+        is the *remainder*, below the ceiling -- and the requested-value rule
+        cannot see a clamp there, because nothing equals the ceiling (#1241).
+        Carry the applied remainder too, so that run names the ceiling its
+        remainder came from instead of looking like a caller's own cap. Only
+        that case writes it: an inherited copy is dropped at the detach
+        boundary, so a launch that is not a remainder carries nothing.
         """
         env = self.host_model_env()
         if limit is not None and limit.get("source") == runstore.OPERATOR_MAX_CALLS_ENV:
             env = {**env, runstore.OPERATOR_MAX_CALLS_REQUESTED_ENV:
                    "" if max_calls is None else str(int(max_calls))}
+            ticket = limit.get("ticket") or {}
+            applied = limit.get("max_calls")
+            remaining = ticket.get("remaining")
+            if applied is not None and remaining is not None \
+                    and int(applied) == int(remaining):
+                env[runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV] = str(int(remaining))
         return env
 
 

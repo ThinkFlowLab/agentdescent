@@ -18,8 +18,9 @@ The whole surface is small:
 * :func:`load_gated_hf` -- a best-effort loader for **gated** datasets via a lazy
   ``datasets`` import + an ``HF_TOKEN``; returns ``None`` if unavailable.
 
-Everything caches under ``~/.cache/agentdescent/<subdir>``. The URL/paging helpers
-are pure so they can be unit-tested without a network.
+Everything caches under ``~/.cache/agentdescent/<subdir>``, or wherever
+``AGENTDESCENT_CACHE`` / ``XDG_CACHE_HOME`` point it. The URL/paging helpers are
+pure so they can be unit-tested without a network.
 """
 
 from __future__ import annotations
@@ -194,8 +195,25 @@ def page_offsets(limit: int, page: int = PAGE_MAX) -> List[Tuple[int, int]]:
 # ---------------------------------------------------------------------------
 
 
+def _cache_root() -> str:
+    """The dataset cache root, resolved at call time (#1261).
+
+    A host with a read-only home cannot create anything under ``~/.cache``, so
+    the two standard knobs move the root: ``AGENTDESCENT_CACHE`` names it
+    directly and ``XDG_CACHE_HOME`` puts it under ``<XDG_CACHE_HOME>/agentdescent``.
+    With neither set the root is :data:`CACHE_ROOT`, exactly as before.
+    """
+    explicit = os.environ.get("AGENTDESCENT_CACHE")
+    if explicit:
+        return os.path.expanduser(explicit)
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return os.path.join(os.path.expanduser(xdg), "agentdescent")
+    return CACHE_ROOT
+
+
 def cache_path(subdir: str, filename: str) -> str:
-    d = os.path.join(CACHE_ROOT, subdir)
+    d = os.path.join(_cache_root(), subdir)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, filename)
 

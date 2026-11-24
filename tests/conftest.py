@@ -14,5 +14,15 @@ truncated 944-row download was.
 """
 import os
 
+import pytest
+
 os.environ.setdefault("AGENTDESCENT_GSM8K_SAMPLE", "1")
 os.environ.setdefault("AGENTDESCENT_GSMHARD_SAMPLE", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_dataset_cache(monkeypatch):
+    """The dataset cache root reads the environment at call time (#1261), so a
+    shell that exports either variable would otherwise move every cache test."""
+    monkeypatch.delenv("AGENTDESCENT_CACHE", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)

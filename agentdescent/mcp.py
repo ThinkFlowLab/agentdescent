@@ -716,6 +716,11 @@ class Tools:
         remainder came from instead of looking like a caller's own cap. Only
         that case writes it: an inherited copy is dropped at the detach
         boundary, so a launch that is not a remainder carries nothing.
+
+        A *registered* resume is launched with a third number, its ledger plus
+        the remainder (#1247). That number is below the ceiling and is not the
+        remainder, so it needs the Ticket's own marker: the child then knows the
+        Ticket chose it, and ``launch`` scopes the marker to this run.
         """
         env = self.host_model_env()
         if limit is not None and limit.get("source") == runstore.OPERATOR_MAX_CALLS_ENV:
@@ -727,6 +732,9 @@ class Tools:
             if applied is not None and remaining is not None \
                     and int(applied) == int(remaining):
                 env[runstore.OPERATOR_MAX_CALLS_REMAINDER_ENV] = str(int(remaining))
+            if applied is not None and remaining is not None \
+                    and int(applied) > int(remaining):
+                env[runstore.OPERATOR_MAX_CALLS_TICKET_ENV] = str(int(applied))
         return env
 
 

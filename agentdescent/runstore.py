@@ -125,6 +125,17 @@ OPERATOR_MAX_CALLS_REQUESTED_ENV = "AGENTDESCENT_MAX_CALLS_REQUESTED"
 #: nothing enforced.
 OPERATOR_MAX_CALLS_REMAINDER_ENV = "AGENTDESCENT_MAX_CALLS_REMAINDER"
 
+#: The number the Ticket itself chose for one launch, carried across the detach
+#: boundary (#1247). A run this server started is resumed with ``prior +
+#: remaining``, which is neither the ceiling nor the remainder, so neither rule
+#: above can see that the Ticket -- not the caller, and not a per-run flag --
+#: picked it: the resumed run printed a bare ``cap N`` while the reply it was
+#: given said ``source: AGENTDESCENT_MAX_CALLS``. The value is ``<run id>:<n>``
+#: for the remainder's reason: it names the run it was applied to, and only the
+#: launch that was handed it writes it, so an inherited copy is not evidence
+#: about a later run. Label only: it changes nothing enforced.
+OPERATOR_MAX_CALLS_TICKET_ENV = "AGENTDESCENT_MAX_CALLS_TICKET"
+
 
 def operator_max_calls(environ: Optional[Mapping[str, str]] = None
                        ) -> Optional[int]:
@@ -163,22 +174,22 @@ def _requested_calls() -> Tuple[Optional[int], bool]:
     return (value, True) if value >= 0 else (None, False)
 
 
-def _remainder_calls(run_id: Optional[str] = None
-                     ) -> Tuple[Optional[int], bool]:
-    """``(the remainder the parent applied to this run, whether it recorded one)``.
+def _scoped_marker(name: str, run_id: Optional[str]
+                   ) -> Tuple[Optional[int], bool]:
+    """``(the number a run-scoped handoff marker carries, whether it names this run)``.
 
-    Label only, like :func:`_requested_calls`: a malformed value is ignored
-    rather than refused, because the child already started with its argv and
-    this must not change anything but the wording of ``stop_detail``.
+    Label only: a malformed value is ignored rather than refused, because the
+    child already started with its argv and this must not change anything but
+    the wording of ``stop_detail``.
 
-    The value is run-scoped (``<run id>:<n>``) because the variable is inherited,
-    not scoped: a process that was itself launched below its ceiling passes it
-    to every later child, and the numbers alone cannot tell that copy from a
-    real handoff -- a stale ``requested``/``remainder`` pair is self-consistent.
-    A value naming another run, or carrying no scope at all, is not evidence
-    about this one (#1241).
+    The value is ``<run id>:<n>`` because the variable is inherited, not scoped:
+    a process that was itself launched below its ceiling passes it to every
+    later child, and the numbers alone cannot tell that copy from a real handoff
+    -- a stale ``requested``/``marker`` pair is self-consistent. A value naming
+    another run, or carrying no scope at all, is not evidence about this one
+    (#1241, #1247).
     """
-    raw = os.environ.get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
+    raw = os.environ.get(name)
     if raw is None:
         return None, False
     scope, sep, tail = str(raw).strip().partition(":")
@@ -191,6 +202,29 @@ def _remainder_calls(run_id: Optional[str] = None
     return (value, True) if value >= 0 else (None, False)
 
 
+def _remainder_calls(run_id: Optional[str] = None
+                     ) -> Tuple[Optional[int], bool]:
+    """``(the remainder the parent applied to this run, whether it recorded one)``.
+
+    The Ticket's remainder is the grant for a launch it clamped below the
+    ceiling; see :data:`OPERATOR_MAX_CALLS_REMAINDER_ENV` for why the value is
+    run-scoped (#1241).
+    """
+    return _scoped_marker(OPERATOR_MAX_CALLS_REMAINDER_ENV, run_id)
+
+
+def _ticket_calls(run_id: Optional[str] = None
+                  ) -> Tuple[Optional[int], bool]:
+    """``(the number the Ticket chose for this run, whether it recorded one)``.
+
+    A registered resume is relaunched with ``prior + remaining``, a number that
+    is neither the ceiling nor the remainder; see
+    :data:`OPERATOR_MAX_CALLS_TICKET_ENV` for why the value is run-scoped and
+    why only the launch that was handed it writes it (#1247).
+    """
+    return _scoped_marker(OPERATOR_MAX_CALLS_TICKET_ENV, run_id)
+
+
 def _clamped_max_calls(max_calls: Optional[int],
                        run_id: Optional[str] = None
                        ) -> Tuple[Optional[int], bool]:
@@ -198,8 +232,8 @@ def _clamped_max_calls(max_calls: Optional[int],
 
     In the detached child ``max_calls`` is already the clamped argv value, so
     the parent's record of what the caller asked for is what decides whether
-    the ceiling bound the run. ``run_id`` scopes the Ticket remainder to the run
-    it was applied to (#1241).
+    the ceiling bound the run. ``run_id`` scopes the Ticket's handoff markers
+    to the run they were applied to (#1241, #1247).
     """
     cap = operator_max_calls()
     if cap is None:
@@ -215,6 +249,14 @@ def _clamped_max_calls(max_calls: Optional[int],
         # bound this run even though the applied value is below it (#1241).
         # The remainder names this run, so an inherited copy -- which names the
         # ancestor it was applied to -- cannot label a run of its own.
+        return max_calls, True
+    ticket, ticket_present = _ticket_calls(run_id)
+    if (ticket_present and max_calls is not None
+            and max_calls == ticket and max_calls < cap):
+        # The Ticket chose this number for this launch: a registered resume is
+        # relaunched with its ledger plus the remainder, so the applied value is
+        # neither the ceiling nor the remainder (#1247). The marker names this
+        # run, so only the launch that was handed it can make it count.
         return max_calls, True
     # The label follows the clamp, not the variable: only a run whose applied
     # value *is* the ceiling can say the ceiling bound it, so a hand-set or
@@ -841,19 +883,21 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # prefix, so it survives either way.
     child_env = scrub_host_env({**os.environ, "PYTHONPATH": _child_pythonpath(),
                                 **(env or {})})
-    # The remainder marker is inherited, not scoped: a process that was itself
-    # launched below its ceiling would hand that number to every later child,
-    # and a caller who legitimately asks for exactly that number would be
-    # labelled ceiling-clamped (#1241). The scrub keeps ``AGENTDESCENT_*`` (that
-    # is why the requested value works), so this one is dropped here and only
-    # restored from the ``env`` this launch was given -- which is how the MCP
-    # server says "this launch is a remainder" -- and restored naming *this*
-    # run, because only this launch knows the id the number was applied to.
-    wanted_remainder = (env or {}).get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
-    child_env.pop(OPERATOR_MAX_CALLS_REMAINDER_ENV, None)
-    if wanted_remainder is not None:
-        child_env[OPERATOR_MAX_CALLS_REMAINDER_ENV] = (
-            f"{rd.run_id}:{wanted_remainder}")
+    # The Ticket's handoff markers are inherited, not scoped: a process that was
+    # itself launched below its ceiling would hand that number to every later
+    # child, and a caller who legitimately asks for exactly that number would be
+    # labelled ceiling-clamped (#1241, #1247). The scrub keeps
+    # ``AGENTDESCENT_*`` (that is why the requested value works), so these are
+    # dropped here and only restored from the ``env`` this launch was given --
+    # which is how the MCP server says "the Ticket chose this launch's number" --
+    # and restored naming *this* run, because only this launch knows the id the
+    # number was applied to.
+    for marker in (OPERATOR_MAX_CALLS_REMAINDER_ENV,
+                   OPERATOR_MAX_CALLS_TICKET_ENV):
+        wanted = (env or {}).get(marker)
+        child_env.pop(marker, None)
+        if wanted is not None:
+            child_env[marker] = f"{rd.run_id}:{wanted}"
     if operator_bound:
         # After the scrub, so it survives; label only, nothing here is enforced.
         child_env[OPERATOR_MAX_CALLS_REQUESTED_ENV] = (

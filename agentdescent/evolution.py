@@ -33,6 +33,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import warnings
@@ -1621,26 +1622,42 @@ def _refuse_blocked_parent(dest: str) -> None:
 
 
 def _refuse_blocked_leaf(path: str) -> None:
-    """Refuse a write whose leaf already exists as a directory (#1223).
+    """Refuse a write whose leaf already exists as anything but a regular file.
 
     ``_refuse_blocked_parent`` catches a regular file sitting on an intermediate
-    path. The inverse is a directory sitting where the artifact wants a file:
-    ``dest`` is valid, ``dest/alpha`` is a directory, and the tree writes
-    ``alpha``. ``show --diff`` and ``apply --dry-run`` then advertised the leaf
-    as ``written`` while the real ``apply`` died at ``open`` with
+    path. The inverse is a directory sitting where the artifact wants a file
+    (#1223): ``dest`` is valid, ``dest/alpha`` is a directory, and the tree
+    writes ``alpha``. ``show --diff`` and ``apply --dry-run`` then advertised
+    the leaf as ``written`` while the real ``apply`` died at ``open`` with
     ``cannot write <dest>: Is a directory`` -- the tree root, not the blocking
     leaf. ``apply --from`` was worse: ``shutil.copy2`` nested the bytes at
     ``dest/alpha/alpha`` and reported success.
 
+    The same test one object type over is a FIFO, a socket or a device (#1225):
+    the previews planned the write, the backup copy died inside ``shutil``, and
+    ``apply --no-backup`` blocked forever in ``open(..., "w")`` after rewriting
+    the leaves that sort before it. ``os.lstat`` + ``S_ISREG`` covers all of
+    them, and the suffix names the kind the caller has to remove.
+
     Called from ``_check_apply_paths`` on every path in ``written`` (not on
     ``dest`` itself: a tree root *is* a directory). A symlink at the leaf is
-    ``_refuse_link_in_dest``'s job; this helper names only a real directory.
+    ``_refuse_link_in_dest``'s job: this helper skips one, so the refusal
+    cannot pre-empt that rule.
     """
-    if os.path.lexists(path) and not os.path.islink(path) and os.path.isdir(path):
-        from . import runstore  # runstore imports this module at import time
+    if not os.path.lexists(path) or os.path.islink(path):
+        return
+    from . import runstore  # runstore imports this module at import time
 
+    if os.path.isdir(path):
         raise runstore.RunStoreError(
             f"cannot write {path}: {path!r} is a directory, not a file")
+    mode = os.lstat(path).st_mode
+    if stat.S_ISREG(mode):
+        return
+    from .filetree import _entry_kind
+
+    raise runstore.RunStoreError(
+        f"cannot write {path}: {path!r} is {_entry_kind(mode)}")
 
 
 def _refuse_link_in_dest(dest: str, path: str) -> None:

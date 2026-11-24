@@ -265,13 +265,33 @@ def tree_summary(state: Mapping[str, str], limit: int = 40) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _entry_kind(mode: int) -> str:
+    """Name a non-regular directory entry for a refusal sentence (#1225).
+
+    ``open`` cannot read or write these as an artifact: a FIFO blocks until a
+    peer appears -- forever, when none does -- and a socket or a device fails
+    with ``ENXIO``. Naming the kind in the refusal is what tells a caller which
+    object to remove or declare outside the tree.
+    """
+    if stat.S_ISFIFO(mode):
+        return "a named pipe"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISCHR(mode):
+        return "a character device"
+    if stat.S_ISBLK(mode):
+        return "a block device"
+    return "a special file"
+
+
 def load_tree(path: str, spec: Optional[TreeSpec] = None) -> Dict[str, str]:
     """Read a directory into ``{relpath: text}``.
 
-    Files that match ``spec.include`` but cannot be represented -- binary, or
-    over ``max_file_bytes`` -- **raise** rather than being skipped. Skipping
-    silently would mean the evolved tree is not the tree the caller pointed at,
-    and :meth:`~agentdescent.evolution.EvolutionResult.write_to` would then
+    Files that match ``spec.include`` but cannot be represented -- binary, over
+    ``max_file_bytes``, or not a regular file -- **raise** rather than being
+    skipped. Skipping silently would mean the evolved tree is not the tree the
+    caller pointed at, and
+    :meth:`~agentdescent.evolution.EvolutionResult.write_to` would then
     delete-by-omission or write back a truncated directory. Widen ``exclude`` to
     say "this file is not part of the artifact" on purpose.
     """
@@ -296,7 +316,15 @@ def load_tree(path: str, spec: Optional[TreeSpec] = None) -> Dict[str, str]:
                 continue                    # never follow links out of the tree
             if not spec.selects(rel):
                 continue
-            size = os.path.getsize(full)
+            # A FIFO is not a link, so the skip above does not cover it, and the
+            # `open` below blocks until a peer appears (#1225). Refuse before
+            # `open`: a read that never returns is not a diagnostic. One
+            # `lstat` also gives the size `getsize` would ask for a second time.
+            entry = os.lstat(full)
+            if not stat.S_ISREG(entry.st_mode):
+                raise TreeError(
+                    f"{rel!r} is {_entry_kind(entry.st_mode)}, not a regular file")
+            size = entry.st_size
             if size > spec.max_file_bytes:
                 rejected.append(f"{rel} ({size:,} bytes > max_file_bytes="
                                 f"{spec.max_file_bytes:,})")

@@ -57,6 +57,7 @@ from .evolvespec import (CLI_CAP_HINT, KINDS, EvolveSpec, SpecError,
                          budget_round_overshoot_warning,
                          build_call_limit, compose, estimate, fold_kind, load_spec,
                          resolve_kind, _POLICY_SLOTS)
+from .filetree import _entry_kind
 from .probe import first_failed_next
 
 __all__ = ["main", "doctor_report", "starter_spec"]
@@ -3878,9 +3879,16 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
         which follows the link and wrote the target's bytes into ``--to``.
         Dest walks keep ``refuse_symlinks=False`` so a pre-existing link in
         ``--to`` is left alone (and not listed as ``extra``).
+
+        ``refuse_symlinks`` also bounds the source tree to regular files
+        (#1246): a FIFO blocks in ``open`` for ever waiting for a peer, and a
+        socket or device cannot be read at all, so no planned path may be one.
+        Only the ``--from`` walk opts in; a dest walk leaves such an entry
+        alone, exactly as it leaves a link alone.
         """
         out: List[str] = []
         links: List[str] = []
+        special: List[str] = []
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames if d not in (".git", "__pycache__"))
             for d in list(dirnames):
@@ -3894,8 +3902,18 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                 rel = os.path.relpath(full, root).replace(os.sep, "/")
                 if os.path.islink(full):
                     links.append(rel)
-                else:
-                    out.append(rel)
+                    continue
+                if refuse_symlinks:
+                    # One lstat, no open: the mode alone decides, so a FIFO is
+                    # classified without a reader to block on.
+                    try:
+                        mode = os.lstat(full).st_mode
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(mode):
+                        special.append(f"{rel!r} is {_entry_kind(mode)}")
+                        continue
+                out.append(rel)
         if refuse_symlinks and links:
             shown = ", ".join(links[:5]) + ("…" if len(links) > 5 else "")
             raise runstore.RunStoreError(
@@ -3903,6 +3921,13 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                 "(would dereference into real files). Remove the links or replace "
                 "them with real files, matching apply <run_id> which never "
                 "materialises symlinks.")
+        if refuse_symlinks and special:
+            shown = ", ".join(special[:5]) + ("…" if len(special) > 5 else "")
+            raise runstore.RunStoreError(
+                f"--from {root} contains a non-regular entry ({shown}); refuse to "
+                "apply (a pipe blocks in open until a peer appears and a device or "
+                "socket cannot be read). Remove it or replace it with a real file, "
+                "matching apply <run_id> which materialises regular files only.")
         return out
 
     def _same(a_path: str, b_path: str) -> bool:
@@ -3950,13 +3975,22 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
             os.makedirs(os.path.dirname(out), exist_ok=True)
         except OSError as e:
             raise _cannot_write(out, e) from None
-        # Source entries are guaranteed non-links by `_files`; still refuse to
-        # follow if the tree changed under us.
+        # Source entries are guaranteed non-links and regular by `_files`;
+        # still refuse to follow or block if the tree changed under us.
         src_path = os.path.join(src, rel.replace("/", os.sep))
         if os.path.islink(src_path):
             raise runstore.RunStoreError(
                 f"--from {src} contains symlink(s) ({rel}); refuse to apply "
                 "(would dereference into real files)")
+        try:
+            mode = os.lstat(src_path).st_mode
+        except OSError as e:
+            raise _cannot_write(src_path, e) from None
+        if not stat.S_ISREG(mode):
+            raise runstore.RunStoreError(
+                f"--from {src} contains a non-regular entry ({rel!r} is "
+                f"{_entry_kind(mode)}); refuse to apply (a pipe blocks in open "
+                "until a peer appears and a device or socket cannot be read)")
         try:
             shutil.copy2(src_path, out)
         except OSError as e:

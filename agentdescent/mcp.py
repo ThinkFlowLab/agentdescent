@@ -503,6 +503,28 @@ def _unreadable_run_error(run_id: str, e: BaseException) -> str:
             "status.json, or start a new server session.")
 
 
+def _resume_unreadable_status(run_id: str, e: BaseException
+                              ) -> Optional[Dict[str, Any]]:
+    """The #1082 resume refusal for a damaged status, or ``None`` if it is not.
+
+    ``RunDir._status_from_file`` (#1236) wraps a corrupt or wrong-shape
+    ``status.json`` as ``RunStoreError("cannot read run …")``. That is a
+    ``RuntimeError``, so the older ``except (ValueError, OSError)`` path in
+    ``resume`` no longer sees it and the generic ``RunStoreError`` handler
+    would answer with only ``{"error": "cannot read run …"}``, missing
+    ``ok: false`` and the "cannot be accounted" sentence the Ticket needs.
+    A missing run is a different ``RunStoreError`` and must stay one.
+    """
+    if isinstance(e, runstore.RunStoreError) and not str(e).startswith(
+            "cannot read run "):
+        return None
+    reason: BaseException = e
+    msg = str(e)
+    if msg.startswith("cannot read run ") and ": " in msg:
+        reason = RuntimeError(msg.split(": ", 1)[1])
+    return {"ok": False, "error": _unreadable_run_error(run_id, reason)}
+
+
 class Tools:
     """The tool bodies, SDK-free. One instance per server, bound to a run store."""
 
@@ -1110,11 +1132,14 @@ class Tools:
                 # so it keeps its own sentence instead of becoming "cannot be
                 # accounted" (#1082).
                 raise
-            except (ValueError, OSError) as e:
+            except (runstore.RunStoreError, ValueError, OSError) as e:
                 # These gates read the run's status too. A corrupt one is a
                 # refusal with a reason, not a traceback out of `resume`
                 # (#1082); a missing run stays a RunStoreError as before.
-                return {"ok": False, "error": _unreadable_run_error(run_id, e)}
+                refused = _resume_unreadable_status(run_id, e)
+                if refused is None:
+                    raise
+                return refused
             # One gate for both entry points (#1082): a resumed run belongs to
             # this Ticket too, so it is clamped to what is left and charged for
             # what it spends. It already carries a ledger, so the reservation is
@@ -1128,9 +1153,11 @@ class Tools:
                     # Same reason as the gates above: a decided `SpecError`
                     # out of the store is not an unreadable status (#1082).
                     raise
-                except (ValueError, OSError) as e:
-                    return {"ok": False,
-                            "error": _unreadable_run_error(run_id, e)}
+                except (runstore.RunStoreError, ValueError, OSError) as e:
+                    refused = _resume_unreadable_status(run_id, e)
+                    if refused is None:
+                        raise
+                    return refused
                 prior = int(before.calls) + int(before.pending_calls)
                 limit, applied, refused = self._ticket_open(
                     None, None, usd_per_call, prior_calls=prior,

@@ -95,3 +95,22 @@ def test_a_missing_status_keeps_its_wording(tmp_path, store):
     assert err == expected
     err = _mcp_error(tools, rd.run_id, "show")
     assert err == expected
+
+
+
+def test_resume_names_an_unreadable_status_as_unaccounted(tmp_path, store):
+    """`resume` still uses the #1082 sentence, not the bare wrap (#1236).
+
+    The wrap in `_status_from_file` is a `RunStoreError`, so `resume`'s
+    older `except (ValueError, OSError)` no longer sees a corrupt file.
+    The Ticket still has to refuse with `ok: false` and "cannot be
+    accounted", rather than `{"error": "cannot read run …"}`.
+    """
+    rd = _plant(tmp_path, store, status="{not json")
+    tools = Tools(store)
+    refused = tools.resume(rd.run_id)
+    assert refused.get("ok") is False, refused
+    assert rd.run_id in refused["error"], refused["error"]
+    assert "cannot be accounted" in refused["error"], refused["error"]
+    # Not relaunched: the corrupt file is still the file.
+    assert open(rd.status_path, encoding="utf-8").read() == "{not json"

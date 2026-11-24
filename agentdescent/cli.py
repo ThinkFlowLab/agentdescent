@@ -806,6 +806,14 @@ def demo_payload(
     init = getattr(result, "initial_reward", None)
     learned = demo_mod.learned_summary(result.state, kind=used_kind)
     ok = result.final_reward >= 1.0
+    # #1270: a run the operator cap stopped is not a demo that fell short -- the
+    # status already names the limit and what it observed, so both the human
+    # footer and --json read that instead of blaming the demo.
+    note = ""
+    if not ok:
+        stop_detail = rd.status().stop_detail
+        note = (f"the run stopped at {stop_detail}" if stop_detail
+                else "the final reward never reached 1.0")
     # #902: one list feeds both the human footer and --json.next, and with
     # --algorithm NAME the "your own run" steps keep the algorithm just shown.
     target = {"text": "<your-prompt.txt>",
@@ -875,7 +883,7 @@ def demo_payload(
             for info in result.history
         ],
         "next": next_steps,
-        **({} if ok else {"note": "lower than expected for the demo; see the run store"}),
+        **({} if ok else {"note": note}),
     }
 
 
@@ -937,7 +945,8 @@ def _print_demo_human(payload: Dict[str, Any], *, store: Optional[str] = None,
               f"outcomes: {payload['outcomes']}")
     print(f"what it learned:  {payload['learned']}")
     if not payload["ok"]:
-        print("\n(that is lower than expected for the demo; the run store has the detail:")
+        cause = payload.get("note") or "that is lower than expected for the demo"
+        print(f"\n({cause}; the run store has the detail:")
         try:
             print(f" {runstore.get(payload['run_id'], store=store).path})")
         except runstore.RunStoreError:

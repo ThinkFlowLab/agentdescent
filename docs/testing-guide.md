@@ -503,7 +503,7 @@ agentdescent serve         # a read-only panel on http://127.0.0.1:8787/
 Run logs are at `~/.agentdescent/runs/<id>/log.txt`, and the spec that produced
 them sits beside it, re-runnable from anywhere.
 
-Two failure modes worth recognising:
+Three failure modes worth recognising:
 
 * **A run fails with `Connection refused` partway through.** A detached run
   inherits the environment of whatever launched it, including a proxy. If that
@@ -516,6 +516,10 @@ Two failure modes worth recognising:
   `host_model_unavailable`, and the warnings `evolve` and `resume` print. A
   `host_model` spec resumed from a shell does exactly this: it has no host to
   borrow from, so every proposal raises and the rounds pass in silence.
+* **A dataset-backed example dies with `OSError: [Errno 30] Read-only file
+  system` under `~/.cache/agentdescent`.** On a container or CI host whose home
+  is read-only, point `AGENTDESCENT_CACHE` (or `XDG_CACHE_HOME`) at a writable
+  directory — the run store's `AGENTDESCENT_HOME` does not move this cache.
 
 ## 9. Running the test suite
 

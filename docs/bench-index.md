@@ -55,10 +55,13 @@ prints the plan without loading data or calling a model — no key needed.
 
 ## Environment notes
 
-- **`$HOME` must be writable.** `agentdescent/dataloader.py` caches datasets
-  under `~/.cache/agentdescent`, so on a box with a read-only `$HOME` even
-  `--help` fails for a module that loads a dataset at import time. Point `HOME`
-  at a scratch directory for those runs.
+- **The cache root must be writable.** `agentdescent/dataloader.py` caches
+  datasets under `$XDG_CACHE_HOME/agentdescent` (default
+  `~/.cache/agentdescent`), so on a box with a read-only `$HOME` even `--help`
+  fails for a module that loads a dataset at import time. Point
+  `AGENTDESCENT_CACHE` at a scratch directory (or set `XDG_CACHE_HOME`) for
+  those runs — prefer that to moving `HOME`, which also moves the Python user
+  site and can hide the packages installed there.
 - **`bench/candidate_methods.py` and `bench/candidate_methods_merge.py` load
   GSM8K at import.** They build their algorithm registry when the module is
   imported, so `--help` needs the data too. With no network and no `pyarrow`,

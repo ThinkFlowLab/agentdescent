@@ -19,6 +19,9 @@ jobs:
     # tests such as test_era_algotune's reference speedup measured 0.07x there.
     # Move this deliberately, with the matrix, when 3.9 support is dropped.
     runs-on: ubuntu-24.04
+    # 3.9 is the slowest leg: 30m12s observed max (run 45002962476), two more
+    # at 29m54s -- a 30-minute bound would cancel a legitimate green run.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +52,7 @@ jobs:
     # nothing listens on: the refusal must be logged and contained, never raised
     # out of `export_run`, and a real export must still return its count.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0

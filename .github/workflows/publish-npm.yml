@@ -30,7 +30,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     environment: npm
     permissions:
       contents: read           # job-level permissions replace the workflow block

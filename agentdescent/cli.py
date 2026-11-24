@@ -2455,10 +2455,58 @@ def _declared_cap(spec: Any) -> Tuple[bool, Optional[int]]:
     return False, None
 
 
+def _advised_cap(calls: Any, declared: Optional[Tuple[bool, Optional[int]]],
+                 enforced: Optional[int]) -> Tuple[Optional[int], bool]:
+    """``(the call cap the advice names, whether the ceiling lowered it)``.
+
+    Three numbers compete for the one ``--max-calls`` the advice can print: the
+    structural bound (``estimate.agent_calls_upper_bound``), the cap the spec
+    already declares (#1219: never raise a user's own number) and the operator
+    ceiling ``AGENTDESCENT_MAX_CALLS``, which ``runstore.launch`` clamps every
+    run to and which the MCP ``start`` spends per Ticket (#1082, #1252). The
+    smallest wins: a larger number is one the first run following the advice
+    will not honour.
+
+    ``None`` means the advice has no number of its own -- the ``<N>``
+    placeholder when nothing bounds the run. A declared *dollar* cap is the
+    other such case: the advice prints no ``--max-calls`` at all for it (an
+    explicit flag would replace the whole ``CallLimit`` and drop that cap), so
+    it also gets no call warning.
+    """
+    declared_flag, declared_calls = declared or (False, None)
+    if declared_flag and declared_calls is None:
+        return None, False
+    bound = (int(calls) if isinstance(calls, (int, float))
+             and not isinstance(calls, bool) and calls > 0 else None)
+    number = bound
+    if declared_flag:
+        number = (declared_calls if bound is None
+                  else min(bound, declared_calls))
+    if enforced is None:
+        return number, False
+    if number is None or enforced < number:
+        return int(enforced), True
+    return number, False
+
+
+def _ceiling_warning(enforced: int, calls: Any) -> str:
+    """The ``warning:`` naming the cap the operator ceiling enforces (#1252).
+
+    One sentence for both surfaces: ``--json.warnings`` carries it and the human
+    form prints it as ``warning: …`` on stderr, like every other plan warning.
+    """
+    line = (f"{runstore.OPERATOR_MAX_CALLS_ENV}={enforced} caps this run at "
+            f"{enforced} call{'s' if enforced != 1 else ''}")
+    if isinstance(calls, (int, float)) and not isinstance(calls, bool) and calls > 0:
+        line += f"; the plan estimates {int(calls)}"
+    return line
+
+
 def _capped_evolve_next(spec_path: str, calls: Any, *,
                         already_probed: bool = False,
                         extra_flags: str = "",
-                        declared: Optional[Tuple[bool, Optional[int]]] = None) -> str:
+                        declared: Optional[Tuple[bool, Optional[int]]] = None,
+                        enforced: Optional[int] = None) -> str:
     """The first-run ``next:`` line: preflight, then evolve with a per-call cap.
 
     #1201 / #1217: a new user or host following ``next`` must see
@@ -2470,19 +2518,17 @@ def _capped_evolve_next(spec_path: str, calls: Any, *,
     #1219: when the spec declares its own cap, the advice may not raise it --
     ``min(bound, declared)``, or no flag at all for a dollar cap the command
     line cannot express in calls.
+
+    #1252: ``enforced`` is the operator ceiling the run will be clamped to, so
+    the advice may not name a number above it either (``_advised_cap``).
     """
     declared_flag, declared_calls = declared or (False, None)
-    if not declared_flag:
-        cap = (f" --max-calls {int(calls)}"
-               if isinstance(calls, (int, float)) and calls > 0
-               else " --max-calls <N>")
-    elif declared_calls is None:
+    if declared_flag and declared_calls is None:
         cap = ""
     else:
-        number = declared_calls
-        if isinstance(calls, (int, float)) and calls > 0:
-            number = min(int(calls), declared_calls)
-        cap = f" --max-calls {number}"
+        number, _ = _advised_cap(calls, declared, enforced)
+        cap = (f" --max-calls {number}" if number is not None
+               else " --max-calls <N>")
     evolve = f"agentdescent evolve {spec_path}{extra_flags}{cap}"
     if already_probed:
         return evolve
@@ -2639,6 +2685,20 @@ def cmd_plan(a: argparse.Namespace) -> int:
         # human `error: ...` line on stderr as a spec that does not compile (#553).
         print(f"error: {payload.get('error', 'plan failed')}", file=sys.stderr)
         return 2
+    # #1252: `evolve` will not spend more than the operator ceiling, so the
+    # advice may not name a cap above it. Read it before the opt-in probe: a
+    # ceiling `evolve` refuses is not worth a paid call to discover.
+    try:
+        enforced = runstore.operator_max_calls()
+    except runstore.RunStoreError as e:
+        # A malformed ceiling is the config answer `evolve` would raise, not a
+        # traceback out of `plan` -- the same `{"ok": false, "error": …}` a spec
+        # that does not compile already gets (#551).
+        if a.json:
+            _out({"ok": False, "error": str(e)}, as_json=True)
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
     probe = _probe_if_asked(a, spec) if payload.get("ok", True) else None
     # Default next names the preflight and the per-call cap (#1217);
     # a refused probe replaces it with the repair action so a reader
@@ -2652,9 +2712,14 @@ def cmd_plan(a: argparse.Namespace) -> int:
         for param in getattr(a, "param", None) or []:
             extra_flags += f" --param {param}"
     calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
+    declared = _declared_cap(spec)
+    # The human form and `--json` carry the same warning list; say which number
+    # the ceiling enforces only when it lowers what the advice would name.
+    if _advised_cap(calls, declared, enforced)[1]:
+        payload["warnings"].append(_ceiling_warning(enforced, calls))
     next_line = _capped_evolve_next(
         a.spec, calls, already_probed=False, extra_flags=extra_flags,
-        declared=_declared_cap(spec))
+        declared=declared, enforced=enforced)
     then_line = None
     probe_refused = False
     if probe is not None:
@@ -2677,7 +2742,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
             # only (#1217). A refusal keeps the repair + `then:` above.
             next_line = _capped_evolve_next(
                 a.spec, calls, already_probed=True, extra_flags=extra_flags,
-                declared=_declared_cap(spec))
+                declared=declared, enforced=enforced)
     # `--baseline-sample` spends real calls, so it runs last: a broken spec or a
     # refused probe must not first pay for N rollouts (#1113). The sample's own
     # call count is printed before the first one; it is opt-in, and plain `plan`

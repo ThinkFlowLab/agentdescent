@@ -966,6 +966,14 @@ class Tools:
             # What `start` would enforce, so the host can show the number the
             # user is agreeing to -- and the clamped one when a ceiling binds.
             payload["call_limit"] = limit
+            # #1252: a spent Ticket has nothing left to grant, and `start`
+            # refuses it in one sentence. Answering `ok: true` with
+            # `max_calls: 0` described a run the same call cannot launch, so
+            # return that refusal -- the same bytes `start` gives, `call_limit`
+            # included, or the two surfaces disagree about what was refused.
+            ticket = limit.get("ticket") or {}
+            if ticket.get("remaining") == 0:
+                return self._ticket_refusal(ticket, limit)
         if not probe or not payload.get("ok", True):
             return payload
         return _with_probe(payload, es)

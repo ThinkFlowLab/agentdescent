@@ -45,8 +45,17 @@ def _has_main(path: Path) -> bool:
 
 
 def runnable_modules() -> set[str]:
-    """Every ``bench/*.py`` that can be invoked as ``python -m bench.<name>``."""
-    return {path.stem for path in BENCH_DIR.glob("*.py") if _has_main(path)}
+    """Every ``bench/*.py`` that can be invoked as ``python -m bench.<name>``.
+
+    ``_``-prefixed files are skipped: ``__init__`` is the package and
+    ``__main__`` is the entry point behind ``python -m bench``, which is not a
+    module a row can name (``tests/test_bench_main.py`` pins that same set).
+    """
+    return {
+        path.stem
+        for path in BENCH_DIR.glob("*.py")
+        if not path.name.startswith("_") and _has_main(path)
+    }
 
 
 def listed_modules() -> set[str]:

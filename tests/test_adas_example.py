@@ -340,3 +340,34 @@ def test_a_missing_score_prints_as_missing():
     assert fmt_score(0.4375).strip() == "0.438"
     assert fmt_score(None).strip() == "n/a"
     assert len(fmt_score(None)) == len(fmt_score(0.5))    # column stays aligned
+
+
+def test_hard_cache_uses_dataset_cache_root(tmp_path, monkeypatch):
+    """#1273: the ADAS hard-subset cache follows AGENTDESCENT_CACHE."""
+    import hashlib
+
+    from examples.adas.adas_meta_agent_search import _HardCache
+
+    root = tmp_path / "cache"
+    monkeypatch.setenv("AGENTDESCENT_CACHE", str(root))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    model = "dummy-model"
+    cache = _HardCache(model, enabled=True)
+    key = hashlib.sha256(model.encode()).hexdigest()[:12]
+    expected = root / "mgsm" / "hard" / f"direct_{key}.json"
+    assert cache.path == str(expected)
+    assert expected.parent.is_dir()
+
+
+def test_hard_cache_disabled_does_not_create_a_directory(tmp_path, monkeypatch):
+    """#1273: a disabled hard cache must not mkdir, matching today's behaviour."""
+    from examples.adas.adas_meta_agent_search import _HardCache
+
+    root = tmp_path / "cache"
+    monkeypatch.setenv("AGENTDESCENT_CACHE", str(root))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    cache = _HardCache("dummy-model", enabled=False)
+    assert cache.path == ""
+    assert not (root / "mgsm").exists()

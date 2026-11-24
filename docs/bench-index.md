@@ -47,7 +47,7 @@ the run prints its plan and stops.
 ### Which key
 
 `--provider openai` and `--provider glm` read `OPENAI_API_KEY`; `--provider
-claude` reads `ANTHROPIC_API_KEY` (`agentdescent/backends.py`). Two modules
+claude` reads `ANTHROPIC_API_KEY` (`agentdescent/agents.py:737`). Two modules
 check the key themselves before spending anything: `bench/candidate_methods.py`
 and `bench/openevolve_agentdescent.py` raise `set OPENAI_API_KEY` for
 `openai`/`glm`. The two `metasearch_*` modules also take `--dry-run`, which

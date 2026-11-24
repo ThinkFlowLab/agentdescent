@@ -18,10 +18,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests._workflows import workflow_files
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github" / "scripts"
 WORKFLOW = ROOT / ".github" / "workflows" / "controller.yml"
-WORKFLOWS = ROOT / ".github" / "workflows"
+WORKFLOWS = workflow_files(ROOT)
 CONFIG = json.loads((ROOT / ".github" / "agent" / "controller.json").read_text())
 # A `pull_request` run on a fork head gets a read-only GITHUB_TOKEN, so neither
 # job may run for it: `plan` would hand `apply` a live plan it cannot carry out.
@@ -311,7 +313,7 @@ def test_a_fork_head_never_reaches_the_label_jobs():
 
 def test_no_workflow_uses_pull_request_target():
     offenders = []
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+    for path in WORKFLOWS:
         wf = yaml.safe_load(path.read_text(encoding="utf-8"))
         on = wf.get("on", wf.get(True)) or {}
         if "pull_request_target" in on:

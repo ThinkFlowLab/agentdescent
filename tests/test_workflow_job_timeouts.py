@@ -27,8 +27,10 @@ from pathlib import Path
 
 import pytest
 
+from tests._workflows import workflow_files
+
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+WORKFLOWS = workflow_files(ROOT)
 
 # workflow:job -> minutes, the whole repository. Raise a value only with the
 # measurement that justifies it.

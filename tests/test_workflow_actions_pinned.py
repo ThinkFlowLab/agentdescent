@@ -1,6 +1,6 @@
 """Workflow actions must be pinned to a commit, not to a moving ref.
 
-Every ``uses:`` in ``.github/workflows/*.yml`` is a supply-chain input: ``@v4``
+Every ``uses:`` in ``.github/workflows/*.yml`` / ``*.yaml`` is a supply-chain input: ``@v4``
 and ``@release/v1`` are mutable refs, so whoever can move the tag or branch
 decides what our CI executes -- with ``id-token: write`` on the publish jobs,
 that includes the OIDC token and the PyPI/npm upload.  Pinning to a 40-hex
@@ -17,8 +17,10 @@ from pathlib import Path
 
 import yaml
 
+from tests._workflows import workflow_files
+
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+WORKFLOWS = workflow_files(ROOT)
 
 USES = re.compile(r"^[ \t]*(?:-[ \t]*)?uses:[ \t]*[\"']?([^\"'#\s]+)")
 COMMIT = re.compile(r"[0-9a-f]{40}")

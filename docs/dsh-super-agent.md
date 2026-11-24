@@ -24,7 +24,7 @@ the shortest path from a fresh checkout to one offline pilot run from a
   `command: agentdescent`, `args: ["mcp"]`, `transport: stdio`, a 120000 ms
   tool-call timeout, and an explicit env allowlist because dsh scrubs
   `KEY|PASSWORD|SECRET|TOKEN` from the ambient environment
-  (`integrations/dsh-agentdescent/cordis.patch.yml:8-26`).
+  (`integrations/dsh-agentdescent/cordis.patch.yml:7-17`).
 
 Rows are `insert`ed, not overridden: a bare row would be read as an override of
 an id that does not exist and dsh composes without it — the same trap the file's

@@ -317,6 +317,23 @@ def test_cancel_kills_the_run_and_its_workers(store, tmp_path):
     assert not [l for l in out.splitlines() if "time.sleep(60)" in l], out
 
 
+def test_cancel_clears_a_pending_call(store, tmp_path):
+    # A run cancelled mid-call keeps `pending_calls` set in its last write; a
+    # cancelled run that keeps it would hold a phantom charge against its MCP
+    # Ticket forever, because the Ticket counts a call in flight as spent
+    # (#1082). Its own session, so `cancel` kills the child and not the suite.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             start_new_session=True)
+    try:
+        rd = runstore.create(_spec_file(tmp_path)[1].to_dict(), store=store)
+        rd.update_status(state="running", pid=child.pid, calls=1, pending_calls=1)
+        st = runstore.cancel(rd.run_id, store=store, grace=2.0)
+    finally:
+        child.wait(10)
+    assert st.state == "cancelled", st
+    assert st.pending_calls == 0, st
+
+
 def test_resume_continues_on_the_same_ledger(store, tmp_path):
     _, spec = _spec_file(tmp_path)
     rd = runstore.create(spec.to_dict(), store=store)

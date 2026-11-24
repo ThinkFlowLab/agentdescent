@@ -33,6 +33,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import warnings
@@ -1621,46 +1622,98 @@ def _refuse_blocked_parent(dest: str) -> None:
 
 
 def _refuse_blocked_leaf(path: str) -> None:
-    """Refuse a write whose leaf already exists as a directory (#1223).
+    """Refuse a write whose leaf already exists as anything but a regular file.
 
     ``_refuse_blocked_parent`` catches a regular file sitting on an intermediate
-    path. The inverse is a directory sitting where the artifact wants a file:
-    ``dest`` is valid, ``dest/alpha`` is a directory, and the tree writes
-    ``alpha``. ``show --diff`` and ``apply --dry-run`` then advertised the leaf
-    as ``written`` while the real ``apply`` died at ``open`` with
+    path. The inverse is a directory sitting where the artifact wants a file
+    (#1223): ``dest`` is valid, ``dest/alpha`` is a directory, and the tree
+    writes ``alpha``. ``show --diff`` and ``apply --dry-run`` then advertised
+    the leaf as ``written`` while the real ``apply`` died at ``open`` with
     ``cannot write <dest>: Is a directory`` -- the tree root, not the blocking
     leaf. ``apply --from`` was worse: ``shutil.copy2`` nested the bytes at
     ``dest/alpha/alpha`` and reported success.
 
+    The same test one object type over is a FIFO, a socket or a device (#1225):
+    the previews planned the write, the backup copy died inside ``shutil``, and
+    ``apply --no-backup`` blocked forever in ``open(..., "w")`` after rewriting
+    the leaves that sort before it. ``os.lstat`` + ``S_ISREG`` covers all of
+    them, and the suffix names the kind the caller has to remove.
+
     Called from ``_check_apply_paths`` on every path in ``written`` (not on
     ``dest`` itself: a tree root *is* a directory). A symlink at the leaf is
-    left to ``_refuse_dest_link`` / ``dest_problem``; this helper names only a
-    real directory.
+    ``_refuse_link_in_dest``'s job: this helper skips one, so the refusal
+    cannot pre-empt that rule.
     """
-    if os.path.lexists(path) and not os.path.islink(path) and os.path.isdir(path):
-        from . import runstore  # runstore imports this module at import time
+    if not os.path.lexists(path) or os.path.islink(path):
+        return
+    from . import runstore  # runstore imports this module at import time
 
+    if os.path.isdir(path):
         raise runstore.RunStoreError(
             f"cannot write {path}: {path!r} is a directory, not a file")
+    mode = os.lstat(path).st_mode
+    if stat.S_ISREG(mode):
+        return
+    from .filetree import _entry_kind
+
+    raise runstore.RunStoreError(
+        f"cannot write {path}: {path!r} is {_entry_kind(mode)}")
+
+
+def _refuse_link_in_dest(dest: str, path: str) -> None:
+    """Refuse a produced path a link in the destination would redirect (#1230).
+
+    ``_refuse_blocked_parent`` treats a link to a directory as a directory and
+    ``_refuse_blocked_leaf`` deliberately skips links, so a link planted inside
+    the tree was the one leaf of this walk the preview did not see: ``show
+    --diff`` and ``apply --dry-run`` advertised ``written`` while
+    ``materialize`` refused at write time with a ``TreeError`` -- an uncaught
+    traceback, not the exit-2 JSON refusal the other leaves return.
+
+    The rule is ``filetree.dest_problem``, the one ``materialize`` enforces, so
+    the two cannot drift. A text artifact passes ``[dest]`` here and its link
+    refusals run before this funnel; ``path == dest`` is therefore skipped.
+    """
+    if os.path.abspath(path) == os.path.abspath(dest):
+        return
+    from .filetree import dest_problem
+
+    problem = dest_problem(dest, path)
+    if problem is not None:
+        from . import runstore  # runstore imports this module at import time
+
+        raise runstore.RunStoreError(f"cannot write {path}: {problem}")
 
 
 def _check_apply_paths(dest: str, written: Sequence[str], backup: Optional[str],
                        check_write: Optional[Callable[[str, str], Any]]) -> None:
     """Check the selected write set before any artifact or backup is changed.
 
-    The blocked-parent and blocked-leaf refusals run before the operator
-    allowlist guard: they are a property of the filesystem, not of who is
-    writing, so ``show`` and ``--dry-run`` see them even when
+    The blocked-parent, blocked-leaf and destination-link refusals run before
+    the operator allowlist guard: they are a property of the filesystem, not of
+    who is writing, so ``show`` and ``--dry-run`` see them even when
     ``AGENTDESCENT_SURFACE_WRITE_DIRS`` is unset. The helper covers ``dest``
     and every path in ``written`` (tree children included): a regular file
     sitting at an intermediate path blocks a leaf the same way a file sitting
-    at the destination's parent does (#1221, #1208), and a directory already
-    sitting at a written leaf is refused the other way around (#1223).
+    at the destination's parent does (#1221, #1208), a directory already
+    sitting at a written leaf is refused the other way around (#1223), and a
+    link at a leaf or on the way to one is refused by the writer's own rule
+    (#1230).
+
+    The backup slot is on that list because it is a path the walk writes and
+    it is not always beside ``dest``: a text artifact's ``.bak-N`` is, but a
+    tree's copy lives under ``$AGENTDESCENT_HOME/backups`` (#758), so a file
+    sitting at that root passed both previews and then failed the real write
+    with the errno of the *backup* printed against ``dest`` -- a destination
+    that is a perfectly good directory (#1226).
     """
     _refuse_blocked_parent(dest)
     for path in written:
         _refuse_blocked_parent(path)
         _refuse_blocked_leaf(path)
+        _refuse_link_in_dest(dest, path)
+    if backup is not None:
+        _refuse_blocked_parent(backup)
     if check_write is not None:
         check_write(dest, "to")
         for path in written:

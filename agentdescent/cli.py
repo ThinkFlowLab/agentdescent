@@ -3890,9 +3890,9 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
                             "source": src, "dest": dest}
     # Every leaf, before the backup is taken: a link planted in --to must not
     # redirect the `.bak-N` copy either, or the backup holds the target's
-    # bytes inside a directory host scanners read (#977).
-    for rel in changed:
-        _refuse_dest_link(dest, os.path.join(dest, rel.replace("/", os.sep)))
+    # bytes inside a directory host scanners read (#977). The funnel below owns
+    # that rule now (`_refuse_link_in_dest`, #1230), so this surface and
+    # `apply <run_id>` name the same block with the same sentence.
     slot = (_file_tree_backup_path(dest)
             if backup and not plan["noop"] and os.path.isdir(dest) else None)
     _check_apply_paths(dest, [os.path.join(dest, rel.replace("/", os.sep))

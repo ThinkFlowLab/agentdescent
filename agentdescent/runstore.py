@@ -112,6 +112,19 @@ OPERATOR_MAX_CALLS_ENV = "AGENTDESCENT_MAX_CALLS"
 #: for exactly this". Label only: it never changes what is enforced.
 OPERATOR_MAX_CALLS_REQUESTED_ENV = "AGENTDESCENT_MAX_CALLS_REQUESTED"
 
+#: The remainder a Ticket left, carried across the detach boundary (#1241).
+#: A Ticket that already spent part of the ceiling launches the next run
+#: *below* the ceiling, and there the applied value never equals the ceiling, so
+#: the requested-value rule below cannot see that the ceiling bound it: the run
+#: printed the same bare ``cap N`` as a caller who asked for that very number.
+#: The value is ``<run id>:<n>`` -- the number the parent applied, scoped to the
+#: run it applied it to. Only a process that inherited the variable from an
+#: ancestor's launch can see a marker naming another run, and that mismatch is
+#: what stops it: a self-consistent ``requested``/``remainder`` pair looks
+#: exactly like a clamped child from the numbers alone. Label only: it changes
+#: nothing enforced.
+OPERATOR_MAX_CALLS_REMAINDER_ENV = "AGENTDESCENT_MAX_CALLS_REMAINDER"
+
 
 def operator_max_calls(environ: Optional[Mapping[str, str]] = None
                        ) -> Optional[int]:
@@ -150,12 +163,43 @@ def _requested_calls() -> Tuple[Optional[int], bool]:
     return (value, True) if value >= 0 else (None, False)
 
 
-def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
+def _remainder_calls(run_id: Optional[str] = None
+                     ) -> Tuple[Optional[int], bool]:
+    """``(the remainder the parent applied to this run, whether it recorded one)``.
+
+    Label only, like :func:`_requested_calls`: a malformed value is ignored
+    rather than refused, because the child already started with its argv and
+    this must not change anything but the wording of ``stop_detail``.
+
+    The value is run-scoped (``<run id>:<n>``) because the variable is inherited,
+    not scoped: a process that was itself launched below its ceiling passes it
+    to every later child, and the numbers alone cannot tell that copy from a
+    real handoff -- a stale ``requested``/``remainder`` pair is self-consistent.
+    A value naming another run, or carrying no scope at all, is not evidence
+    about this one (#1241).
+    """
+    raw = os.environ.get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
+    if raw is None:
+        return None, False
+    scope, sep, tail = str(raw).strip().partition(":")
+    if not sep or run_id is None or scope != run_id:
+        return None, False
+    try:
+        value = int(tail.strip())
+    except ValueError:
+        return None, False
+    return (value, True) if value >= 0 else (None, False)
+
+
+def _clamped_max_calls(max_calls: Optional[int],
+                       run_id: Optional[str] = None
+                       ) -> Tuple[Optional[int], bool]:
     """``(max_calls, whether the operator's ceiling is what bound it)`` (#1082).
 
     In the detached child ``max_calls`` is already the clamped argv value, so
     the parent's record of what the caller asked for is what decides whether
-    the ceiling bound the run.
+    the ceiling bound the run. ``run_id`` scopes the Ticket remainder to the run
+    it was applied to (#1241).
     """
     cap = operator_max_calls()
     if cap is None:
@@ -163,6 +207,15 @@ def _clamped_max_calls(max_calls: Optional[int]) -> Tuple[Optional[int], bool]:
     if max_calls is None or cap < max_calls:
         return cap, True
     requested, present = _requested_calls()
+    remainder, remainder_present = _remainder_calls(run_id)
+    if (remainder_present and max_calls is not None
+            and max_calls == remainder and max_calls < cap
+            and present and (requested is None or requested > max_calls)):
+        # The Ticket's remainder lowered the caller's number, so the ceiling
+        # bound this run even though the applied value is below it (#1241).
+        # The remainder names this run, so an inherited copy -- which names the
+        # ancestor it was applied to -- cannot label a run of its own.
+        return max_calls, True
     # The label follows the clamp, not the variable: only a run whose applied
     # value *is* the ceiling can say the ceiling bound it, so a hand-set or
     # stale request cannot blame a ceiling that never bit (#1082).
@@ -754,10 +807,16 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     Its stdout and stderr go to ``log.txt``.
     """
     requested_calls = max_calls
-    max_calls, operator_bound = _clamped_max_calls(max_calls)
     require_budget_pair(budget_usd, usd_per_call)
     from .evolvespec import SpecError, build_call_limit
+    # #1196 pins that the unpriced-dollar refusal lands before ``launch``
+    # dereferences the run at all, and since #1241 the clamp reads ``rd.run_id``.
+    # So the dollar pair is refused on the raw arguments first, and the cap
+    # itself is validated after the clamp, on the value that actually applies --
+    # as at base, where a float cap above the ceiling clamped down and ran.
     try:
+        build_call_limit(max_usd=max_usd, usd_per_call=usd_per_call)
+        max_calls, operator_bound = _clamped_max_calls(max_calls, rd.run_id)
         build_call_limit(max_calls=max_calls, max_usd=max_usd,
                          usd_per_call=usd_per_call)
     except SpecError as e:
@@ -782,6 +841,19 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # prefix, so it survives either way.
     child_env = scrub_host_env({**os.environ, "PYTHONPATH": _child_pythonpath(),
                                 **(env or {})})
+    # The remainder marker is inherited, not scoped: a process that was itself
+    # launched below its ceiling would hand that number to every later child,
+    # and a caller who legitimately asks for exactly that number would be
+    # labelled ceiling-clamped (#1241). The scrub keeps ``AGENTDESCENT_*`` (that
+    # is why the requested value works), so this one is dropped here and only
+    # restored from the ``env`` this launch was given -- which is how the MCP
+    # server says "this launch is a remainder" -- and restored naming *this*
+    # run, because only this launch knows the id the number was applied to.
+    wanted_remainder = (env or {}).get(OPERATOR_MAX_CALLS_REMAINDER_ENV)
+    child_env.pop(OPERATOR_MAX_CALLS_REMAINDER_ENV, None)
+    if wanted_remainder is not None:
+        child_env[OPERATOR_MAX_CALLS_REMAINDER_ENV] = (
+            f"{rd.run_id}:{wanted_remainder}")
     if operator_bound:
         # After the scrub, so it survives; label only, nothing here is enforced.
         child_env[OPERATOR_MAX_CALLS_REQUESTED_ENV] = (
@@ -816,7 +888,11 @@ def cancel(run_id: str, *, store: Optional[str] = None, grace: float = 5.0) -> R
     st = rd.status()
     if st.pid is None or not st.alive():
         if st.state == "running":
-            st = rd.update_status(state="cancelled", finished=time.time())
+            # Clear `pending_calls` with the state: a cancelled run that kept a
+            # call in flight would hold a phantom charge against its Ticket
+            # forever (#1082).
+            st = rd.update_status(state="cancelled", finished=time.time(),
+                                  pending_calls=0)
         return st
     pgid = None
     try:
@@ -830,7 +906,7 @@ def cancel(run_id: str, *, store: Optional[str] = None, grace: float = 5.0) -> R
     if st.alive():
         _signal(st.pid, pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
     return rd.update_status(state="cancelled", finished=time.time(),
-                            stop_reason="cancelled")
+                            stop_reason="cancelled", pending_calls=0)
 
 
 def _signal(pid: int, pgid: Optional[int], sig: int) -> None:
@@ -915,7 +991,7 @@ def execute(rd: RunDir, *, budget_usd: Optional[float] = None,
     # live run that later "ended without reporting".
     try:
         require_budget_pair(budget_usd, usd_per_call)
-        max_calls, operator_bound = _clamped_max_calls(max_calls)
+        max_calls, operator_bound = _clamped_max_calls(max_calls, rd.run_id)
     except RunStoreError as e:
         rd.update_status(state="failed", finished=time.time(), error=str(e)[:2000])
         raise

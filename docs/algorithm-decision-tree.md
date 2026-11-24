@@ -38,7 +38,7 @@ the non-evoskill card:
 ```bash
 agentdescent init ./my-skills --kind skill_library \
   --data cases.jsonl --algorithm archive_selection --out spec.json
-agentdescent plan spec.json
+agentdescent plan spec.json --probe
 ```
 
 (`demo --algorithm archive_selection` is still a **skill_dir** offline smoke.)

@@ -9,9 +9,9 @@ funnel that names a blocked leaf (``_check_apply_paths``) runs later and on the
 
 Measured on ``main`` at ``22ea7528``: a FIFO at
 ``src/references/rules.md`` with a regular file at the same rel in ``--to``
-under a 15 s ceiling gives rc=124, and the stack ends in ``_same``.
+under a 60 s ceiling gives rc=124, and the stack ends in ``_same``.
 
-The rows that can block run out of process under a ``timeout 20`` ceiling, and
+The rows that can block run out of process under a ``timeout 60`` ceiling, and
 rc 124 is the red: a regression fails as a killed child inside the test's own
 ceiling instead of hanging CI until the platform kills the job.
 
@@ -35,11 +35,14 @@ import pytest
 
 #: This checkout, so the child imports the tree under test, not an install.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-#: The child's own ceiling. A blocked ``open`` never returns; the ceiling does.
-CEILING = 20
-#: When the child dumps its stack. Chosen so it fires inside the ceiling while
-#: still leaving room for interpreter start plus imports (~1 s measured).
-DUMP_AFTER = 12
+#: The child's own ceiling: a cold start plus fixture build can cross 20 s on a
+#: loaded box, so a refusal row would die as a false ``rc=124``. A blocked
+#: ``open`` still never returns; the ceiling does.
+CEILING = 60
+#: When the child dumps its stack. It fires inside the ceiling so a real hang
+#: yields a stack before the kill, while a cold start plus fixture build stays
+#: far below it; 45 s leaves 15 s before the 60 s ceiling.
+DUMP_AFTER = 45
 TIMEOUT = shutil.which("timeout")
 CHILD = (
     "import faulthandler, sys; "

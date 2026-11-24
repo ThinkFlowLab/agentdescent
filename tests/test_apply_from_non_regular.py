@@ -28,6 +28,8 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -130,22 +132,37 @@ def test_a_fifo_in_the_source_is_named_by_the_real_run(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX socket")
-def test_a_socket_in_the_source_is_named(tmp_path):
-    src, dest = _two_trees(tmp_path)
-    sock_path = str(src / "references" / "rules.md")
-    os.unlink(sock_path)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.bind(sock_path)
-        try:
-            proc = _run_capped(["--json", "apply", "--from", str(src),
-                                "--to", str(dest), "--dry-run"])
-            _assert_returned(proc, "apply --from with a socket source")
-        finally:
-            s.close()
-    assert proc.returncode == 2, proc.stdout + proc.stderr
-    doc = json.loads(proc.stdout)
-    assert doc["ok"] is False
-    assert "'references/rules.md' is a socket" in doc["error"], doc["error"]
+def test_a_socket_in_the_source_is_named(tmp_path, monkeypatch):
+    # ``sun_path`` caps a bind at 108 bytes and ``tmp_path`` rides on TMPDIR, so
+    # a long TMPDIR pushes ``src/references/rules.md`` over the cap before the
+    # product is exercised (#1245). Build this row under a short root when the
+    # fixture's path is long; the refusal under test is unchanged.
+    relocated = len(str(tmp_path / "src" / "references" / "rules.md")) > 100
+    if relocated and not os.path.isdir("/tmp"):
+        pytest.skip("AF_UNIX leaf path exceeds sun_path and there is no short /tmp")
+    root = Path(tempfile.mkdtemp(prefix="ad-sock-", dir="/tmp")) if relocated else tmp_path
+    if relocated:
+        monkeypatch.setenv("AGENTDESCENT_SURFACE_WRITE_DIRS",
+                           ",".join((str(tmp_path), str(root))))
+    try:
+        src, dest = _two_trees(root)
+        sock_path = str(src / "references" / "rules.md")
+        os.unlink(sock_path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.bind(sock_path)
+            try:
+                proc = _run_capped(["--json", "apply", "--from", str(src),
+                                    "--to", str(dest), "--dry-run"])
+                _assert_returned(proc, "apply --from with a socket source")
+            finally:
+                s.close()
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        doc = json.loads(proc.stdout)
+        assert doc["ok"] is False
+        assert "'references/rules.md' is a socket" in doc["error"], doc["error"]
+    finally:
+        if relocated:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX character device")

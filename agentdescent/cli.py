@@ -43,6 +43,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -3348,15 +3349,18 @@ def show_payload(run_id: str, *, store: Optional[str] = None, diff: bool = True,
     if spec.kind == "text":
         payload["rendered"] = result.rendered[:max_chars]
         dest = os.path.expanduser(spec.target)
-        plan = _text_plan(dest, result.rendered)
-        payload["apply_plan"] = plan
-        # Directory and symlink refusals apply makes first (#1204, #755, #977).
-        # Catch them so the preview stays read-only and exits 0.
+        # Directory, symlink and non-regular refusals apply makes before it
+        # reads the destination (#1204, #755, #977, #1248). They run *before*
+        # `_text_plan`, because planning opens `dest`: a FIFO there blocked the
+        # preview forever instead of naming what to remove. Caught so the
+        # preview stays read-only and exits 0.
         try:
             _refuse_text_dest(run_id, dest)
         except runstore.RunStoreError as e:
             payload["apply_plan"] = {"error": str(e)}
             return payload
+        plan = _text_plan(dest, result.rendered)
+        payload["apply_plan"] = plan
         _refuse_plan_outside_write_dirs(
             payload, dest, plan["written"],
             _backup_slot(dest) if not plan["noop"] and os.path.exists(dest) else None)
@@ -3678,13 +3682,18 @@ def apply_with_target(run_id: Optional[str] = None, *, to: Optional[str] = None,
 
 
 def _refuse_text_dest(run_id: str, dest: str) -> None:
-    """Refuse a text destination ``apply`` would also refuse (#1204, #755, #977).
+    """Refuse a text destination ``apply`` would also refuse (#1204, #755, #977, #1248).
 
     A directory cannot receive a single text artifact (the dry run used to
     report it would write the directory, then apply traced back on
     ``IsADirectoryError``), and a destination link is never dereferenced.
     ``show_payload`` calls the same helper so the preview cannot drift from
     the write; the message bytes are unchanged.
+
+    The third shape is anything ``open`` cannot treat as a file (#1248): a FIFO
+    blocks there until a writer appears -- forever, when none does -- and a
+    socket or a device fails with ``ENXIO``. Every surface plans the write by
+    opening the destination first, so the refusal has to come before that read.
     """
     if os.path.isdir(dest):
         raise runstore.RunStoreError(
@@ -3692,6 +3701,32 @@ def _refuse_text_dest(run_id: str, dest: str) -> None:
             "directory; pass --to FILE to write it to a file, or read it "
             "with `show`")
     _refuse_dest_link(os.path.dirname(os.path.abspath(dest)) or os.sep, dest)
+    _refuse_non_regular_text_dest(dest)
+
+
+def _refuse_non_regular_text_dest(dest: str) -> None:
+    """Refuse a text destination that exists as anything but a regular file (#1248).
+
+    ``_text_plan`` decides ``unchanged`` by opening ``dest``, so a FIFO at
+    ``target`` blocked ``show``, ``show --diff``, ``apply --dry-run`` and
+    ``apply`` before any refusal could run, and ``apply --from <file> --to
+    <fifo>`` blocked the same way with no text-destination refusal at all.
+
+    The rule is the one ``_refuse_blocked_leaf`` applies to a tree leaf -- skip
+    links (the link rule owns those, so its sentence cannot be pre-empted),
+    skip a missing path (apply creates it), and name the kind the caller has to
+    remove -- with the same sentence bytes, so one object type is named one way
+    on both writers.
+    """
+    if not os.path.lexists(dest) or os.path.islink(dest):
+        return
+    mode = os.lstat(dest).st_mode
+    if stat.S_ISREG(mode):
+        return
+    from .filetree import _entry_kind
+
+    raise runstore.RunStoreError(
+        f"cannot write {dest}: {dest!r} is {_entry_kind(mode)}")
 
 
 def _refuse_dest_link(top: str, path: str) -> None:
@@ -3859,6 +3894,10 @@ def apply_from_payload(source: str, *, to: str, dry_run: bool = False,
         except (OSError, UnicodeDecodeError) as e:
             raise runstore.RunStoreError(f"cannot read {src}: {e}") from None
         _refuse_dest_link(os.path.dirname(dest) or os.sep, dest)
+        # `_text_plan` opens `dest` to decide `unchanged`, so a FIFO there
+        # blocked this surface before any refusal ran (#1248). Same rule and
+        # same sentence as `apply <run_id>`; a directory is refused above.
+        _refuse_non_regular_text_dest(dest)
         plan = _text_plan(dest, rendered)
         slot = (_backup_slot(dest)
                 if backup and not plan["noop"] and os.path.exists(dest) else None)

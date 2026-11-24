@@ -35,11 +35,11 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Optional
 
 from agentdescent.agents import Usage, claude, openai_compatible
+from agentdescent.dataloader import cache_path
 from agentdescent.evolution import AppendRules, LLMAgent, Task, evolve
 from agentdescent.parallel import DataParallel
 
 BBH_URL = "https://raw.githubusercontent.com/suzgunmirac/BIG-Bench-Hard/main/bbh/{task}.json"
-CACHE_DIR = os.path.expanduser("~/.cache/agentdescent/bbh")
 
 
 # -- dataset loading ---------------------------------------------------------
@@ -47,8 +47,7 @@ CACHE_DIR = os.path.expanduser("~/.cache/agentdescent/bbh")
 
 def download_bbh(task: str) -> List[dict]:
     """Fetch a BBH task's examples (cached locally after first download)."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{task}.json")
+    path = cache_path("bbh", f"{task}.json")
     if not os.path.exists(path):
         url = BBH_URL.format(task=task)
         with urllib.request.urlopen(url, timeout=30) as resp:

@@ -62,3 +62,36 @@ def test_build_tasks_shapes_examples():
 def test_estimate_calls_scales():
     assert estimate_calls(4, 2, 10) > estimate_calls(2, 2, 10)
     assert estimate_calls(4, 4, 10) > estimate_calls(4, 2, 10)
+
+
+def test_download_bbh_uses_dataset_cache_root(tmp_path, monkeypatch):
+    """#1273: BBH cache follows AGENTDESCENT_CACHE instead of ~/.cache."""
+    import json
+    import urllib.request
+
+    from examples.skill_evolution import download_bbh
+
+    root = tmp_path / "cache"
+    monkeypatch.setenv("AGENTDESCENT_CACHE", str(root))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    payload = json.dumps({"examples": [{"input": "q", "target": "a"}]}).encode()
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return payload
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: Resp())
+
+    rows = download_bbh("hyperbaton")
+
+    assert rows == [{"input": "q", "target": "a"}]
+    expected = root / "bbh" / "hyperbaton.json"
+    assert expected.is_file()
+    assert json.loads(expected.read_text())["examples"] == rows

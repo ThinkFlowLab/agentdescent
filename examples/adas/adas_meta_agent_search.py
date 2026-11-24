@@ -55,7 +55,7 @@ from typing import Callable, List, Optional, Tuple
 
 from agentdescent.agents import Usage
 from agentdescent.aggregator import AggregatorProtocol, MergeOutcome, MergeReport
-from agentdescent.dataloader import Dataset, fetch_text, split_dataset
+from agentdescent.dataloader import Dataset, cache_path, fetch_text, split_dataset
 from agentdescent.evolvable import Diff, EvidenceCard
 from agentdescent.evolution import EvolvingArtifact, Task, evolve, rule_id
 from agentdescent.governance import classify
@@ -746,16 +746,13 @@ class _HardCache:
 
     def __init__(self, model: str, enabled: bool = True) -> None:
         import hashlib
-        import os
         self.enabled = enabled
         key = hashlib.sha256(model.encode()).hexdigest()[:12]
-        root = os.path.join(os.path.expanduser("~/.cache/agentdescent"), "mgsm", "hard")
-        self.path = os.path.join(root, f"direct_{key}.json")
+        self.path = cache_path("mgsm/hard", f"direct_{key}.json") if enabled else ""
         self._d = {}
         self._dirty = False
         self._lock = threading.Lock()
         if enabled:
-            os.makedirs(root, exist_ok=True)
             try:
                 with open(self.path, encoding="utf-8") as fh:
                     self._d = json.load(fh)

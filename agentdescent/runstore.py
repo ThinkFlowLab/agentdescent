@@ -809,16 +809,18 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     requested_calls = max_calls
     require_budget_pair(budget_usd, usd_per_call)
     from .evolvespec import SpecError, build_call_limit
-    # Refuse a cap the caller cannot have before the clamp consults the run:
-    # #1196 pins that ``launch`` refuses a mispriced dollar cap before it
-    # touches the store, and the clamp now needs ``rd.run_id`` (#1241). The
-    # result is validation only -- the applied value is the clamped one below.
+    # #1196 pins that the unpriced-dollar refusal lands before ``launch``
+    # dereferences the run at all, and since #1241 the clamp reads ``rd.run_id``.
+    # So the dollar pair is refused on the raw arguments first, and the cap
+    # itself is validated after the clamp, on the value that actually applies --
+    # as at base, where a float cap above the ceiling clamped down and ran.
     try:
+        build_call_limit(max_usd=max_usd, usd_per_call=usd_per_call)
+        max_calls, operator_bound = _clamped_max_calls(max_calls, rd.run_id)
         build_call_limit(max_calls=max_calls, max_usd=max_usd,
                          usd_per_call=usd_per_call)
     except SpecError as e:
         raise RunStoreError(str(e)) from None
-    max_calls, operator_bound = _clamped_max_calls(max_calls, rd.run_id)
     st = rd.status()
     if st.state == "running" and st.alive():
         raise RunStoreError(f"{rd.run_id} is already running (pid {st.pid})")

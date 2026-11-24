@@ -11,7 +11,7 @@
 The examples each need a public benchmark (FiNER, HotpotQA, SearchQA, MGSM,
 SWE-bench Verified, OfficeQA). Rather than re-implement HuggingFace paging and
 on-disk caching in every file, that boilerplate lives here — dependency-free
-(`urllib` only), cached under `~/.cache/agentdescent/`.
+(`urllib` only), cached under `$XDG_CACHE_HOME/agentdescent/` (default `~/.cache/agentdescent/`; `AGENTDESCENT_CACHE` overrides the root).
 
 ## The surface
 
@@ -108,7 +108,7 @@ def download_hotpotqa(limit):
 * **Dependency-free public path.** `hf_rows` / `fetch_text` use only `urllib`, so
   the examples install nothing extra. The `datasets` library is imported lazily,
   and *only* inside `load_gated_hf`, for gated datasets that need auth.
-* **Cache-first.** Every page and file is cached under `~/.cache/agentdescent/`;
+* **Cache-first.** Every page and file is cached under `$XDG_CACHE_HOME/agentdescent/` (default `~/.cache/agentdescent/`; `AGENTDESCENT_CACHE` overrides the root);
   real re-runs are offline after the first fetch. Pass `cache=False` on
   `hf_rows`, `hf_rows_modelscope`, `fetch_bytes`, or `fetch_text` to bypass an
   existing entry without writing a new one. Faithful-port `--dry-run`

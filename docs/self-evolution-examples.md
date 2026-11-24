@@ -166,7 +166,7 @@ Self-Refine, Reflexion, SICA, Gödel Agent — loads and caches its split during
 dry run, and prints that it did.
 
 Datasets go through the shared [**`agentdescent.dataloader`**](dataloader.md)
-layer — dependency-free (`urllib` only), cached under `~/.cache/agentdescent/`,
+layer — dependency-free (`urllib` only), cached under `$XDG_CACHE_HOME/agentdescent/` (default `~/.cache/agentdescent/`; `AGENTDESCENT_CACHE` overrides the root),
 from each benchmark's canonical source. Every port has an offline test suite
 exercising its pure logic, named on its page. Where a paper's full setup needs
 heavy infrastructure, the boundary is documented in the example's module

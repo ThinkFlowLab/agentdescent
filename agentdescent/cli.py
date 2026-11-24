@@ -2476,12 +2476,10 @@ def _advised_cap(calls: Any, declared: Optional[Tuple[bool, Optional[int]]],
         return None, False
     bound = (int(calls) if isinstance(calls, (int, float))
              and not isinstance(calls, bool) and calls > 0 else None)
-    if not declared_flag:
-        number: Optional[int] = bound
-    else:
-        number = int(declared_calls)  # type: ignore[arg-type]
-        if bound is not None:
-            number = min(bound, number)
+    number = bound
+    if declared_flag:
+        number = (declared_calls if bound is None
+                  else min(bound, declared_calls))
     if enforced is None:
         return number, False
     if number is None or enforced < number:

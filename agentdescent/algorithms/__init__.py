@@ -417,6 +417,13 @@ def kind_mismatch_message(algorithm: Algorithm, kind: str, *,
             else:
                 msg += (f"; to run {name} on one file, target it as text: "
                         f"agentdescent init {one} --kind text ... --algorithm {name}")
+            # #1251: the hint used to stop here, and following it with this
+            # kind's own cases.jsonl looked fine while every fixture stayed
+            # in a workspace the text runner does not have.
+            msg += (f"; a {kind} cases file stages its `fixtures` into a "
+                    f"workspace, and a text run has none, so inline each fixture "
+                    f"body in the prompt or reuse the prompt-inlined cases "
+                    f"`agentdescent demo --kind text --dir <dir>` writes")
     return msg
 
 

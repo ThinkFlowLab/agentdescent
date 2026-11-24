@@ -807,14 +807,18 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     Its stdout and stderr go to ``log.txt``.
     """
     requested_calls = max_calls
-    max_calls, operator_bound = _clamped_max_calls(max_calls, rd.run_id)
     require_budget_pair(budget_usd, usd_per_call)
     from .evolvespec import SpecError, build_call_limit
+    # Refuse a cap the caller cannot have before the clamp consults the run:
+    # #1196 pins that ``launch`` refuses a mispriced dollar cap before it
+    # touches the store, and the clamp now needs ``rd.run_id`` (#1241). The
+    # result is validation only -- the applied value is the clamped one below.
     try:
         build_call_limit(max_calls=max_calls, max_usd=max_usd,
                          usd_per_call=usd_per_call)
     except SpecError as e:
         raise RunStoreError(str(e)) from None
+    max_calls, operator_bound = _clamped_max_calls(max_calls, rd.run_id)
     st = rd.status()
     if st.state == "running" and st.alive():
         raise RunStoreError(f"{rd.run_id} is already running (pid {st.pid})")

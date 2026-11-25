@@ -15,6 +15,13 @@ block must have a row here, and every module named here must exist with one. A
 new bench module without a row fails the suite — that is the point of the
 page, so add the row in the same change as the module.
 
+`python -m bench` answers the same question in the terminal: one line per
+runnable module saying what it measures, then the `python -m bench.<name> --help`
+hint. The listing is read off the tree with `ast`, so it imports no bench module
+and needs no dataset cache — it works before the heavy runs do. `python -m bench
+<name> …` hands the arguments to that module, and an unknown name exits `2` with
+the list instead of a traceback.
+
 ## Offline — deterministic, no key
 
 | Module | What it measures | Command | Evidence |

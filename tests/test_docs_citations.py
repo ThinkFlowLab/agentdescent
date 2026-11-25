@@ -5,8 +5,8 @@ rows are the verified part, so a citation that runs past a file's last line
 sends a reader to nothing. This guard walks ``docs/**/*.md`` and ``README.md``,
 reads every backticked ``path:line`` or ``path:line-line`` citation, and
 requires the cited file to exist, the line numbers to start at 1 and run
-forward, the path to stay inside the checkout, and the last cited line to be
-within that file's line count.
+forward, the path to stay inside the checkout after resolving any symlink,
+and the last cited line to be within that file's line count.
 
 Citations into codebases this repository does not ship — the upstream
 Elixir/DGM trees the port pages quote — are pinned in ``_EXTERNAL``. A pin is
@@ -79,8 +79,17 @@ def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
                 problems.append(f"{prefix} (line numbers start at 1 and run forward)")
                 continue
             target = root / path
-            if target.is_file():
-                count = _line_count(target)
+            try:
+                resolved = target.resolve()
+                root_resolved = root.resolve()
+            except (OSError, RuntimeError):
+                problems.append(f"{prefix} (file does not exist)")
+                continue
+            if not resolved.is_relative_to(root_resolved):
+                problems.append(f"{prefix} (citation path escapes this repository)")
+                continue
+            if resolved.is_file():
+                count = _line_count(resolved)
                 if end > count:
                     problems.append(f"{prefix} (file has {count} lines)")
             elif (rel_page, path, first, end if last else None) not in external:
@@ -166,3 +175,36 @@ def test_an_absolute_citation_cannot_escape_the_repository(tmp_path: Path) -> No
     assert len(problems) == 1, problems
     assert "/nonexistent/outside.txt:1" in problems[0], problems
     assert "escapes this repository" in problems[0], problems
+
+def test_a_symlink_citation_cannot_escape_the_repository(tmp_path: Path) -> None:
+    """A committed symlink to an outside file is followed today.
+
+    Lexical checks (``..``, absolute) do not see a link, so ``_line_count()``
+    reads a file this checkout does not contain. An in-range citation then
+    reports nothing, and the page reads as verified.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    (root / "link.txt").symlink_to(outside)
+    _temp_tree(root, {"docs/page.md": "see `link.txt:2`\n"}, {})
+    problems = _problems(root, external=set())
+    assert len(problems) == 1, problems
+    assert "link.txt:2" in problems[0] and "docs/page.md" in problems[0], problems
+    assert "escapes this repository" in problems[0], problems
+
+
+def test_a_symlink_citation_past_the_end_is_an_escape(tmp_path: Path) -> None:
+    """Past-the-end through a link must not report the outside file's length."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    (root / "link.txt").symlink_to(outside)
+    _temp_tree(root, {"docs/page.md": "see `link.txt:9`\n"}, {})
+    problems = _problems(root, external=set())
+    assert len(problems) == 1, problems
+    assert "link.txt:9" in problems[0] and "docs/page.md" in problems[0], problems
+    assert "escapes this repository" in problems[0], problems
+    assert "file has 3 lines" not in problems[0], problems

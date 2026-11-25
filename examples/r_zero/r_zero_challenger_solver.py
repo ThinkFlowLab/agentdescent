@@ -36,6 +36,11 @@ from examples._selfplay_domain import (CartTask, majority_share, mixed_reward,
 
 FIDELITY = "inference_analogue"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "r_zero"
+PROPOSAL_CALLS = 2
+
 _FALLBACK = CartTask((125, 240), (1, 2))
 CHALLENGER_SEED = "Increase curriculum difficulty gradually."
 
@@ -116,7 +121,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = selfplay_splits(seed, "r_zero")
     return MethodPolicy(
-        name="r_zero",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "Separate Challenger and Solver role memories receive separate updates and union-merge across fields.",
@@ -135,7 +140,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=mixed_reward,
-        proposal_calls_per_candidate=2,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(
             task_sampler=DifficultyWeighted(),
             acceptance=AdvantageAcceptance(),   # wraps the run's own gate

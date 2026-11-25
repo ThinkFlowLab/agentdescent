@@ -71,6 +71,11 @@ from . import _fixtures
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "gskill"
+PROPOSAL_CALLS = 1
+
 SKILL_NAME = "kvtools-fixer"
 
 #: "GEPA starts with empty skills" -- as a *valid* skill, so the structural gate
@@ -307,7 +312,7 @@ def build(seed: int, export_dir: str = "") -> MethodPolicy:
 
     train, held_out, test = gskill_splits(seed)
     return MethodPolicy(
-        name="gskill",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "Traced gepa-ai/gepa@f1cfdee src/gepa/gskill: optimize_anything evolves one repository skill from agent traces and test feedback; skills start empty and are deployed unchanged.",
@@ -325,7 +330,7 @@ def build(seed: int, export_dir: str = "") -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(acceptance=StrictHeldOutGate()),
         # `ReflectiveFusion` writes its synthesis to the ledger without passing
         # `to_diff`, so a model-merged SKILL.md would bypass the frontmatter gate.

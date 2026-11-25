@@ -82,6 +82,11 @@ from examples._gsm8k_domain import (SAMPLE_ENV, STARTING_INSTRUCTION, feedback,
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "textgrad"
+PROPOSAL_CALLS = 2
+
 UPSTREAM = "zou-group/textgrad@75e912e210864b61999781778cdf756d4468120f"
 
 #: ``optimizer.new_variable_tags`` default.
@@ -316,7 +321,7 @@ def build(seed: int, *, dry_run: bool = False) -> MethodPolicy:
         f"({len(train)}/{len(held_out)}/{len(test)}); nothing was fetched. A "
         "live run loads GSM8K and uses 64/64/64.",) if dry_run else ()
     return MethodPolicy(
-        name="textgrad",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             f"Traced against {UPSTREAM}: evaluation/prompt_optimization.py, textgrad/optimizer/optimizer.py (TextualGradientDescent), optimizer_prompts.py, autograd/llm_backward_prompts.py.",
@@ -336,7 +341,7 @@ def build(seed: int, *, dry_run: bool = False) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=gsm8k_reward,
-        proposal_calls_per_candidate=2,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         reflective=True,
     )
 

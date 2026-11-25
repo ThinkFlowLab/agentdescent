@@ -81,6 +81,11 @@ from examples.dynamic_cheatsheet.game24 import (TARGET, game24_reward,
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "dynamic_cheatsheet"
+PROPOSAL_CALLS = 1
+
 #: Upstream's initial cheatsheet (``cheatsheet = "(empty)"`` in run_benchmark.py).
 INITIAL_CHEATSHEET = "(empty)"
 
@@ -326,7 +331,7 @@ def build(seed: int, *, gated: bool = False) -> MethodPolicy:
 
     train, held_out, test = game24_splits(seed)
     return MethodPolicy(
-        name="dynamic_cheatsheet",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "DC-Cu (cumulative, no retrieval) traced at suzgunmirac/dynamic-cheatsheet@5cfe3c3: Gen answers with the current cheatsheet in context, Cur rewrites the whole cheatsheet from (memory, question, the model's own answer).",
@@ -349,7 +354,7 @@ def build(seed: int, *, gated: bool = False) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=game24_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies() if gated else Policies(acceptance=CommitEveryUpdate()),
         reflective=True,
         # Skill-layer context, like ACE's playbook. Above 0.3 the runtime audits

@@ -16,7 +16,10 @@ fails here instead of rotting quietly.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,9 +43,9 @@ _EXTERNAL = {
 }
 
 
-def _pages() -> list[Path]:
-    pages = sorted(REPO_ROOT.glob("docs/**/*.md"))
-    readme = REPO_ROOT / "README.md"
+def _pages(root: Path = REPO_ROOT) -> list[Path]:
+    pages = sorted(root.glob("docs/**/*.md"))
+    readme = root / "README.md"
     if readme.is_file():
         pages.append(readme)
     return pages
@@ -52,25 +55,34 @@ def _line_count(path: Path) -> int:
     return len(path.read_text(encoding="utf-8", errors="replace").splitlines())
 
 
-def _problems() -> list[str]:
+def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
+    if external is None:
+        external = _EXTERNAL
     problems: list[str] = []
-    for page in _pages():
+    for page in _pages(root):
         text = page.read_text(encoding="utf-8")
-        rel_page = page.relative_to(REPO_ROOT).as_posix()
+        rel_page = page.relative_to(root).as_posix()
         for match in _CITATION.finditer(text):
             path, first, last = match.group(1), int(match.group(2)), match.group(3)
             end = int(last) if last else first
             page_line = text.count("\n", 0, match.start()) + 1
             citation = f"{path}:{first}" + (f"-{last}" if last else "")
             prefix = f"{rel_page}:{page_line} -> {citation}"
-            target = REPO_ROOT / path
+            target = root / path
             if target.is_file():
                 count = _line_count(target)
                 if end > count:
                     problems.append(f"{prefix} (file has {count} lines)")
-            elif (rel_page, path, first, end if last else None) not in _EXTERNAL:
+            elif (rel_page, path, first, end if last else None) not in external:
                 problems.append(f"{prefix} (file does not exist)")
     return problems
+
+
+def _temp_tree(root: Path, pages: dict[str, str], files: dict[str, str]) -> None:
+    for name, text in {**pages, **files}.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
 
 
 def test_docs_citations_resolve_inside_their_files() -> None:
@@ -78,4 +90,46 @@ def test_docs_citations_resolve_inside_their_files() -> None:
     assert not problems, (
         f"{len(problems)} doc citation(s) do not resolve into this repository:\n"
         + "\n".join(problems)
+    )
+
+
+def test_a_stale_external_pin_is_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pin whose page stopped citing it must fail, not sit there allowed."""
+    stale = ("docs/algo-genesis.md", "agents/nowhere.ex", 7, None)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_EXTERNAL", _EXTERNAL | {stale}
+    )
+    problems = _problems()
+    assert any(
+        "docs/algo-genesis.md" in p and "agents/nowhere.ex:7" in p for p in problems
+    ), problems
+
+
+def test_a_zero_line_citation_is_rejected(tmp_path: Path) -> None:
+    """`path:0` passes today because line 0 is never past a file's end.
+
+    The pin set is empty here: ``_EXTERNAL`` names pages in the shipped docs, so
+    walking a temp tree without it would report every real pin as stale and
+    hide whether the zero-line check fired at all.
+    """
+    _temp_tree(
+        tmp_path,
+        {"docs/page.md": "See `pkg/mod.py:0` for the guard.\n"},
+        {"pkg/mod.py": "one\ntwo\n"},
+    )
+    problems = _problems(tmp_path, external=set())
+    assert len(problems) == 1, problems
+    assert "pkg/mod.py:0" in problems[0] and "docs/page.md" in problems[0], problems
+
+
+def test_a_citation_cannot_escape_the_repository(tmp_path: Path) -> None:
+    """`../../outside.txt:1` resolves to a real file and is read today."""
+    root = tmp_path / "nested" / "repo"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    _temp_tree(root, {"docs/page.md": "See `../../outside.txt:1`.\n"}, {})
+    problems = _problems(root, external=set())
+    assert len(problems) == 1, problems
+    assert "../../outside.txt:1" in problems[0] and "docs/page.md" in problems[0], (
+        problems
     )

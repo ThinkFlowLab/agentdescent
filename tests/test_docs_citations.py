@@ -72,7 +72,7 @@ def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
             page_line = text.count("\n", 0, match.start()) + 1
             citation = f"{path}:{first}" + (f"-{last}" if last else "")
             prefix = f"{rel_page}:{page_line} -> {citation}"
-            if ".." in Path(path).parts:
+            if ".." in Path(path).parts or Path(path).is_absolute():
                 problems.append(f"{prefix} (citation path escapes this repository)")
                 continue
             if first < 1 or end < first:

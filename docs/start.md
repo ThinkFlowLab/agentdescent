@@ -134,8 +134,21 @@ agentdescent evolve spec.json --max-calls 40
 agentdescent evolve spec.json --max-usd 5 --usd-per-call 0.02
 ```
 
-`--max-calls 0` is a real limit — no calls at all — not "unset". Leave both
-flags off and the run behaves exactly as before.
+`--max-calls 0` is a real limit — no calls at all — not "unset". Leaving both
+flags off means *this command names no cap*; it does not mean the run is
+uncapped. An operator who exports `AGENTDESCENT_MAX_CALLS=N` clamps every run
+this process starts to `N`, including one that names no cap of its own: a
+caller's `--max-calls` can lower that number but never raise it, and the clamp
+is **per run**, so a second `agentdescent evolve` from the same shell gets the
+ceiling again (`agentdescent/runstore.py:228-266`, `_clamped_max_calls`).
+
+The one place the number is spent cumulatively is a run the MCP server's
+`start` launches: one worker session is one Ticket, the ceiling is handed out
+once, and a second run in the same Ticket is granted only what is left.
+`call_limit` then carries `ticket: {ceiling, spent, remaining}`, and a spent
+Ticket refuses another `start` rather than launch a run that cannot charge a
+call ([plugin design](plugin-design.md) — `docs/plugin-design.md:595-612`,
+`agentdescent/mcp.py:440-490`, `_call_limit_payload`).
 
 The walkthrough that loads a dataset, calls a model, and evolves an instruction
 is in [Quickstart — dataset to skill](quickstart-skill.md). That path evolves a

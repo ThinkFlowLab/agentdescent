@@ -25,17 +25,19 @@ Parse `$ARGUMENTS` (trim; empty means `list`):
   exists). Stop here unless they ask to run it.
 - **`run <name> <path>`** [optional `cases.jsonl`] [optional `--param k=v`]:
   call `algorithm_spec` with the name, the absolute path, the absolute cases
-  file and only the params they gave (validate with `describe_algorithm` /
-  `show` first); it writes and plans the spec and returns `spec`. Run `doctor`
-  first, then `plan` that `spec` with `--probe` / `probe=true`. If the probe
-  refuses, give me its `next` and do not `start`. Show the resolved algorithm
-  card (including fidelity / surface) and estimate, and wait for my yes
-  before `start` with that `spec` and `max_calls` (and `max_usd` beside
-  `usd_per_call` when a price is known), starting at the plan's
-  `agent_calls_upper_bound` (or smaller for a trial). Same
-  apply/cancel/resume rules as `/evolve`. Without MCP: `agentdescent algorithms
-  run <name> <path> [cases.jsonl] [--param k=v...] [--rounds N] [--workers N]`
-  (init + plan), then `plan <spec> --probe` and `evolve --max-calls N` after
-  yes. For a quick trial pass `--rounds 1 --workers 1`.
+  file, the `model` and `base_url` they gave (and `key_env` when several keys
+  are set — never guess them), and only the params they gave (validate with
+  `describe_algorithm` / `show` first); it writes and plans the spec and
+  returns `spec`. Run `doctor` first, then `plan` that `spec` with `--probe` /
+  `probe=true`. If the probe refuses, give me its `next` and do not `start`.
+  Show the resolved algorithm card (including fidelity / surface) and
+  estimate, and wait for my yes before `start` with that `spec` and
+  `max_calls` (and `max_usd` beside `usd_per_call` when a price is known),
+  starting at the plan's `agent_calls_upper_bound` (or smaller for a trial).
+  Same apply/cancel/resume rules as `/evolve`. Without MCP: `agentdescent
+  algorithms run <name> <path> [cases.jsonl] --model <model> [--base-url
+  <url>] [--param k=v...] [--rounds N] [--workers N]` (init + plan), then
+  `plan <spec> --probe` and `evolve --max-calls N` after yes. For a quick
+  trial pass `--rounds 1 --workers 1`.
 
 If they only named a method with no path, `show` it and ask whether to `run`.

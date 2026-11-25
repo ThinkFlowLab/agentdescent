@@ -255,3 +255,47 @@ def test_grok_bot_host_md_names_the_probe_and_the_cap():
     assert "plan --probe" in drive
     assert "evolve --max-calls" in drive
     assert "evolve the written" not in drive
+
+def test_first_run_algorithms_run_recipes_name_model_and_base_url():
+    """#1275: leftover first-run recipes must name the flags plan requires."""
+    from agentdescent.integrations import grok_bot_host_md
+
+    skill = skill_text()
+    offer = skill.split("`algorithm_spec`", 1)[1].split("after `doctor`", 1)[0]
+    assert "--model" in offer and "--base-url" in offer, offer
+    assert "model" in offer and "base_url" in offer, offer
+    look = skill.split("For a quick first look at a named method", 1)[1]
+    look = look.split("writes a one-round", 1)[0]
+    assert "--model" in look and "--base-url" in look, look
+
+    run_branch = ALGORITHMS_COMMAND.split("**`run", 1)[1]
+    assert "--model" in run_branch and "--base-url" in run_branch, run_branch
+    assert "`model`" in run_branch and "`base_url`" in run_branch, run_branch
+
+    drive = _section_after(grok_bot_host_md(), "Drive AgentDescent")
+    drive = drive.split("MCP (optional", 1)[0]
+    assert "algorithms run" in drive
+    assert "--model" in drive and "--base-url" in drive, drive
+
+    cheat = _read("docs", "algorithms.md").split("```bash", 1)[1].split("```", 1)[0]
+    run_line = [ln for ln in cheat.splitlines() if "algorithms run" in ln]
+    assert run_line and "--model" in run_line[0] and "--base-url" in run_line[0], cheat
+
+    pointer = _read("docs", "plugin-quickstart.md")
+    pointer = pointer.split("Pass `--algorithm", 1)[1].split("## 3.", 1)[0]
+    assert "algorithms run" in pointer
+    assert "--model" in pointer and "--base-url" in pointer, pointer
+
+
+@pytest.mark.parametrize("name", ALGORITHMS)
+def test_bare_algorithms_run_without_model_flags_still_refuses(tmp_path, monkeypatch, name):
+    """#1275: docs teach the flags; a bare run must still refuse placeholders."""
+    monkeypatch.chdir(tmp_path)
+    prompt, cases = _prompt_and_cases(tmp_path)
+    out = tmp_path / f"{name}.spec.json"
+    code, text = _run([
+        "algorithms", "run", name, str(prompt), str(cases),
+        "--rounds", "1", "--workers", "1", "--out", str(out),
+    ])
+    assert code != 0, text
+    assert "<your-model>" in text or "placeholder" in text.lower(), text

@@ -36,7 +36,7 @@ real model and a key):
 Then continue with The procedure for a real run on the user's files. If
 `demo` refuses a card (unknown name, or a kind with no offline fixture),
 surface that error — the same words the CLI prints — and offer
-`algorithm_spec` (or `agentdescent algorithms run NAME <path> <cases.jsonl>`)
+`algorithm_spec` with the user's `model` / `base_url` (or `agentdescent algorithms run NAME <path> <cases.jsonl> --model <model> [--base-url <url>]`)
 after `doctor`. Do not invent a keyless path for those cards.
 
 ## The procedure
@@ -96,9 +96,11 @@ after `doctor`. Do not invent a keyless path for those cards.
      same spec still override the algorithm's defaults. `plan` echoes what was
      resolved and what it costs.
      For a quick first look at a named method, `agentdescent algorithms run
-     NAME PATH [cases.jsonl] --rounds 1 --workers 1` (same flags on `init`)
-     writes a one-round, one-worker spec and plans it, so the call estimate is
-     small; quote that estimate, then scale the flags up once it works.
+     NAME PATH [cases.jsonl] --model <model> [--base-url <url>] --rounds 1
+     --workers 1` (same flags on `init`; add `--key-env` when several keys are
+     set — never guess a model) writes a one-round, one-worker spec and plans
+     it, so the call estimate is small; quote that estimate, then scale the
+     flags up once it works.
    - No data? Offer to draft 12 to 20 cases into `eval/cases.jsonl`
      (`{"prompt": ..., "gold": ...}` per line) and have the user check them.
      Fewer than 12 leaves under 4 held-out cases at the default `held_out_frac`

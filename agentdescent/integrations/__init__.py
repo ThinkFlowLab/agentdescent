@@ -441,18 +441,20 @@ Parse `$ARGUMENTS` (trim; empty means `list`):
   exists). Stop here unless they ask to run it.
 - **`run <name> <path>`** [optional `cases.jsonl`] [optional `--param k=v`]:
   call `algorithm_spec` with the name, the absolute path, the absolute cases
-  file and only the params they gave (validate with `describe_algorithm` /
-  `show` first); it writes and plans the spec and returns `spec`. Run `doctor`
-  first, then `plan` that `spec` with `--probe` / `probe=true`. If the probe
-  refuses, give me its `next` and do not `start`. Show the resolved algorithm
-  card (including fidelity / surface) and estimate, and wait for my yes
-  before `start` with that `spec` and `max_calls` (and `max_usd` beside
-  `usd_per_call` when a price is known), starting at the plan's
-  `agent_calls_upper_bound` (or smaller for a trial). Same
-  apply/cancel/resume rules as `/evolve`. Without MCP: `agentdescent algorithms
-  run <name> <path> [cases.jsonl] [--param k=v...] [--rounds N] [--workers N]`
-  (init + plan), then `plan <spec> --probe` and `evolve --max-calls N` after
-  yes. For a quick trial pass `--rounds 1 --workers 1`.
+  file, the `model` and `base_url` they gave (and `key_env` when several keys
+  are set — never guess them), and only the params they gave (validate with
+  `describe_algorithm` / `show` first); it writes and plans the spec and
+  returns `spec`. Run `doctor` first, then `plan` that `spec` with `--probe` /
+  `probe=true`. If the probe refuses, give me its `next` and do not `start`.
+  Show the resolved algorithm card (including fidelity / surface) and
+  estimate, and wait for my yes before `start` with that `spec` and
+  `max_calls` (and `max_usd` beside `usd_per_call` when a price is known),
+  starting at the plan's `agent_calls_upper_bound` (or smaller for a trial).
+  Same apply/cancel/resume rules as `/evolve`. Without MCP: `agentdescent
+  algorithms run <name> <path> [cases.jsonl] --model <model> [--base-url
+  <url>] [--param k=v...] [--rounds N] [--workers N]` (init + plan), then
+  `plan <spec> --probe` and `evolve --max-calls N` after yes. For a quick
+  trial pass `--rounds 1 --workers 1`.
 
 If they only named a method with no path, `show` it and ask whether to `run`.
 """
@@ -1031,7 +1033,7 @@ and it cannot drift from the package -- and its `cordis.patch.yml` adds the
 `__start`, `__status`, `__show`, `__apply`, `__list_algorithms`,
 `__describe_algorithm` and the rest. Named methods match
 `agentdescent algorithms list` / `show` / `run` (dsh has no slash surface; use
-the skill, those tools, or `agentdescent algorithms run NAME PATH`).
+the skill, those tools, or `agentdescent algorithms run NAME PATH --model <model> [--base-url <url>]`).
 
 Check it composed:
 
@@ -1116,9 +1118,10 @@ launcher will not reach the Bot from Cursor's backend.
    box): `agentdescent doctor`, `plan --probe`, `evolve --max-calls N`,
    `status`, `apply`. Named methods: `agentdescent algorithms list` /
    `show <name>`, then
-   `agentdescent algorithms run NAME PATH [cases.jsonl]` (init + plan in one
-   step; add `--rounds 1 --workers 1` for a quick trial; then `plan --probe`
-   and `evolve --max-calls N` after yes) — or MCP `list_algorithms` /
+   `agentdescent algorithms run NAME PATH [cases.jsonl] --model <model>
+   [--base-url <url>]` (init + plan in one step; add `--rounds 1 --workers 1`
+   for a quick trial; then `plan --probe` and `evolve --max-calls N` after
+   yes) — or MCP `list_algorithms` /
    `describe_algorithm` when the HTTP MCP below is wired. The skill
    falls back to those verbs when MCP tools are absent.
 3. **MCP (optional, not auto-wired).** Serve the tools over HTTP on loopback

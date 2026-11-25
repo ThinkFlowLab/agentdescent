@@ -15,7 +15,7 @@ and it cannot drift from the package -- and its `cordis.patch.yml` adds the
 `__start`, `__status`, `__show`, `__apply`, `__list_algorithms`,
 `__describe_algorithm` and the rest. Named methods match
 `agentdescent algorithms list` / `show` / `run` (dsh has no slash surface; use
-the skill, those tools, or `agentdescent algorithms run NAME PATH`).
+the skill, those tools, or `agentdescent algorithms run NAME PATH --model <model> [--base-url <url>]`).
 
 Check it composed:
 

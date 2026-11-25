@@ -5,8 +5,8 @@ rows are the verified part, so a citation that runs past a file's last line
 sends a reader to nothing. This guard walks ``docs/**/*.md`` and ``README.md``,
 reads every backticked ``path:line`` or ``path:line-line`` citation, and
 requires the cited file to exist, the line numbers to start at 1 and run
-forward, the path to stay inside the checkout, and the last cited line to be
-within that file's line count.
+forward, the path to stay inside the checkout after resolving any symlink,
+and the last cited line to be within that file's line count.
 
 Citations into codebases this repository does not ship — the upstream
 Elixir/DGM trees the port pages quote — are pinned in ``_EXTERNAL``. A pin is
@@ -79,8 +79,17 @@ def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
                 problems.append(f"{prefix} (line numbers start at 1 and run forward)")
                 continue
             target = root / path
-            if target.is_file():
-                count = _line_count(target)
+            try:
+                resolved = target.resolve()
+                root_resolved = root.resolve()
+            except (OSError, RuntimeError):
+                problems.append(f"{prefix} (file does not exist)")
+                continue
+            if not resolved.is_relative_to(root_resolved):
+                problems.append(f"{prefix} (citation path escapes this repository)")
+                continue
+            if resolved.is_file():
+                count = _line_count(resolved)
                 if end > count:
                     problems.append(f"{prefix} (file has {count} lines)")
             elif (rel_page, path, first, end if last else None) not in external:

@@ -43,11 +43,14 @@ def test_relative_xdg_cache_home_resolves_absolute(tmp_path, monkeypatch):
 
 
 def test_relative_root_is_absolute_whatever_the_cwd(tmp_path, monkeypatch):
-    """Whichever process resolves it -- the CLI or the detached child in the run dir.
+    """A bare relative value is absolute wherever a process reads it.
 
-    The value is still resolved against the cwd of the process that reads it
-    (the same contract ``#403`` gave the run store), so the path is absolute in
-    both, and ``cache_path`` never hands back a bare relative path.
+    This is the resolution rule itself, so it is the cwd of the reader that
+    applies (the same contract ``#403`` gave the run store) and
+    ``cache_path`` never hands back a bare relative path. A run is not exposed
+    to that: ``runstore.launch`` spells the knob absolute before the child
+    starts in the run directory, so the run and its launcher name one tree
+    (``test_runstore_cache_env.py``).
     """
     run_dir = tmp_path / "run"
     run_dir.mkdir()

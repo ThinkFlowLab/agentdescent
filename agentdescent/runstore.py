@@ -921,6 +921,18 @@ def launch(rd: RunDir, *, budget_usd: Optional[float] = None,
     # prefix, so it survives either way.
     child_env = scrub_host_env({**os.environ, "PYTHONPATH": _child_pythonpath(),
                                 **(env or {})})
+    # The dataset cache root is resolved against the cwd of whichever process
+    # reads it, and the child reads it at ``cwd=rd.path`` -- so an operator's
+    # ``AGENTDESCENT_CACHE=cache`` used to name one tree in the CLI and another
+    # in the run it started, moving the cache with every run directory (#1280).
+    # Only this launch still knows the cwd the value was typed in, so a relative
+    # value is spelled absolute here, after the scrub and after the caller's
+    # ``env`` is merged; an absolute value is forwarded untouched. Datasets only
+    # (#402/#403 normalised the store the same way).
+    for knob in ("AGENTDESCENT_CACHE", "XDG_CACHE_HOME"):
+        wanted = child_env.get(knob)
+        if wanted and not os.path.isabs(os.path.expanduser(wanted)):
+            child_env[knob] = os.path.abspath(os.path.expanduser(wanted))
     # The Ticket's handoff markers are inherited, not scoped: a process that was
     # itself launched below its ceiling would hand that number to every later
     # child, and a caller who legitimately asks for exactly that number would be

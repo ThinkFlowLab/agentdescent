@@ -148,3 +148,21 @@ def test_a_citation_cannot_escape_the_repository(tmp_path: Path) -> None:
     assert "../../outside.txt:1" in problems[0] and "docs/page.md" in problems[0], (
         problems
     )
+
+
+def test_an_absolute_citation_cannot_escape_the_repository(tmp_path: Path) -> None:
+    """An absolute path makes ``root / path`` drop the root and read elsewhere.
+
+    The target deliberately does not exist: citing a real file such as
+    ``/etc/hostname`` would make the assertion depend on the runner, and the
+    point is the wrong message, not a missing file.
+    """
+    _temp_tree(
+        tmp_path,
+        {"docs/page.md": "See `/nonexistent/outside.txt:1`.\n"},
+        {},
+    )
+    problems = _problems(tmp_path, external=set())
+    assert len(problems) == 1, problems
+    assert "/nonexistent/outside.txt:1" in problems[0], problems
+    assert "escapes this repository" in problems[0], problems

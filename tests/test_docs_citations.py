@@ -4,13 +4,16 @@ The pages checked here are reference pages whose stated value is that their
 rows are the verified part, so a citation that runs past a file's last line
 sends a reader to nothing. This guard walks ``docs/**/*.md`` and ``README.md``,
 reads every backticked ``path:line`` or ``path:line-line`` citation, and
-requires the cited file to exist and the last cited line to be within that
-file's line count.
+requires the cited file to exist, the line numbers to start at 1 and run
+forward, the path to stay inside the checkout, and the last cited line to be
+within that file's line count.
 
 Citations into codebases this repository does not ship — the upstream
-Elixir/DGM trees the port pages quote — are pinned in ``_EXTERNAL``. Everything
-else is checked, so a deleted file or a new pointer that resolves to nothing
-fails here instead of rotting quietly.
+Elixir/DGM trees the port pages quote — are pinned in ``_EXTERNAL``. A pin is
+allowed only while a page still quotes it at exactly those coordinates, so a
+pin the page stopped citing is reported instead of staying permanently
+allowed. Everything else is checked, so a deleted file or a new pointer that
+resolves to nothing fails here instead of rotting quietly.
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
     if external is None:
         external = _EXTERNAL
     problems: list[str] = []
+    seen_external: set[tuple[str, str, int, int | None]] = set()
     for page in _pages(root):
         text = page.read_text(encoding="utf-8")
         rel_page = page.relative_to(root).as_posix()
@@ -68,6 +72,12 @@ def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
             page_line = text.count("\n", 0, match.start()) + 1
             citation = f"{path}:{first}" + (f"-{last}" if last else "")
             prefix = f"{rel_page}:{page_line} -> {citation}"
+            if ".." in Path(path).parts:
+                problems.append(f"{prefix} (citation path escapes this repository)")
+                continue
+            if first < 1 or end < first:
+                problems.append(f"{prefix} (line numbers start at 1 and run forward)")
+                continue
             target = root / path
             if target.is_file():
                 count = _line_count(target)
@@ -75,6 +85,11 @@ def _problems(root: Path = REPO_ROOT, external: set | None = None) -> list[str]:
                     problems.append(f"{prefix} (file has {count} lines)")
             elif (rel_page, path, first, end if last else None) not in external:
                 problems.append(f"{prefix} (file does not exist)")
+            else:
+                seen_external.add((rel_page, path, first, end if last else None))
+    for page, path, first, last in sorted(external - seen_external, key=str):
+        citation = f"{path}:{first}" + (f"-{last}" if last else "")
+        problems.append(f"{page} -> {citation} (pinned in _EXTERNAL, no longer cited)")
     return problems
 
 

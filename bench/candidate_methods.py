@@ -76,14 +76,38 @@ PROPOSAL_CALLS_PER_CANDIDATE = {
 DEFAULT_OUTPUT = Path("bench/results/candidate-methods-framework-live.json")
 
 
+def _examples_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "examples"
+
+
+def algorithm_source_dir(
+    name: str, examples_dir: Optional[Path] = None
+) -> Path:
+    """Return ``examples/<name>``, refusing a key that is not a directory.
+
+    ``source_fingerprint`` globs ``*.py`` under this folder. A missing
+    directory would contribute no paths and no error, so a renamed port
+    would stop invalidating cached results.
+    """
+    root = _examples_dir() if examples_dir is None else examples_dir
+    path = root / name
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"algorithm {name!r} names no folder at {path}"
+        )
+    return path
+
+
 def source_fingerprint() -> str:
     """Hash every module defining this matrix: the shared examples runtime,
     each method's folder, and this file. Generated results are excluded."""
-    examples_dir = Path(__file__).resolve().parent.parent / "examples"
+    examples_dir = _examples_dir()
     paths = [Path(__file__).resolve()]
     paths += sorted(examples_dir.glob("_*.py"))
     for name in ALGORITHMS:
-        paths += sorted((examples_dir / name).glob("*.py"))
+        paths += sorted(
+            algorithm_source_dir(name, examples_dir=examples_dir).glob("*.py")
+        )
     digest = hashlib.sha256()
     for path in paths:
         digest.update(path.name.encode("utf-8"))

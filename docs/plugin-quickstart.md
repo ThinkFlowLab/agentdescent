@@ -118,7 +118,7 @@ after the command returns.
 Pass `--algorithm archive_selection` to watch a named algorithm (from
 `agentdescent algorithms list`) run the same offline example end to end. Only
 algorithms that work against the offline agent are accepted; any other name is
-refused with the `agentdescent algorithms run NAME <path> <cases.jsonl>` command
+refused with the `agentdescent algorithms run NAME <path> <cases.jsonl> --model <model> [--base-url <url>]` command
 that runs it for real with your model.
 
 ## 3. Put it in your agent

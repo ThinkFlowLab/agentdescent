@@ -70,13 +70,16 @@ NO_CACHE = textwrap.dedent(
 def run(body: str) -> subprocess.CompletedProcess:
     """Run ``body`` in a fresh interpreter that cannot write a dataset cache.
 
-    ``tests/conftest.py`` turns on the bundled GSM8K sample for the suite, and
-    that switch returns before the cache -- so it has to go, or every row here
-    would pass without the dataset path being reached at all. Without it the
-    child takes the path a reader's ``--help`` takes.
+    ``tests/conftest.py`` turns on the bundled sample for **both** domains and
+    each switch returns before the cache -- so both have to go, or the three
+    GSM-HARD ports (``reflexion``, ``self_refine``, ``sica``) would load their
+    bundled sample and an import-time build of one of them would pass here
+    without the dataset path being reached. Without them the child takes the
+    path a reader's ``--help`` takes.
     """
     env = dict(os.environ)
     env.pop("AGENTDESCENT_GSM8K_SAMPLE", None)
+    env.pop("AGENTDESCENT_GSMHARD_SAMPLE", None)
     script = NO_CACHE + textwrap.dedent(body)
     return subprocess.run(
         [sys.executable, "-c", script],

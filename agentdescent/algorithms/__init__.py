@@ -413,10 +413,12 @@ def kind_mismatch_message(algorithm: Algorithm, kind: str, *,
         if one is not None:
             if via == "run":
                 msg += (f"; to run {name} on one file, target it as text: "
-                        f"agentdescent algorithms run {name} {one} --kind text")
+                        f"agentdescent algorithms run {name} {one} --kind text "
+                        f"--model <model> [--base-url <url>]")
             else:
                 msg += (f"; to run {name} on one file, target it as text: "
-                        f"agentdescent init {one} --kind text ... --algorithm {name}")
+                        f"agentdescent init {one} --kind text ... --algorithm {name} "
+                        f"--model <model> [--base-url <url>]")
             # #1251: the hint used to stop here, and following it with this
             # kind's own cases.jsonl looked fine while every fixture stayed
             # in a workspace the text runner does not have.

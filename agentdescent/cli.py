@@ -778,7 +778,8 @@ def demo_payload(
                 f"demo --algorithm: {algo!r} does not run against the offline demo "
                 f"agent (it needs a real model); offline: "
                 f"{list(demo_mod.OFFLINE_ALGORITHMS)}. Run it for real with "
-                f"`agentdescent algorithms run {algo} <path> <cases.jsonl>` "
+                f"`agentdescent algorithms run {algo} <path> <cases.jsonl> "
+                f"--model <model> [--base-url <url>]` "
                 f"(`agentdescent algorithms show {algo}` for its parameters)")
     try:
         demo_mod.resolve_demo_kind(algo, kind)

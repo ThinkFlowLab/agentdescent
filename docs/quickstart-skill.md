@@ -18,8 +18,9 @@ evoskill's proposer protocol, use the archive parent-selection card:
 
 ```bash
 mkdir -p my-skills && agentdescent init my-skills --kind skill_library \
-  --data cases.jsonl --algorithm archive_selection --out spec.json
-# fill cases.jsonl, pin reflect/agent, then:
+  --data cases.jsonl --algorithm archive_selection --out spec.json \
+  --model <model> [--base-url <url>]
+# fill cases.jsonl, then:
 agentdescent plan spec.json --probe
 # agentdescent evolve spec.json --max-calls N   (N from the plan's upper bound)
 ```

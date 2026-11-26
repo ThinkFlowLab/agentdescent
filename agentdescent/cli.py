@@ -839,14 +839,16 @@ def demo_payload(
         ]
     elif used_kind == "text":
         own_steps = [
-            f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json",
+            f"agentdescent init {target} --kind text --data <your-cases.jsonl> --out spec.json "
+            f"--model <model> [--base-url <url>]",
             "agentdescent doctor",
             "agentdescent plan spec.json --probe",
             "agentdescent evolve spec.json --max-calls <N>",
         ]
     elif kind == "skill_library":
         own_steps = [
-            f"agentdescent init {target} --kind skill_library --data <your-cases.jsonl> --out spec.json",
+            f"agentdescent init {target} --kind skill_library --data <your-cases.jsonl> --out spec.json "
+            f"--model <model> [--base-url <url>]",
             "agentdescent doctor",
             "agentdescent plan spec.json --probe",
             "agentdescent evolve spec.json --max-calls <N>",
@@ -855,7 +857,8 @@ def demo_payload(
         # #1217: the README demo path must name the same preflight and
         # per-call cap that #1201 already put on `demo --algorithm`.
         own_steps = [
-            f"agentdescent init {target} --data <your-cases.jsonl> --out spec.json",
+            f"agentdescent init {target} --data <your-cases.jsonl> --out spec.json "
+            f"--model <model> [--base-url <url>]",
             "agentdescent doctor",
             "agentdescent plan spec.json --probe",
             "agentdescent evolve spec.json --max-calls <N>",

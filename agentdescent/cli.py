@@ -4321,6 +4321,8 @@ def _algorithm_card_text(card: Dict[str, Any]) -> str:
         lines.append(f"  source:      {card['source']}")
     if card["doc"]:
         lines.append(f"  docs:        docs/{card['doc']}")
+    if card.get("run"):
+        lines.append(f"  run:         {card['run']}")
     lines.append("  params (spec: \"algorithm\": {\"name\": \"%s\", \"params\": {...}}):"
                  % card["name"])
     if not card["params"]:

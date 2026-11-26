@@ -196,12 +196,17 @@ class Algorithm:
         When the same slug also has an ``examples/<name>/`` research port, the
         card carries ``research_port`` and a ``fidelity_note`` so hosts never
         read a mechanism slice as the paper port (#384 fidelity addendum).
+        ``run`` is the copyable ``algorithms run`` recipe with ``--model`` /
+        ``--base-url`` so a host or a person who just listed the card can
+        plan without inventing the Path A verb or the flags ``plan`` requires
+        (#1293).
         """
         out: Dict[str, Any] = {
             "name": self.name, "summary": self.summary, "kinds": list(self.kinds),
             "fidelity": self.fidelity, "surface": "card", "source": self.source,
             "extra_calls": self.extra_calls, "doc": self.doc,
             "params": [p.to_dict() for p in self.params],
+            "run": run_recipe(self.name, self.kinds),
         }
         port = research_port_for(self.name)
         if port is not None:
@@ -212,6 +217,29 @@ class Algorithm:
                 "different propose/strategy path."
             )
         return out
+
+
+
+def run_recipe(name: str, kinds: Sequence[str]) -> str:
+    """The copyable ``algorithms run`` line ``show`` and ``describe`` print.
+
+    Names ``--model`` / ``--base-url`` so a copied recipe can plan; never
+    guesses a model name. The target placeholder follows the card's kinds
+    (#1293).
+    """
+    kinds = tuple(kinds)
+    if kinds == ("text",):
+        target = "<your-prompt.txt>"
+    elif kinds == ("skill_library",):
+        target = "<your-skill-library>"
+    elif "text" in kinds:
+        target = "<path>"
+    else:
+        target = "<your-skill-dir>"
+    return (
+        f"agentdescent algorithms run {name} {target} <your-cases.jsonl> "
+        f"--model <model> [--base-url <url>]"
+    )
 
 
 _REGISTRY: Dict[str, Algorithm] = {}

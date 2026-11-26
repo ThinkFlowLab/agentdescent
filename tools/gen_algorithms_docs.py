@@ -80,7 +80,7 @@ def render() -> str:
         "agentdescent algorithms list [--kind K] [--json]",
         "agentdescent algorithms show NAME",
         "agentdescent algorithms run NAME PATH [cases.jsonl] --model MODEL [--base-url URL] [--param k=v...] [--rounds N] [--workers N] [--probe]",
-        "agentdescent init PATH --algorithm NAME --param KEY=VALUE [--rounds N] [--workers N]",
+        "agentdescent init PATH --algorithm NAME --model MODEL [--base-url URL] --param KEY=VALUE [--rounds N] [--workers N]",
         "```",
         "",
         "`--rounds 1 --workers 1` turns the kind's default plan (for a text prompt,",

@@ -217,7 +217,7 @@ Three things change from the demo: your directory, your cases, and a real agent
 instead of the offline one.
 
 ```bash
-agentdescent init ./my-skill --data cases.jsonl --out spec.json
+agentdescent init ./my-skill --data cases.jsonl --out spec.json --model <model> [--base-url <url>]
 agentdescent plan spec.json          # validates and prices it; runs nothing
 agentdescent plan spec.json --probe  # + one minimal call per model, so a dead
                                      #   key/endpoint/model/subscription is

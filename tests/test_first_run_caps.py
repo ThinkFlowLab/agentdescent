@@ -148,6 +148,8 @@ def test_default_demo_footer_names_the_probe_then_the_cap(tmp_path, monkeypatch)
     assert "agentdescent evolve spec.json --max-calls <N>" in text
     assert "--out spec.json" in text
     assert "agentdescent doctor" in text
+    # #1287: the default init recipe must name the flags plan requires.
+    assert "--model <model>" in text and "[--base-url <url>]" in text
 
     code, text = _run(["--store", str(tmp_path / "runs2"), "demo",
                        "--dir", str(tmp_path / "work2"), "--json"])
@@ -155,6 +157,8 @@ def test_default_demo_footer_names_the_probe_then_the_cap(tmp_path, monkeypatch)
     steps = json.loads(text)["next"]
     assert "agentdescent plan spec.json --probe" in steps
     assert "agentdescent evolve spec.json --max-calls <N>" in steps
+    init_steps = [s for s in steps if " init " in s]
+    assert init_steps and "--model <model>" in init_steps[0] and "[--base-url <url>]" in init_steps[0], steps
 
 
 def test_demo_kind_skill_library_footer_names_the_probe_then_the_cap(
@@ -168,6 +172,23 @@ def test_demo_kind_skill_library_footer_names_the_probe_then_the_cap(
     assert "agentdescent plan spec.json --probe" in steps
     assert "agentdescent evolve spec.json --max-calls <N>" in steps
     assert any("--kind skill_library" in s for s in steps)
+    init_steps = [s for s in steps if " init " in s]
+    assert init_steps and "--model <model>" in init_steps[0] and "[--base-url <url>]" in init_steps[0], steps
+
+
+def test_demo_kind_text_footer_names_model_and_base_url(tmp_path, monkeypatch):
+    # #1287: the --kind text footer had the same bare-init gap.
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    code, text = _run(["--store", str(tmp_path / "runs"), "demo",
+                       "--kind", "text",
+                       "--dir", str(tmp_path / "work"), "--json"])
+    assert code == 0, text
+    steps = json.loads(text)["next"]
+    assert "agentdescent plan spec.json --probe" in steps
+    assert "agentdescent evolve spec.json --max-calls <N>" in steps
+    init_steps = [s for s in steps if " init " in s]
+    assert init_steps and "--kind text" in init_steps[0], steps
+    assert "--model <model>" in init_steps[0] and "[--base-url <url>]" in init_steps[0], steps
 
 
 def test_bare_plan_next_names_the_probe_then_the_cap(tmp_path, monkeypatch):
@@ -221,6 +242,8 @@ def test_readme_quickstart_names_the_probe_and_the_cap():
     block = _first_init_my_skill_block(_read("README.md"))
     assert "plan spec.json --probe" in block
     assert "evolve spec.json --max-calls" in block
+    init_line = [ln for ln in block.splitlines() if "init ./my-skill" in ln][0]
+    assert "--model <model>" in init_line and "[--base-url <url>]" in init_line, init_line
 
 
 def test_start_page_opening_cli_block_names_the_probe_and_the_cap():
@@ -230,6 +253,8 @@ def test_start_page_opening_cli_block_names_the_probe_and_the_cap():
     block = _first_init_my_skill_block(opening)
     assert "plan spec.json --probe" in block
     assert "evolve spec.json --max-calls" in block
+    init_line = [ln for ln in block.splitlines() if "init ./my-skill" in ln][0]
+    assert "--model <model>" in init_line and "[--base-url <url>]" in init_line, init_line
 
 
 def test_plugin_quickstart_command_block_names_the_cap():
@@ -237,6 +262,8 @@ def test_plugin_quickstart_command_block_names_the_cap():
     block = _first_init_my_skill_block(_read("docs", "plugin-quickstart.md"))
     assert "plan spec.json --probe" in block
     assert "evolve spec.json --max-calls" in block
+    init_line = [ln for ln in block.splitlines() if "init ./my-skill" in ln][0]
+    assert "--model <model>" in init_line and "[--base-url <url>]" in init_line, init_line
 
 
 def test_skill_without_mcp_cheatsheet_names_the_probe_and_the_cap():
@@ -280,11 +307,38 @@ def test_first_run_algorithms_run_recipes_name_model_and_base_url():
     cheat = _read("docs", "algorithms.md").split("```bash", 1)[1].split("```", 1)[0]
     run_line = [ln for ln in cheat.splitlines() if "algorithms run" in ln]
     assert run_line and "--model" in run_line[0] and "--base-url" in run_line[0], cheat
+    init_line = [ln for ln in cheat.splitlines() if "init PATH --algorithm" in ln]
+    assert init_line and "--model" in init_line[0] and "--base-url" in init_line[0], cheat
 
     pointer = _read("docs", "plugin-quickstart.md")
     pointer = pointer.split("Pass `--algorithm", 1)[1].split("## 3.", 1)[0]
     assert "algorithms run" in pointer
     assert "--model" in pointer and "--base-url" in pointer, pointer
+
+
+def test_bare_init_without_model_flags_still_writes_placeholders(tmp_path, monkeypatch):
+    """#1287: docs teach the flags; a bare init still writes placeholders and plan refuses them."""
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    work = tmp_path / "demo-default"
+    code, text = _run(["--store", str(tmp_path / "runs"), "demo", "--dir", str(work)])
+    assert code == 0, text
+    skill = work / "csv-total"
+    cases = work / "cases.jsonl"
+    spec = tmp_path / "spec.json"
+    code, text = _run([
+        "init", str(skill), "--data", str(cases), "--out", str(spec),
+    ])
+    assert code == 0, text
+    assert "<your-model>" in text or "placeholder" in text.lower(), text
+    payload = json.loads(spec.read_text(encoding="utf-8"))
+    assert payload["reflect"]["model"] == cli.PLACEHOLDER_MODEL
+    code, text = _run(["--json", "plan", str(spec)])
+    assert code != 0, text
+    plan = json.loads(text)
+    assert plan.get("ok") is False
+    assert "ready" not in plan and "probe" not in plan
+    err = plan.get("error", "")
+    assert "placeholder" in err.lower() or "your-model" in err, plan
 
 
 @pytest.mark.parametrize("name", ALGORITHMS)

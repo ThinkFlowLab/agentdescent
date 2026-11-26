@@ -135,9 +135,11 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "archive, not a run store."),
     "describe_algorithm": (
         "One Algorithm card: summary, kinds, fidelity, surface=card, source, extra "
-        "cost, params, and — when a same-name examples/<name>/ research port exists — "
-        "research_port + fidelity_note so you do not claim paper fidelity for a "
-        "mechanism slice. Call before setting `algorithm: {name, params}`. Same data "
+        "cost, params, `run` (the copyable `algorithms run` recipe with --model / "
+        "--base-url; never guess those), and — when a same-name examples/<name>/ "
+        "research port exists — research_port + fidelity_note so you do not claim "
+        "paper fidelity for a mechanism slice. Call before setting "
+        "`algorithm: {name, params}` or calling algorithm_spec. Same data "
         "as `agentdescent algorithms show <name>`."),
     "algorithm_spec": (
         "Build and plan a starter spec for one named algorithm on the user's target "

@@ -1133,6 +1133,38 @@ def test_card_vs_research_port_fidelity_fields():
     assert "research_port" not in rrsi
 
 
+def test_show_and_describe_name_the_run_recipe(capsys):
+    """#1293: list/show/describe include a copyable algorithms run recipe."""
+    from agentdescent.mcp import Tools
+
+    flags = "--model <model> [--base-url <url>]"
+    cases = {
+        "gepa": "<your-prompt.txt>",
+        "evoskill": "<your-skill-dir>",
+        "archive_selection": "<path>",
+    }
+    for name, target in cases.items():
+        want = (f"agentdescent algorithms run {name} {target} "
+                f"<your-cases.jsonl> {flags}")
+        card = algorithms.get(name).describe()
+        assert card["run"] == want, name
+        assert Tools(None).describe_algorithm(name)["run"] == want
+        assert cli.main(["algorithms", "show", name, "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["run"] == want
+        assert cli.main(["algorithms", "show", name]) == 0
+        text = capsys.readouterr().out
+        assert f"run:         {want}" in text
+
+    # MCP list uses describe(), so each row carries the same recipe.
+    listed = {a["name"]: a["run"] for a in Tools(None).list_algorithms()["algorithms"]}
+    for name, target in cases.items():
+        assert listed[name].endswith(flags) and f" {target} " in listed[name]
+
+    # No shipped card is skill_library-only; pin that placeholder anyway.
+    lib = algorithms.run_recipe("demo_lib", ("skill_library",))
+    assert "<your-skill-library>" in lib and flags in lib
+
+
 def test_cli_show_and_plan_echo_card_surface(tmp_path, capsys):
     assert cli.main(["algorithms", "show", "gepa"]) == 0
     text = capsys.readouterr().out

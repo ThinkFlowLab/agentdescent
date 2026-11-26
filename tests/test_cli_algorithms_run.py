@@ -130,7 +130,10 @@ def test_algorithms_run_kind_mismatch_speaks_run_not_init(tmp_path, capsys, monk
     err = capsys.readouterr().err
     assert "--algorithm" not in err
     assert "agentdescent init" not in err
-    assert f"agentdescent algorithms run gepa {skill / 'SKILL.md'} --kind text" in err
+    assert (
+        f"agentdescent algorithms run gepa {skill / 'SKILL.md'} --kind text "
+        "--model <model> [--base-url <url>]"
+    ) in err
     assert not list(tmp_path.glob("agentdescent.*.spec.json"))
 
 

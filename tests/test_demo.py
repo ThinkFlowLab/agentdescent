@@ -212,6 +212,26 @@ def test_demo_algorithm_unknown_name_lists_the_real_ones(tmp_path, capsys):
     assert "unknown algorithm 'nope'" in err and "archive_selection" in err
 
 
+def test_demo_algorithm_live_model_refusal_names_model_flags(tmp_path, capsys, monkeypatch):
+    # #1291: plugin-quickstart already documents this refusal with --model /
+    # --base-url; the live CLI must match so a copied command can plan.
+    # Shrink the offline set so a built-in card takes this path.
+    monkeypatch.setattr(demo, "OFFLINE_ALGORITHMS", ("archive_selection", "evoskill"))
+    work = tmp_path / "work"
+    code = cli.main(["--store", str(tmp_path / "runs"), "demo",
+                     "--dir", str(work), "--algorithm", "gepa"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "does not run against the offline demo" in err
+    assert "needs a real model" in err
+    assert (
+        "agentdescent algorithms run gepa <path> <cases.jsonl> "
+        "--model <model> [--base-url <url>]"
+    ) in err
+    assert "agentdescent algorithms show gepa" in err
+    assert not work.exists()
+
+
 def test_offline_text_agent_uses_last_column_match():
     # ACE/DGM keep the seed and append lessons; the last COLUMN wins (#845).
     prompt = (

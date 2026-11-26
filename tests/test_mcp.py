@@ -168,6 +168,20 @@ def test_demo_refuses_unknown_cards_like_cli(store, capsys):
     assert code == 2 and unknown["error"] in err
 
 
+def test_demo_live_model_refusal_names_model_flags(store, monkeypatch):
+    """#1291: MCP demo uses demo_payload; the live-model refusal must name the flags."""
+    from agentdescent import demo
+
+    monkeypatch.setattr(demo, "OFFLINE_ALGORITHMS", ("archive_selection", "evoskill"))
+    out = Tools(store).demo(algorithm="gepa")
+    assert out.get("ok") is False
+    assert "does not run against the offline demo" in out["error"]
+    assert (
+        "agentdescent algorithms run gepa <path> <cases.jsonl> "
+        "--model <model> [--base-url <url>]"
+    ) in out["error"]
+
+
 def test_demo_evoskill_runs_offline_like_cli(store):
     """#934: evoskill is no longer a real-model-only card on demo or MCP."""
     t = Tools(store)

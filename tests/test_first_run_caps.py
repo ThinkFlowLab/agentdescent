@@ -283,6 +283,37 @@ def test_grok_bot_host_md_names_the_probe_and_the_cap():
     assert "evolve --max-calls" in drive
     assert "evolve the written" not in drive
 
+
+def test_skill_library_path_a_init_recipes_name_model_and_base_url():
+    """#1289: leftover skill-library Path A fences must name the flags plan requires."""
+    for rel in (
+        ("docs", "quickstart-skill.md"),
+        ("docs", "algorithm-decision-tree.md"),
+    ):
+        text = _read(*rel)
+        # Odd-indexed parts after split("```") are fenced bodies; prose
+        # before the first fence also mentions these tokens.
+        block = None
+        for part in text.split("```")[1::2]:
+            body = part
+            if body.startswith("bash"):
+                body = body.split("\n", 1)[1]
+            if "--kind skill_library" in body and "archive_selection" in body and "init " in body:
+                block = body
+                break
+        assert block is not None, rel
+        # Flags must sit on the init command (which may wrap with backslashes),
+        # before the plan line that follows it in the same fence.
+        fence = block
+        assert "--model <model>" in fence and "[--base-url <url>]" in fence, (rel, fence)
+        assert "plan spec.json --probe" in fence, (rel, fence)
+        init_idx = fence.find("init ")
+        plan_idx = fence.find("plan spec.json --probe")
+        flags_idx = fence.find("--model <model>")
+        assert init_idx != -1 and plan_idx != -1 and flags_idx != -1
+        assert init_idx < flags_idx < plan_idx, (rel, fence)
+
+
 def test_first_run_algorithms_run_recipes_name_model_and_base_url():
     """#1275: leftover first-run recipes must name the flags plan requires."""
     from agentdescent.integrations import grok_bot_host_md

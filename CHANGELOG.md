@@ -6,6 +6,394 @@ All notable changes to AgentDescent are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-11-27
+
+### Added
+
+- An operator can set `AGENTDESCENT_MAX_CALLS` as a ceiling on the model calls
+  every run in this process may make. A caller's `--max-calls` lowers it but
+  cannot raise it, and a run that names no call cap still gets it; a run that
+  reaches the ceiling ends `done` with `stop_reason="budget"` and a
+  `stop_detail` naming the variable, whether the run is foreground or detached.
+  Calls only: a dollar ceiling needs a per-call price, which an un-priced run
+  does not have (#1082).
+
+- The MCP `plan` and `start` tools take `max_calls` and `max_usd`, so a host can
+  bound a run's model calls per call instead of only through the process-wide
+  `AGENTDESCENT_MAX_CALLS`. Both validate through the same rule the CLI uses (a
+  `max_usd` without a price refuses with the CLI's own sentence) and report
+  `call_limit` with what was asked for and what will be enforced; the operator's
+  ceiling lowers a caller's number and never raises it, and `start` launches the
+  detached run under the clamped cap (#1184).
+
+- The first-run surfaces now name the preflight and the per-call cap that
+  `docs/start.md` already documents: the shared host skill (and its Claude Code
+  and DSH renditions) tells a host to pass `max_calls` / `max_usd` on MCP
+  `plan` / `start` or `--max-calls` / `--max-usd` on the CLI, the
+  plugin-quickstart habits and the `docs/plugins.md` budget section point at the
+  same cap beside the older `--budget` overshoot warning, and the `next:` line
+  from `algorithms run` now reads `plan <spec> --probe, then evolve <spec>
+  --max-calls N` with N from the plan's own `agent_calls_upper_bound`. The
+  `demo --algorithm` footer gains the same two steps (`<N>` there: the footer
+  runs before a spec exists) and `--out spec.json`, so the steps have a path
+  (#1201).
+
+- `docs/bench-index.md` indexes the sixteen `bench/` modules that run on their
+  own: what each one measures, the command it takes, whether it runs offline or
+  needs a provider key, and the committed artefact under `bench/results/` when one
+  exists. `tests/test_bench_index.py` pins the page to the tree in both
+  directions, so a new bench module without a row fails the suite (#1239).
+
+- `status` shows a live run's call cap beside its spend — `calls=137/200` — where
+  it used to print a bare `calls=137`, so a reader can tell 137 of 200 from 137
+  of 20,000 before the run stops. `RunStatus.calls_cap` is written from the limit
+  the run actually enforces (the operator ceiling and a Ticket's remainder
+  included) and omitted from `status.json` when the run has no call cap, so an
+  uncapped or dollar-only run writes the same bytes as before (#1249).
+
+- `python -m bench` lists the benchmark modules that can be run on their own, one
+  line per module saying what it measures, and `python -m bench <name> ...`
+  dispatches to that module; an unknown name exits `2` with the list instead of a
+  traceback (#1262).
+
+- A long-horizon bench (`python -m bench.long_horizon`) evolves one playbook
+  across 5–15 sequential steps on a git ledger, with a deterministic offline
+  proposer and `DefaultAcceptance` gating each rewrite on held-out checks. It
+  reports retention, per-check forgetting (mean, max, fraction), paired transfer
+  on a fresh check set, and cost, alongside the refusals as well as the commits.
+  On its 3-seed run every seed ends at the domain's reachable ceiling and is
+  still a `forgetting` verdict, because two check families were erased on the
+  way (#941).
+
+- Every evidence card now says what reproduces it on one `command:` line — an
+  argv that `python -m tools.evidence_card --check` resolves offline, or
+  `no offline command -- <why>` when nothing in the repository reproduces the
+  claim — and the checker refuses a missing or unresolvable one by card name. The
+  11 published cards gained that line, and
+  `reports/evidence/results-baselines-plan-runs.json` pins the baselines plan's 18
+  runs, which `docs/results.md` asserted but nothing checked (#951).
+
+### Changed
+
+- A refused probe now prints one JSON contract on every surface: `ok: false`,
+  `ready: false` and `next` as the repair action. The MCP `plan` tool gains
+  `ready` (it had only `ok: false`), and `plan --probe --json` /
+  `algorithms run --probe --json` now set `ok: false` instead of `ok: true`, so a
+  host reads the same keys and reaches the same verdict whichever surface it
+  drives (#1175).
+
+  This supersedes the 0.11.0 entry (#1093), which said: "`--json` sets
+  `ready: false` while leaving `ok` about the plan itself, and a successful or
+  omitted probe is unchanged (#1093)." It now sets `ok: false` too, on both
+  surfaces, because a refusal is not success anywhere; a successful or omitted
+  probe is still unchanged.
+
+- The label-only controller now also runs on the `pull_request` `opened`,
+  `ready_for_review` and `reopened` events, so a new PR is labelled immediately
+  instead of waiting for a `schedule` tick. The cron moves from every 30 minutes
+  (48 declared slots, in practice two or three runs a day) to `17 */6 * * *`, a
+  backstop only; a `pull_request` run from a fork head is skipped by both jobs
+  because it cannot hold a write token (#1187).
+
+- `AGENTS.md` now describes the label controller as event-driven (`opened` /
+  `ready_for_review` / `reopened`, with a four-a-day cron backstop) instead of
+  "every 30 minutes" (#1197).
+
+### Fixed
+
+- `AGENTDESCENT_MAX_CALLS` is now a budget for one worker session, not a number
+  each run may ask for again: an MCP `start` after earlier runs is clamped to
+  what the Ticket has left, reports `call_limit.ticket` with ceiling/spent/
+  remaining, and refuses outright once the ceiling is spent (#1082). The clamp is
+  what the run is actually started with, not just what the reply says, and a
+  started run holds its cap until it reports, so two overlapping starts cannot
+  both take the remainder (#1082).
+
+  A run whose status cannot be read is no longer counted as free: the Ticket
+  refuses to start or resume anything until the run store is readable again,
+  instead of granting a remainder that may already be spent. A `max_usd` without
+  `usd_per_call` is still refused with the argument named in the message, now
+  from inside the same gate (#1196).
+
+  `resume` shares the same Ticket remainder as `start`: a run this server started
+  is relaunched with its ledger plus what is left, and a run it did not start is
+  registered and charged on its first resume here, its whole earlier ledger
+  counted, with no grant once that ledger fills the remainder.
+
+- `agentdescent snapshot eval --json` now prints `"ok": false` when a task in the
+  eval failed, instead of always `true` while the command exited 1. The field
+  matches the exit code again, like the `ok` field every other `--json` verb
+  derives; `n`, `reward` and `failed` are unchanged (#1179).
+
+- A spec whose `evolve` block sets `max_usd` without `usd_per_call` is refused with
+  `evolve.max_usd needs evolve.usd_per_call beside it` instead of advising a
+  `--usd-per-call` flag that `compose` refuses before the CLI reads it; the CLI and
+  run-store wording is unchanged (#1183).
+
+- `agentdescent show --diff` previews the same write `apply` performs: when the
+  directory backup a plan would take sits outside
+  `AGENTDESCENT_SURFACE_WRITE_DIRS`, its `apply_plan` reports that refusal --
+  naming the path and the allowed roots -- instead of listing the same files as
+  `written` (#1188).
+
+- `--json evolve` and `--json show` now include `stop_detail` when a run-level
+  cap stopped the run, so the machine output names the limit that fired instead
+  of only `"stop_reason": "budget"`. The key is omitted when no cap tripped, so
+  an uncapped payload keeps its previous shape (#1190).
+
+- The label controller skips a draft pull request instead of labelling it, so a
+  draft parked before it is ready no longer picks up `agent-pr` or a `risk:T*`
+  label and enter the review queue; a pull request marked ready is labelled as
+  before (#1192).
+
+- The MCP `plan` / `start` tools no longer answer an unpriced `max_usd` with the
+  CLI's `--usd-per-call` sentence: they now name `usd_per_call`, the argument the
+  host passes in the same tool call. A Python `runstore.launch` / `execute` caller
+  is told to set `usd_per_call` beside it, and the command line keeps its own
+  sentence unchanged (#1196).
+
+- A failed model call now records the tokens its provider reported -- a 4xx body,
+  or a stream that died after its last chunk -- so the run's totals and the
+  `max_tokens` meter no longer under-report what was spent. `Usage` gains
+  `failed_usage_attempts` and `failed_usage_tokens`, which report that part of
+  the bill; both are additive fields with defaults, and the accounting basis is
+  unchanged (#1202).
+
+- Sixteen annotation names `agentdescent` uses in annotations that nothing bound at
+  module scope now resolve there: `Union`, `Optional` and `Sequence` join existing
+  `typing` imports, `selection.py` gets a plain `import random`, and twelve
+  cycle-prone cross-module names sit behind `if TYPE_CHECKING:` blocks (seven new,
+  one extended). Static readers -- a type checker, a schema generator, the new
+  `tests/test_annotation_names.py` sweep -- now resolve all 24 sites. Runtime
+  `typing.get_type_hints()` is unchanged for the twelve names kept behind
+  `if TYPE_CHECKING:` (that block does not execute), which is why the issue scopes
+  this as AST-level; no annotation text, signature or generated API text changes
+  (#1203).
+
+- `agentdescent show --diff` previews every destination `apply` refuses, not
+  only the write-dir boundary: a text artifact whose target is a directory or
+  a symlink, and a tree whose root is a symlink, now appear as
+  `apply_plan.error` with `apply`'s own message, and `show` stays read-only
+  (#1204).
+
+- `agentdescent show --diff` and `apply --dry-run` no longer advertise a write
+  whose nearest existing parent is a regular file; the preview and the real
+  `apply` now name the blocking file (`cannot write <dest>: '<ancestor>' is a
+  file, not a directory`) instead of `File exists` on a destination that never
+  existed (#1208).
+
+- The controller workflow also runs on the `issues` events `labeled`, `unlabeled`
+  and `edited`, so an approval that someone voided by setting a label or editing
+  the issue is read in the same minute instead of at the next cron tick -- the
+  schedule once skipped 14 h 16 min (#1209).
+
+- The default `demo` footer (and `demo --kind skill_library`) and a successful
+  bare `plan` now name the same first-run preflight and per-call cap that
+  #1212 already put on `algorithms run` / `demo --algorithm`: after `init`
+  and `doctor`, `plan spec.json --probe`, then `evolve spec.json --max-calls
+  <N>` (a placeholder on the demo, which has no user estimate yet). Bare
+  `plan` recommends `evolve --max-calls N` from its own
+  `estimate.agent_calls_upper_bound`, names `plan --probe` first when this
+  invocation did not already probe, and `--json` carries the same `next`
+  string. A refused probe still prints the repair plus `then: plan --probe`
+  (#1175 / #1093) (#1217).
+
+- `plan`'s `next:` line no longer raises a call cap the spec already declares: a
+  spec with `evolve.max_calls` is advised at `min(bound, declared)`, a spec with
+  `max_usd` + `usd_per_call` gets no `--max-calls` at all (also when it declares
+  both, since a flag would replace that dollar cap), and `--json.next` is the
+  same string. The `estimate.agent_calls_upper_bound` reading is unchanged
+  (#1219).
+
+- `show --diff` and `apply --dry-run` no longer advertise a tree leaf whose
+  intermediate path is already a regular file; the preview and the real
+  `apply` now name the blocking file (`cannot write <leaf>: '<path>' is a
+  file, not a directory`) instead of listing the leaf as `written` and then
+  failing the real write with `File exists` (#1221).
+
+- `show --diff` and `apply --dry-run` no longer advertise a tree leaf that is
+  already a directory, and `apply --from` no longer writes inside that
+  directory; the preview and the real `apply` now name the blocking path
+  (`cannot write <leaf>: '<leaf>' is a directory, not a file`) instead of
+  listing the leaf as `written` and then failing the real write with
+  `Is a directory`, or nesting a file at `<leaf>/<leaf>` (#1223).
+
+- `show --diff`, `apply --dry-run` and `apply` now refuse a tree leaf that is a
+  FIFO, a socket or a device instead of advertising it as `written`: the preview
+  and the write both name the blocking path (`cannot write <leaf>: '<leaf>' is a
+  named pipe`). `apply --no-backup` no longer blocks in `open(..., "w")` after
+  writing the leaves that sort before the blocking one, and `load_tree` refuses a
+  non-regular entry instead of blocking on it, so `show --diff` returns too
+  (#1225).
+
+- `show --diff` and `apply --dry-run` no longer advertise a tree write whose
+  backup directory cannot be created, and the real write no longer fails with the
+  backup's errno printed against a good destination; every surface now names the
+  blocking path (`cannot write <slot>: '<backup root>' is a file, not a
+  directory`) before anything is written (#1226).
+
+- Installed `/evolve` and `/algorithms run` slash commands (and the MCP
+  `algorithm_spec` description) now name the same first-run `plan --probe` /
+  `probe=true` preflight and `max_calls` / `--max-calls` cap as `SKILL.md`
+  and the CLI `next:` line, so a host following the command no longer starts
+  a first real run without them. Claude / Codex / OpenCode command files stay
+  byte-identical (#1228).
+
+- `apply` and its previews now refuse a link planted inside the destination — at
+  a tree leaf or on the way to one — with the writer's own rule instead of
+  advertising the write and then exiting on an uncaught `TreeError`: `show
+  --diff`, `apply --dry-run`, `apply`, `apply --from` and `apply --install-to`
+  name the same block. The rule is `filetree.dest_problem`, the one
+  `materialize` enforces, so the preview cannot drift from the write (#1230).
+
+- The README and Get started CLI quickstart, the host skill's Without-MCP
+  cheatsheet (and the rendered dsh copy), the plugin-quickstart command
+  block, and Grok Bot `HOST.md` now name the same first-run `plan --probe`
+  and `evolve --max-calls N` as the skill procedure and the CLI `next:`
+  line, so a copied first run is no longer missing the preflight or the
+  per-call cap (#1232).
+
+- Every job in `.github/workflows/*.yml` now declares a finite
+  `timeout-minutes` instead of inheriting GitHub's 360-minute default: docs
+  build/deploy 15/15, publish build/publish 15/15, publish-npm publish 15,
+  and tests test/otel-wire 45/15, each held above the slowest observed run
+  (`tests` test at 30m12s is why it gets 45, not 30). A hung Pages deploy or
+  OIDC exchange now fails in the hour it happens rather than holding a
+  runner for six, and the new `tests/test_workflow_job_timeouts.py` pins
+  both the invariant and the values (#1235).
+
+- `status`, `show`, `diagnose` and `cancel` now report
+  `cannot read run '<id>': …` when `status.json` is damaged or the wrong
+  shape, instead of raising `JSONDecodeError` / `TypeError` out of the MCP
+  server or as a CLI traceback; a missing `status.json` still says
+  `no status.json; not a run directory`. `resume` of a damaged run still
+  refuses with `ok: false` and the Ticket's `cannot be accounted` sentence
+  (#1236, #1082).
+
+- The last two first-run copy-paste blocks — the Path A skill-library recipe in
+  the artifact quickstart and the `archive_selection` recipe in the algorithm
+  decision tree — now name the same `plan --probe` preflight, and the quickstart
+  block names `evolve --max-calls N`, as `start.md`, the README and the CLI
+  `next:` line already do (#1237).
+
+- A run clamped to what an operator's Ticket has left now names
+  `AGENTDESCENT_MAX_CALLS` in its own `stop_detail`, instead of the bare
+  `cap N` that looked exactly like a caller who had asked for that number;
+  the same run with no caller cap names it too. The enforced number and the
+  `call_limit` payload do not change (#1241).
+
+- The socket-leaf row in `tests/test_apply_non_regular_leaf.py` now binds through
+  a short root when `tmp_path` rides on a long `TMPDIR`, so the row exercises the
+  product on every host instead of dying in `bind` with `AF_UNIX path too long` —
+  the test only, no product behaviour changed (#1245).
+
+- `apply --from` now refuses a source tree that holds a non-regular entry, naming
+  it (`'references/rules.md' is a named pipe`) instead of planning it as a file:
+  the comparison used to `open` a FIFO and block until a peer appeared, forever
+  when none did, and a socket or device failed unread. The `--to` side keeps its
+  old behaviour (#1246).
+
+- A registered `resume` clamped by the operator's Ticket ceiling now names that
+  ceiling in the resumed run's `stop_detail` (`max_calls (AGENTDESCENT_MAX_CALLS):
+  2 call(s) made, cap 2`) instead of the bare `max_calls: … cap 2` that
+  contradicted the reply's `source`. The marker is scoped to the run it was
+  applied to, so a descendant that inherits it cannot label a run of its own, and
+  a caller that names its own cap stays bare (#1247).
+
+- `show`, `show --diff`, `apply --dry-run` and `apply` now refuse a `text`
+  destination that is a named pipe, a socket or a device instead of blocking
+  forever in `open` while deciding `unchanged`, and `apply --from <file> --to
+  <path>` refuses the same destination with the same sentence. The four surfaces
+  name the kind (`'<path>' is a named pipe`) and exit 2 for `apply`, exit 0 with
+  that sentence in `apply_plan.error` for the previews (#1248).
+
+- `plan` and `algorithms run` on a `kind=text` spec now name the case `fixtures`
+  a text prompt never shows: the runner sends `{skill} + {prompt}` and has no
+  workspace, so a `skill_dir` `cases.jsonl` reused through the one-file hint
+  planned `ok` while the model could not read the CSV. The note names the
+  dropped files and the repair (inline the body, or reuse the prompt-inlined
+  cases from `agentdescent demo --kind text`), and the kind-mismatch hint no
+  longer stops at `--kind text` without saying that `fixtures` stay behind
+  (#1251).
+
+- `plan`'s `next:` line, `--json.next` and `warnings` now name the smallest of
+  the structural bound, the spec's declared cap and the operator ceiling, so a
+  2-call `AGENTDESCENT_MAX_CALLS` no longer advises `--max-calls 52` for a run
+  that stops after two calls; the warning reads
+  `AGENTDESCENT_MAX_CALLS=2 caps this run at 2 calls; the plan estimates 52`.
+  A spent Ticket makes the MCP `plan` tool refuse in `start`'s exact sentence
+  instead of reporting `ok: true` with `max_calls: 0`. The estimate, the
+  `call_limit` numbers and every stop reason are unchanged (#1252).
+
+- `docs/dsh-super-agent.md` cited the `mcp-agentdescent` row as
+  `cordis.patch.yml:8-26` on a page whose value is that its citations are the
+  verified part, while that file has 17 lines and the row is `:7-17`. The
+  citation now names the range that exists, and `tests/test_docs_citations.py`
+  fails when a `path:line` citation in `docs/` or `README.md` runs past the end
+  of its file or names a file that is not in this repository (#1259).
+
+- The dataset cache root is resolved at call time: `AGENTDESCENT_CACHE` names it
+  directly, `XDG_CACHE_HOME` puts it under `<XDG_CACHE_HOME>/agentdescent`, and
+  with neither set it stays `~/.cache/agentdescent`. A dataset-backed port or
+  bench run no longer dies with `OSError: [Errno 30] Read-only file system` on a
+  container or CI host whose home is read-only (#1261).
+  On a read-only-`$HOME` box, point `AGENTDESCENT_CACHE` at a scratch directory
+  rather than moving `HOME`: `HOME` also moves the Python user site, so the
+  interpreter can lose its installed packages, while `AGENTDESCENT_CACHE` moves
+  only the dataset cache.
+
+- The demo footer names the limit that stopped the run instead of reporting the
+  result as "lower than expected for the demo": a run halted by
+  `AGENTDESCENT_MAX_CALLS` (or another cap) now prints the recorded
+  `stop_detail`, and `demo --json` carries the same cause in `note` (#1270).
+
+- `examples.skill_evolution.download_bbh` and the ADAS hard-subset cache now
+  write through `dataloader.cache_path`, so they honor `AGENTDESCENT_CACHE` /
+  `XDG_CACHE_HOME` instead of always mkdir'ing under `~/.cache/agentdescent`
+  (#1273).
+
+- First-run `algorithms run` recipes on the host skill, the `/algorithms`
+  slash command (and its MCP `algorithm_spec` run branch), Grok Bot
+  `HOST.md`, the generated `docs/algorithms.md` cheatsheet, and the
+  plugin-quickstart refusal line now name `--model` and `--base-url`, in
+  the same shape the `demo --algorithm` footer already prints, so a copied
+  first look can plan instead of exiting on placeholders (#1275).
+
+- `source_fingerprint` now refuses an `ALGORITHMS` key that names no
+  `examples/<key>/` directory, instead of silently hashing nothing for
+  that port, and a test pins each `PROPOSAL_CALLS_PER_CANDIDATE` entry
+  to the policy's reservation (#1283).
+
+- The default `demo` footer (including `--kind skill_library` / `--kind text`
+  and the MCP `demo` `next` list), the first-run `init ./my-skill` blocks in
+  README, `docs/start.md`, and `docs/plugin-quickstart.md`, and the generated
+  `docs/algorithms.md` cheatsheet `init` line now name `--model` and
+  `--base-url`, in the same shape #1276 already put on `algorithms run`, so a
+  copied first run can plan instead of exiting on placeholders (#1287).
+
+- The Path A skill-library `init` recipes in `docs/quickstart-skill.md` and
+  `docs/algorithm-decision-tree.md` now name `--model` and `--base-url`, in the
+  same shape #1288 already put on the first-run `init ./my-skill` blocks, so a
+  copied `archive_selection` library run can plan instead of exiting on
+  placeholders (#1289).
+
+- The `demo --algorithm` refusal for a card that needs a real model, and the
+  kind-mismatch hint that retargets a text-only card at one file, now name
+  `--model` and `--base-url`, in the same shape #1276 already put on first-run
+  `algorithms run` recipes, so a copied refusal can plan instead of exiting
+  on placeholders (#1291).
+
+- `algorithms show` and MCP `describe_algorithm` now include a copyable
+  `algorithms run` recipe that names `--model` and `--base-url`, in the same
+  shape first-run recipes already use, so listing a card can plan instead of
+  leaving the Path A verb and the flags `plan` requires unstated (#1293).
+
+- A successful `init` now names `plan <spec> --probe` in `then:` and `--json`
+  `next`, the same preflight every other first-run surface already teaches.
+  When the written spec still has placeholders, that line names `--model` /
+  `--base-url` (or filling the placeholders) instead of a `plan` that would
+  exit 2 (#1295).
+
 ## [0.11.0] — 2026-11-20
 
 ### Added
@@ -8245,7 +8633,8 @@ First public release on PyPI as **`agentdescent`**.
   discrete-space `Aggregator`, staleness policies, DP/TP/PP parallelism, layered
   governance, and the provider-agnostic `agentdescent.agents` completion layer.
 
-[Unreleased]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ThinkFlowLab/agentdescent/compare/v0.8.0...v0.9.0

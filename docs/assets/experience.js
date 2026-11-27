@@ -434,7 +434,7 @@
       return `"${cli}": ${demoHosts[k] === host ? `"/usr/local/bin/${cli}"` : 'null'}`;
     }).join(', ');
     if (!await toolCall('doctor', '', [
-      '{"version": "0.11.0",',
+      '{"version": "0.12.0",',
       ` "agent_clis": {${clis}, "git": "/usr/bin/git"},`,
       ' "provider_keys_present": {"ANTHROPIC_API_KEY": false, "OPENAI_API_KEY": false, "ARK_API_KEY": true},',
       ` "run_store": "${HOME}/.agentdescent/runs",`,

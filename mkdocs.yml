@@ -11,7 +11,7 @@ site_url: https://thinkflowlab.github.io/agentdescent/
 repo_url: https://github.com/ThinkFlowLab/agentdescent
 repo_name: ThinkFlowLab/agentdescent
 site_author: AgentDescent
-copyright: Copyright &copy; 2026 AgentDescent · MIT · v0.11.0
+copyright: Copyright &copy; 2026 AgentDescent · MIT · v0.12.0
 edit_uri: edit/main/docs/
 docs_dir: docs
 site_dir: site

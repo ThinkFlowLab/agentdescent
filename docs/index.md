@@ -12,7 +12,7 @@ description: AgentDescent is a modular evolve engine for prompts, skills, progra
 
   <main id="main">
     <section class="exp-hero">
-      <div class="hero-content"><div class="eyebrow"><span class="pulse-dot"></span> OPEN SOURCE · <a class="version-badge" href="https://pypi.org/project/agentdescent/">v0.11.0</a> · BUILT FOR CODING AGENTS</div><h1>Evolve<br><em>anything.</em></h1><p class="hero-tagline">Diffs are the gradients; the aggregator is the optimizer.</p><p>Prompts, skills, programs, agent harnesses, or your own artifact type. AgentDescent gives each a measurable evolution loop, with interchangeable modules for how candidates are proposed, selected, merged and accepted.</p><div class="hero-ctas"><a class="exp-button primary" href="install/">Install AgentDescent <span>↗</span></a><a class="exp-button ghost" href="#framework">Explore the framework <span>↓</span></a></div><div class="hero-command"><span>$</span><code tabindex="0">curl -fsSL https://raw.githubusercontent.com/ThinkFlowLab/agentdescent/main/scripts/install.sh | bash</code><button class="exp-copy" data-copy="curl -fsSL https://raw.githubusercontent.com/ThinkFlowLab/agentdescent/main/scripts/install.sh | bash">Copy</button></div></div>
+      <div class="hero-content"><div class="eyebrow"><span class="pulse-dot"></span> OPEN SOURCE · <a class="version-badge" href="https://pypi.org/project/agentdescent/">v0.12.0</a> · BUILT FOR CODING AGENTS</div><h1>Evolve<br><em>anything.</em></h1><p class="hero-tagline">Diffs are the gradients; the aggregator is the optimizer.</p><p>Prompts, skills, programs, agent harnesses, or your own artifact type. AgentDescent gives each a measurable evolution loop, with interchangeable modules for how candidates are proposed, selected, merged and accepted.</p><div class="hero-ctas"><a class="exp-button primary" href="install/">Install AgentDescent <span>↗</span></a><a class="exp-button ghost" href="#framework">Explore the framework <span>↓</span></a></div><div class="hero-command"><span>$</span><code tabindex="0">curl -fsSL https://raw.githubusercontent.com/ThinkFlowLab/agentdescent/main/scripts/install.sh | bash</code><button class="exp-copy" data-copy="curl -fsSL https://raw.githubusercontent.com/ThinkFlowLab/agentdescent/main/scripts/install.sh | bash">Copy</button></div></div>
       <div class="hero-aside" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit orbit-three"></div><div class="orbit-center">a<span>↘</span></div><div class="orbit-note note-one">artifact <b>01</b></div><div class="orbit-note note-two">algorithm <b>02</b></div><div class="orbit-note note-three">evolve() <b>03</b></div></div>
     </section>
 
@@ -46,7 +46,7 @@ description: AgentDescent is a modular evolve engine for prompts, skills, progra
 
     <section class="exp-cta"><div><span class="section-label">READY WHEN YOU ARE</span><h2>Start with your agent.</h2><p>One command installs AgentDescent and connects supported agents on your PATH.</p></div><a class="exp-button primary" href="install/">Open Quickstart <span>↗</span></a></section>
   </main>
-  <footer class="exp-footer"><a class="exp-brand" href="./"><span class="brand-mark">a<span>↘</span></span> agentdescent</a><span>Open source · MIT · <a href="https://pypi.org/project/agentdescent/">v0.11.0</a></span><div><a href="https://github.com/ThinkFlowLab/agentdescent">GitHub ↗</a><a href="https://pypi.org/project/agentdescent/">PyPI ↗</a><a href="https://deepwiki.com/ThinkFlowLab/agentdescent">DeepWiki ↗</a><a href="plugins/">Plugin docs</a><a href="results/">Results</a></div></footer>
+  <footer class="exp-footer"><a class="exp-brand" href="./"><span class="brand-mark">a<span>↘</span></span> agentdescent</a><span>Open source · MIT · <a href="https://pypi.org/project/agentdescent/">v0.12.0</a></span><div><a href="https://github.com/ThinkFlowLab/agentdescent">GitHub ↗</a><a href="https://pypi.org/project/agentdescent/">PyPI ↗</a><a href="https://deepwiki.com/ThinkFlowLab/agentdescent">DeepWiki ↗</a><a href="plugins/">Plugin docs</a><a href="results/">Results</a></div></footer>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -57,7 +57,7 @@ description: AgentDescent is a modular evolve engine for prompts, skills, progra
     "url": "https://thinkflowlab.github.io/agentdescent/",
     "codeRepository": "https://github.com/ThinkFlowLab/agentdescent",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "0.11.0",
+    "softwareVersion": "0.12.0",
     "description": "A parallel, asynchronous framework for self-evolving LLM agents. Diffs are the gradients; the aggregator is the optimizer.",
     "sameAs": ["https://pypi.org/project/agentdescent/", "https://deepwiki.com/ThinkFlowLab/agentdescent", "https://doi.org/10.5281/zenodo.22348027"]
   }

@@ -27,7 +27,7 @@ deeper reference when you need it.
 ### Getting started
 
 1. **Install and see the loop once, offline.**
-   `pip install "agentdescent[mcp]>=0.11.0"`, then `agentdescent demo`.
+   `pip install "agentdescent[mcp]>=0.12.0"`, then `agentdescent demo`.
    Skill evolution means a multi-file library:
    `agentdescent demo --kind skill_library`.
    [Install and first run](start.md)

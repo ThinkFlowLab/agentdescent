@@ -466,3 +466,79 @@ def test_algorithms_run_plan_failure_json_has_notes(tmp_path, capsys, monkeypatc
     assert isinstance(obj["warnings"], list)
     assert any(f"{out}.bak-0" in n for n in obj["notes"])
     assert not any(k.startswith("_") for k in obj)
+
+
+def test_algorithms_run_probe_success_next_is_capped_evolve_only(
+        tmp_path, capsys, monkeypatch):
+    """#1301: after a successful --probe, next is the capped evolve only, like plan --probe."""
+    monkeypatch.chdir(tmp_path)
+    prompt, cases = _prompt_and_cases(tmp_path)
+    out = tmp_path / "out.spec.json"
+    monkeypatch.setattr(
+        cli, "_probe_if_asked",
+        lambda a, spec: {"ok": True, "rows": [
+            {"field": "agent", "state": "ok", "model": "m"}]})
+    assert cli.main([
+        "algorithms", "run", "gepa", str(prompt), str(cases),
+        "--model", "m", "--base-url", "https://example.test/v1",
+        "--out", str(out), "--probe",
+    ]) == 0
+    printed = capsys.readouterr().out
+    nxt = [line for line in printed.splitlines() if line.startswith("next:")]
+    assert nxt, printed
+    line = nxt[-1]
+    assert line.startswith(f"next: agentdescent evolve {out} --max-calls "), line
+    assert "--probe" not in line
+    assert "then: " not in printed
+
+    assert cli.main([
+        "--json", "algorithms", "run", "gepa", str(prompt), str(cases),
+        "--model", "m", "--base-url", "https://example.test/v1",
+        "--out", str(out), "--probe",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["ready"] is True
+    assert payload["probe"]["ok"] is True
+    assert payload["next"].startswith(f"agentdescent evolve {out} --max-calls ")
+    assert "--probe" not in payload["next"]
+
+
+def test_algorithms_run_probe_refusal_keeps_repair_next(
+        tmp_path, capsys, monkeypatch):
+    """#1301: a refused --probe still names the repair, not evolve."""
+    monkeypatch.chdir(tmp_path)
+    prompt, cases = _prompt_and_cases(tmp_path)
+    out = tmp_path / "out.spec.json"
+    repair = ("renew the subscription at the provider, or point api_key_env / "
+              "model at another plan")
+    monkeypatch.setattr(
+        cli, "_probe_if_asked",
+        lambda a, spec: {
+            "ok": False,
+            "rows": [{"field": "agent", "state": "failed", "model": "m",
+                      "next": repair}],
+        })
+    assert cli.main([
+        "algorithms", "run", "gepa", str(prompt), str(cases),
+        "--model", "m", "--base-url", "https://example.test/v1",
+        "--out", str(out), "--probe",
+    ]) == 1
+    captured = capsys.readouterr()
+    printed = captured.out
+    nxt = [line for line in printed.splitlines() if line.startswith("next:")]
+    assert nxt, printed
+    assert nxt[-1] == f"next: {repair}"
+    assert f"then: agentdescent plan {out} --probe" in printed
+    assert "evolve" not in nxt[-1]
+
+    assert cli.main([
+        "--json", "algorithms", "run", "gepa", str(prompt), str(cases),
+        "--model", "m", "--base-url", "https://example.test/v1",
+        "--out", str(out), "--probe",
+    ]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["ready"] is False
+    assert payload["next"] == repair
+    assert "evolve" not in payload["next"]

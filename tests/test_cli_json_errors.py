@@ -191,7 +191,7 @@ def test_init_success_is_one_json_object_with_json(tmp_path, capsys, monkeypatch
     assert payload["providers_config"] is None
     assert isinstance(payload["warnings"], list)
     assert all(not w.startswith("warning:") for w in payload["warnings"])
-    assert payload["next"][-1] == "agentdescent plan spec.json"
+    assert payload["next"][-1] == "re-run with --model / --base-url, or fill the placeholders in spec.json, then agentdescent plan spec.json --probe"
     assert (tmp_path / "spec.json").exists()
     assert err == ""
 
@@ -202,4 +202,4 @@ def test_init_success_without_json_stays_prose(tmp_path, capsys, monkeypatch):
     assert cli.main(["init", "prompt.md", "--out", "spec.json"]) == 0
     out, _ = capsys.readouterr()
     assert out.startswith("wrote spec.json\n")
-    assert out.rstrip().endswith("then: agentdescent plan spec.json")
+    assert out.rstrip().endswith("then: re-run with --model / --base-url, or fill the placeholders in spec.json, then agentdescent plan spec.json --probe")

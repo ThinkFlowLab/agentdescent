@@ -99,6 +99,8 @@ def test_missing_cases_names_the_field_not_a_positional(tmp_path):
     assert "third argument" not in r["error"] and "`cases`" in r["error"]
     assert "spec" not in r       # no path string masquerading as the spec dict
     assert r["spec_path"].endswith("agentdescent.gepa.spec.json")
+    # #1299: the failed path inherits algorithms run's retry, including --probe.
+    assert r["next"] == f"agentdescent plan {r['spec_path']} --probe"
 
 
 def test_same_object_as_algorithms_run_json(tmp_path, capsys):

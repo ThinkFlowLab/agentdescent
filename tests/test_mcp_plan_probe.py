@@ -39,12 +39,14 @@ ARK_SUBSCRIPTION = {
     }
 }
 
-#: What `Tools().plan(spec)` returned before the probe existed (base
-#: f8efc73), for the spec below: a fresh key set or a dropped key is a shape
-#: change a host would see, so the default path is pinned key by key.
+#: What `Tools().plan(spec)` returns on the default (no-probe) path, for the
+#: spec below: a fresh key set or a dropped key is a shape change a host
+#: would see, so the default path is pinned key by key. `next` was added in
+#: #1296 so a host that called plan directly still sees the preflight and
+#: the capped start; `ready` / `probe` stay off this path.
 BASE_PLAN_KEYS = {
-    "artifact_id", "estimate", "evolve_kwargs", "kind", "notes", "ok", "spec",
-    "tasks", "warnings",
+    "artifact_id", "estimate", "evolve_kwargs", "kind", "notes", "next", "ok",
+    "spec", "tasks", "warnings",
 }
 
 
@@ -130,6 +132,12 @@ def test_omitting_the_probe_returns_exactly_the_old_payload(tmp_path):
     out = Tools(str(tmp_path / "runs")).plan(_spec())
     assert set(out) == BASE_PLAN_KEYS, sorted(set(out) ^ BASE_PLAN_KEYS)
     assert "probe" not in out
+    bound = out["estimate"]["agent_calls_upper_bound"]
+    assert bound > 0
+    assert "probe=true" in out["next"]
+    assert f"max_calls={bound}" in out["next"]
+    assert "do not start" in out["next"]
+    assert "start" in out["next"]
 
 
 def test_every_host_skill_teaches_the_probe(tmp_path):
@@ -201,3 +209,16 @@ def test_both_surfaces_publish_ok_and_ready_true_for_a_healthy_probe(tmp_path,
 def test_the_mcp_plan_without_a_probe_has_no_ready_key(tmp_path):
     out = Tools(str(tmp_path / "runs")).plan(_spec())
     assert "ready" not in out
+    assert "probe" not in out
+    assert "next" in out
+
+
+def test_a_successful_mcp_plan_without_a_probe_names_the_preflight_and_cap(tmp_path):
+    """#1296: the silent MCP plan success must name probe=true and a capped start."""
+    out = Tools(str(tmp_path / "runs")).plan(_spec())
+    assert out["ok"] is True, out
+    bound = out["estimate"]["agent_calls_upper_bound"]
+    assert out["next"] == (
+        "call plan with `spec` and probe=true; if that refuses, follow "
+        "its next and do not start; otherwise call start with `spec` and "
+        f"max_calls={bound}")

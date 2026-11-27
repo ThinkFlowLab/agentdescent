@@ -173,7 +173,9 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "contract as the CLI (`ok: false`, `ready: false`) with `next` naming the "
         "fix, so do not call start then. Pass max_calls (and/or max_usd with "
         "usd_per_call) to cap the run at the model call; the reply's `call_limit` is "
-        "what start would enforce. Show the user the "
+        "what start would enforce. A successful call without probe returns "
+        "`next` naming `plan(spec, probe=true)` and then `start` with "
+        "`max_calls` from the estimate (or `<N>` if none). Show the user the "
         "spec and the estimate and get a yes before calling start."),
     "start": (
         "Start an evolution run in the background and return its run_id at once. The run "
@@ -414,6 +416,22 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "the server reads any trace path it is given, like the other read-only path "
         "tools."),
 }
+
+
+def _first_run_next(payload: Dict[str, Any], *, lead: str = "") -> str:
+    """The host-facing first-run ``next``: probe, then a capped ``start`` (#1296).
+
+    MCP tools speak tool names, not CLI verbs. The bound is the plan's own
+    ``estimate.agent_calls_upper_bound``; ``<N>`` is the placeholder when
+    that number is not known yet (the same convention as the CLI ``<N>``).
+    """
+    calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
+    cap = (str(int(calls)) if isinstance(calls, (int, float))
+           and not isinstance(calls, bool) and calls > 0 else "<N>")
+    body = (f"call plan with `spec` and probe=true; if that refuses, follow "
+            f"its next and do not start; otherwise call start with `spec` and "
+            f"max_calls={cap}")
+    return f"{lead}{body}"
 
 
 def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
@@ -944,8 +962,9 @@ class Tools:
             from .evolvespec import load_spec
 
             result["spec"] = load_spec(obj["spec_path"]).to_dict()
-            result["next"] = ("show the user this estimate; after their yes, call "
-                              "start with `spec`")
+            result["next"] = _first_run_next(
+                result,
+                lead="show the user this estimate; after their yes, ")
         return result
 
     def plan(self, spec: Dict[str, Any], usd_per_call: Optional[float] = None,
@@ -976,7 +995,12 @@ class Tools:
             ticket = limit.get("ticket") or {}
             if ticket.get("remaining") == 0:
                 return self._ticket_refusal(ticket, limit)
-        if not probe or not payload.get("ok", True):
+        if not payload.get("ok", True):
+            return payload
+        if not probe:
+            # #1296: a host that called plan directly still needs the
+            # preflight and the capped start the CLI plan next already names.
+            payload["next"] = _first_run_next(payload)
             return payload
         return _with_probe(payload, es)
 

@@ -5119,8 +5119,9 @@ def algorithms_run_payload(
     except ValueError as e:      # kind mismatch / bad --param
         return {"ok": False, "error": str(e), "_stage": "pre"}
     # Once the spec is on disk, a failed plan's next step is to fix it and
-    # re-plan -- never `evolve` on a spec plan just refused (#694).
-    retry_line = f"agentdescent plan {out}"
+    # re-plan with the same preflight the successful path already names
+    # (#694, #1299) -- never `evolve` on a spec plan just refused.
+    retry_line = f"agentdescent plan {out} --probe"
     try:
         spec = load_spec(out)
         payload = plan_payload(spec, usd_per_call=usd_per_call)

@@ -1397,6 +1397,30 @@ def ensure_skill_library_tree(path: str) -> List[str]:
     return _write_skill_library_seed(planned)
 
 
+def _starter_has_placeholders(spec: Dict[str, Any]) -> bool:
+    """True when a starter-spec block still has a value ``plan`` refuses (#1295)."""
+    for field in ("agent", "reflect"):
+        block = spec.get(field)
+        if not isinstance(block, dict):
+            continue
+        if any(_is_placeholder(value) for value in block.values()):
+            return True
+    return False
+
+
+def _init_then_plan_line(out: str, spec: Dict[str, Any]) -> str:
+    """The ``then:`` follow-up ``init`` prints after writing ``out`` (#1295).
+
+    A plan-ready spec names the same preflight every other first-run surface
+    already teaches. A spec that still has placeholders names the repair
+    instead of a ``plan`` that would exit 2.
+    """
+    if _starter_has_placeholders(spec):
+        return (f"re-run with --model / --base-url, or fill the placeholders "
+                f"in {out}, then agentdescent plan {out} --probe")
+    return f"agentdescent plan {out} --probe"
+
+
 def write_starter_spec(
     path: str,
     *,
@@ -1419,10 +1443,12 @@ def write_starter_spec(
     Returns ``(out_path, spec, report, providers_out)``. Raises ``ValueError``
     (including :class:`~agentdescent.algorithms.AlgorithmError`) for a bad
     algorithm / param / agent mismatch. ``follow_up`` is ``"plan"`` for ``init``
-    (appends ``then: agentdescent plan …``) or ``None`` when the caller will
-    plan itself (#674). ``rounds`` / ``workers`` (``--rounds`` / ``--workers``)
-    replace the kind's ``evolve.rounds`` / ``evolve.n_workers`` so a cheap
-    trial needs no hand-edited JSON; left out, the kind defaults stay (#707).
+    (appends ``then: agentdescent plan … --probe`` when the spec is plan-ready,
+    or a repair line when placeholders remain, #1295) or ``None`` when the
+    caller will plan itself (#674). ``rounds`` / ``workers`` (``--rounds`` /
+    ``--workers``) replace the kind's ``evolve.rounds`` / ``evolve.n_workers``
+    so a cheap trial needs no hand-edited JSON; left out, the kind defaults
+    stay (#707).
     ``params`` is an already-parsed ``{name: value}`` mapping (the MCP
     ``algorithm_spec`` tool); it replaces ``param`` so keys and values are
     never round-tripped through ``KEY=VALUE`` strings (#729).
@@ -1614,7 +1640,7 @@ def write_starter_spec(
                            "(selection rule) or evoskill (proposer/generator); "
                            "`agentdescent demo --algorithm evoskill` runs evoskill offline; "
                            "`agentdescent algorithms list --kind skill_library`"))
-        report.append(("then", f"agentdescent plan {out}"))
+        report.append(("then", _init_then_plan_line(out, spec)))
     return out, spec, report, providers_out
 
 

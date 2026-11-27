@@ -31,5 +31,10 @@ def test_init_policy_slot_writes_spec_and_explains_problem_ref(
     assert expected in out
     assert "zero-argument builder returning a mapping of inner problems" in out
     assert "importable" in out and "allow list" in out
-    assert "then: agentdescent plan .agentdescent/selection.evolve.json" in out
+    then = (
+        "then: re-run with --model / --base-url, or fill the placeholders "
+        "in .agentdescent/selection.evolve.json, then agentdescent plan "
+        ".agentdescent/selection.evolve.json --probe")
+    assert then in out
+    assert "then: agentdescent plan .agentdescent/selection.evolve.json\n" not in out
     assert "JSON object per line" not in out

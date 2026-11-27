@@ -361,6 +361,9 @@ def test_bare_init_without_model_flags_still_writes_placeholders(tmp_path, monke
     ])
     assert code == 0, text
     assert "<your-model>" in text or "placeholder" in text.lower(), text
+    assert f"then: re-run with --model / --base-url, or fill the placeholders in {spec}" in text
+    assert f"then agentdescent plan {spec} --probe" in text
+    assert f"then: agentdescent plan {spec}" not in text
     payload = json.loads(spec.read_text(encoding="utf-8"))
     assert payload["reflect"]["model"] == cli.PLACEHOLDER_MODEL
     code, text = _run(["--json", "plan", str(spec)])
@@ -372,7 +375,70 @@ def test_bare_init_without_model_flags_still_writes_placeholders(tmp_path, monke
     assert "placeholder" in err.lower() or "your-model" in err, plan
 
 
+def _skill_library(root):
+    for name in ("alpha", "beta"):
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} skill.\n---\n# {name}\n",
+            encoding="utf-8")
+
+
+def test_init_then_names_plan_probe_when_spec_is_plan_ready(tmp_path, monkeypatch):
+    """#1295: a successful init names the same plan --probe preflight as other first-run surfaces."""
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    prompt, cases = _prompt_and_cases(tmp_path)
+    flags = ["--model", "m", "--base-url", "https://example.test/v1",
+             "--rounds", "1", "--workers", "1"]
+
+    def _check(argv, out):
+        code, text = _run(argv)
+        assert code == 0, text
+        assert f"then: agentdescent plan {out} --probe" in text, text
+        assert f"then: agentdescent plan {out}\n" not in text
+        code, text = _run(["--json", *argv])
+        assert code == 0, text
+        payload = json.loads(text)
+        assert payload["next"][-1] == f"agentdescent plan {out} --probe", payload["next"]
+
+    out = tmp_path / "spec.json"
+    _check(["init", str(prompt), "--kind", "text", "--data", str(cases),
+            "--out", str(out), *flags], out)
+
+    out_ace = tmp_path / "spec-ace.json"
+    _check(["init", str(prompt), "--kind", "text", "--data", str(cases),
+            "--algorithm", "ace", "--out", str(out_ace), *flags], out_ace)
+
+    lib = tmp_path / "skills"
+    _skill_library(lib)
+    out_lib = tmp_path / "spec-lib.json"
+    _check(["init", str(lib), "--kind", "skill_library", "--algorithm", "evoskill",
+            "--data", str(cases), "--out", str(out_lib), *flags], out_lib)
+
+
+def test_bare_init_json_next_names_the_placeholder_repair(tmp_path, monkeypatch):
+    """#1295: a bare init --json must not recommend plan on a placeholder spec."""
+    monkeypatch.setenv("AGENTDESCENT_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    prompt, cases = _prompt_and_cases(tmp_path)
+    spec = tmp_path / "spec-nomodel.json"
+    code, text = _run([
+        "init", str(prompt), "--kind", "text", "--data", str(cases),
+        "--out", str(spec), "--json",
+    ])
+    assert code == 0, text
+    payload = json.loads(text)
+    nxt = payload["next"][-1]
+    assert "--model" in nxt and "--base-url" in nxt, nxt
+    assert "placeholders" in nxt, nxt
+    assert f"then agentdescent plan {spec} --probe" in nxt, nxt
+    assert nxt != f"agentdescent plan {spec}"
+    assert nxt != f"agentdescent plan {spec} --probe"
+
+
 @pytest.mark.parametrize("name", ALGORITHMS)
+
 def test_bare_algorithms_run_without_model_flags_still_refuses(tmp_path, monkeypatch, name):
     """#1275: docs teach the flags; a bare run must still refuse placeholders."""
     monkeypatch.chdir(tmp_path)

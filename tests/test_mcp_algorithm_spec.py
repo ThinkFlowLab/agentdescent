@@ -41,9 +41,18 @@ def test_builds_plans_and_returns_a_startable_spec(tmp_path):
     assert spec["algorithm"] == {"name": "gepa", "params": {"seed": 3}}
     assert spec["target"] == str(prompt) and spec["data"]["path"] == str(cases)
     assert "start" in r["next"]
+    bound = r["estimate"]["agent_calls_upper_bound"]
+    assert bound > 0
+    assert "probe=true" in r["next"]
+    assert f"max_calls={bound}" in r["next"]
+    assert "do not start" in r["next"]
+    assert r["next"].startswith("show the user this estimate; after their yes, ")
     assert not any(k.startswith("_") for k in r)
     # The returned dict plans the same way through the MCP plan tool.
-    assert Tools(None).plan(spec)["ok"] is True
+    planned = Tools(None).plan(spec)
+    assert planned["ok"] is True
+    assert "probe=true" in planned["next"]
+    assert f"max_calls={bound}" in planned["next"]
 
 
 def test_relative_paths_are_absolutised_and_default_out_is_beside_target(

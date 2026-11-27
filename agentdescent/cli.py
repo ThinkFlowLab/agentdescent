@@ -5180,7 +5180,8 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
     if getattr(a, "probe", False) and stage == "done" and ok:
         # The same preflight `plan --probe` runs, on the spec this verb just
         # wrote: one call, before the `evolve` it recommends (#1048).
-        probe = _probe_if_asked(a, load_spec(obj["spec_path"]))
+        spec = load_spec(obj["spec_path"])
+        probe = _probe_if_asked(a, spec)
         obj["probe"] = probe
         # The one refusal contract (#1175): `ok: false`, `ready: false` and
         # `next` as the repair, identical to `plan --probe` and the MCP `plan`
@@ -5192,6 +5193,13 @@ def _cmd_algorithms_run(a: argparse.Namespace) -> int:
             obj["ok"] = False
             obj["next"] = first_failed_next(probe)
             then_line = f"agentdescent plan {obj['spec_path']} --probe"
+        else:
+            # This invocation already probed; `next:` is the capped evolve
+            # only, same as `plan --probe` (#1217, #1301).
+            calls = (obj.get("estimate") or {}).get("agent_calls_upper_bound")
+            obj["next"] = _capped_evolve_next(
+                obj["spec_path"], calls, already_probed=True,
+                declared=_declared_cap(spec))
     if as_json:
         # Exactly one JSON object on stdout for success and error (#674).
         _out(_public(obj), as_json=True)

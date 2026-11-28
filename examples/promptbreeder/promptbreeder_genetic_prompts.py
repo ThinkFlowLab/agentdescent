@@ -61,6 +61,11 @@ from examples.promptbreeder._promptbreeder_population import (
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "promptbreeder"
+PROPOSAL_CALLS = 2
+
 MUTATION_PROMPT = MUTATION_PROMPTS[0]
 
 #: Units in the population. The paper uses 50; this is budget-sized, and the
@@ -207,7 +212,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = gsm8k_splits(seed)
     return MethodPolicy(
-        name="promptbreeder",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "Algorithm 1 as written: fixed-size population, binary tournament on a random training batch, and the loser replaced by the mutated winner.",
@@ -229,7 +234,7 @@ def build(seed: int) -> MethodPolicy:
         # Two, not one: the paper's hypermutation operators are two model calls,
         # and declaring one would make the budget check fail on a run that spent
         # exactly what the algorithm asks for.
-        proposal_calls_per_candidate=2,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(selection=BinaryTournament(seed)),
         reflective=True,
         population=population,

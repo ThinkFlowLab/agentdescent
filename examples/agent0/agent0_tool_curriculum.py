@@ -34,6 +34,11 @@ from examples._selfplay_domain import (CartTask, majority_share, mixed_reward,
 
 FIDELITY = "inference_analogue"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "agent0"
+PROPOSAL_CALLS = 1
+
 _FALLBACK = CartTask((125, 240), (1, 2))
 
 #: Executor samples per generated task. `generate_results` is the same
@@ -174,7 +179,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = selfplay_splits(seed, "agent0")
     return MethodPolicy(
-        name="agent0",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "Curriculum/Executor co-evolution and multi-turn calculator use are preserved; frozen evaluation carts also run the tool loop.",
@@ -190,7 +195,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=mixed_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(task_sampler=DifficultyWeighted()),
         reflective=True,
     )

@@ -44,6 +44,11 @@ from examples._method_runner import standard_main
 
 FIDELITY = "environment_analogue"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "voyager"
+PROPOSAL_CALLS = 1
+
 #: 48, not 12, and the size is a constraint rather than a garnish: `run_port`
 #: refuses a run whose train split is smaller than the worker count, so twelve
 #: goals split 4/4/4 capped this port at four workers with a four-goal gate.
@@ -259,7 +264,7 @@ def build(seed: int) -> MethodPolicy:
     train, held_out, test = _split(seed)
     categories = ["skill generic"] + [f"skill {i}" for i in INGREDIENTS]
     return MethodPolicy(
-        name="voyager",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "A skill is added only when the environment judges the attempt successful, as add_new_skill is called only under info['success'].",
@@ -283,7 +288,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(task_sampler=DifficultyWeighted()),
         reflective=False,
         self_verify=True,

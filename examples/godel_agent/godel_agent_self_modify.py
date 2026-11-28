@@ -30,6 +30,11 @@ from examples.sica.sica_self_edit import compile_policy, policy_prompt
 
 FIDELITY = "self_edit_analogue"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "godel_agent"
+PROPOSAL_CALLS = 1
+
 GODEL_INITIAL_SOURCE = '''def solve_prompt(question):
     return "Solve the arithmetic problem carefully. Return only the final answer.\\n\\n" + question
 
@@ -83,7 +88,7 @@ def build(seed: int, *, gateless: bool = False) -> MethodPolicy:
 
     train, held_out, test = gsmhard_splits(seed)
     return MethodPolicy(
-        name="godel_agent",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "The artifact owns both solve and self-improvement prompt functions; each proposal is produced by the artifact's own current self-improvement prompt.",
@@ -99,7 +104,7 @@ def build(seed: int, *, gateless: bool = False) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=gsmhard_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=(Policies(acceptance=AcceptAnyCompiling()) if gateless
                 else Policies()),
         reflective=True,

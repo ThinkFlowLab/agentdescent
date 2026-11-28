@@ -47,6 +47,11 @@ from examples._gsm8k_domain import (STARTING_INSTRUCTION, feedback,
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "self_refine"
+PROPOSAL_CALLS = 1
+
 STOP_SIGNAL = "it is correct"
 
 #: `entire_output.split("def solution():")` -- the marker that separates the
@@ -142,7 +147,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = gsm8k_splits(seed)
     return MethodPolicy(
-        name="self_refine",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "FEEDBACK and REFINE are one model call split on a marker, as GSMFeedback.__call__ is; six of the seven upstream tasks separate them, and gsm -- this port's domain -- does not.",
@@ -161,7 +166,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=gsm8k_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         reflective=True,
     )
 

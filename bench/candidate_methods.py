@@ -64,13 +64,16 @@ _MODULES = (
     textgrad_prompt_optimization,
 )
 
+#: Every port publishes its identity, fidelity and reserved proposal calls as
+#: module metadata, so the table below is built from constants: calling
+#: ``build(0)`` here would load each port's dataset just to learn its name, and
+#: that made this module's own ``--help`` need a writable cache (#1260).
 ALGORITHMS: Dict[str, Tuple[str, PolicyBuilder]] = {
-    module.build(0).name: (module.FIDELITY, module.build) for module in _MODULES
+    module.NAME: (module.FIDELITY, module.build) for module in _MODULES
 }
 
 PROPOSAL_CALLS_PER_CANDIDATE = {
-    name: builder(0).proposal_calls_per_candidate
-    for name, (_, builder) in ALGORITHMS.items()
+    module.NAME: module.PROPOSAL_CALLS for module in _MODULES
 }
 
 DEFAULT_OUTPUT = Path("bench/results/candidate-methods-framework-live.json")

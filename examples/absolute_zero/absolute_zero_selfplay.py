@@ -32,6 +32,11 @@ from examples._selfplay_domain import (CartTask, mixed_reward, proposer_prompt,
 
 FIDELITY = "inference_analogue"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "absolute_zero"
+PROPOSAL_CALLS = 1
+
 _FALLBACK = CartTask((125, 240), (1, 2))
 
 
@@ -106,7 +111,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = selfplay_splits(seed, "absolute_zero")
     return MethodPolicy(
-        name="absolute_zero",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "Proposer, solver, grounded verifier, and zero-data curriculum are preserved in training rollouts.",
@@ -123,7 +128,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=mixed_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         reflective=True,
     )
 

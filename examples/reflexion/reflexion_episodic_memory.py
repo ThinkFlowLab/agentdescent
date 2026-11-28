@@ -56,6 +56,11 @@ from examples._gsmhard_domain import (STARTING_INSTRUCTION, feedback,
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "reflexion"
+PROPOSAL_CALLS = 1
+
 #: `prompts.REFLECTION_HEADER`, with "question" generalised to "problem" because
 #: this memory is shared across the domain rather than bound to one instance.
 MEMORY_HEADER = (
@@ -206,7 +211,7 @@ def build(seed: int, *, per_instance: bool = False) -> MethodPolicy:
 
     train, held_out, test = gsmhard_splits(seed)
     return MethodPolicy(
-        name="reflexion",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "The reflection query carries two worked examples of a failed attempt and its plan, as _generate_reflection_query prepends FEW_SHOT_EXAMPLES; without them the reflector answers the arithmetic instead of planning.",
@@ -226,7 +231,7 @@ def build(seed: int, *, per_instance: bool = False) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=gsmhard_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         reflective=True,
     )
 

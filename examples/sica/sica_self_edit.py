@@ -43,6 +43,11 @@ from examples._gsmhard_domain import (feedback, gsmhard_reward,
 
 FIDELITY = "self_edit_analogue"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "sica"
+PROPOSAL_CALLS = 1
+
 SICA_INITIAL_SOURCE = '''def agent_prompt(question):
     return "Solve the arithmetic problem carefully. Return only the final answer.\\n\\n" + question
 '''
@@ -120,7 +125,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = gsmhard_splits(seed)
     return MethodPolicy(
-        name="sica",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "The meta loop edits real Python policy source and the framework gate measures utility.",
@@ -136,7 +141,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=gsmhard_reward,
-        proposal_calls_per_candidate=1,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(selection=Archive(sampling="best", seed=seed)),
         reflective=True,
     )

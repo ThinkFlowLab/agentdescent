@@ -52,6 +52,11 @@ from examples._gsm8k_domain import (STARTING_INSTRUCTION, feedback,
 
 FIDELITY = "mechanism_microport"
 
+#: The port's identity and reserved proposal calls, as metadata: a matrix
+#: can list this port without calling :func:`build`, which loads its dataset.
+NAME = "aflow"
+PROPOSAL_CALLS = 2
+
 REVIEW_INSTRUCTION = "Check the arithmetic and return only the corrected answer."
 
 #: `select_round` computes `scores = [item["score"] * 100 ...]` before the
@@ -210,7 +215,7 @@ def build(seed: int) -> MethodPolicy:
 
     train, held_out, test = gsm8k_splits(seed)
     return MethodPolicy(
-        name="aflow",
+        name=NAME,
         fidelity=FIDELITY,
         notes=(
             "The pinned revision's soft mixed selection (not UCT) runs through the population aggregator over the archive of committed workflows, with upstream's own alpha=0.2, lambda=0.3 and its score-by-100 scaling -- without which the distribution is uniform.",
@@ -232,7 +237,7 @@ def build(seed: int) -> MethodPolicy:
         solve=solve,
         propose=propose,
         reward=gsm8k_reward,
-        proposal_calls_per_candidate=2,
+        proposal_calls_per_candidate=PROPOSAL_CALLS,
         engine=Policies(selection=SoftMixed(seed=seed)),
         reflective=True,
     )

@@ -99,8 +99,27 @@ def test_missing_cases_names_the_field_not_a_positional(tmp_path):
     assert "third argument" not in r["error"] and "`cases`" in r["error"]
     assert "spec" not in r       # no path string masquerading as the spec dict
     assert r["spec_path"].endswith("agentdescent.gepa.spec.json")
-    # #1299: the failed path inherits algorithms run's retry, including --probe.
-    assert r["next"] == f"agentdescent plan {r['spec_path']} --probe"
+    # #1305: the failed path names the MCP plan retry, not a CLI verb.
+    assert r["next"] == (
+        "fix the written spec, then call plan with that spec and "
+        "probe=true; if that refuses, follow its next and do not start")
+    assert "agentdescent plan" not in r["next"]
+    assert "evolve" not in r["next"]
+    assert "call start" not in r["next"]
+
+
+def test_failed_plan_next_is_mcp_plan_probe_not_cli(tmp_path):
+    """#1305: a plan refusal (too few cases) also rewrites the CLI retry."""
+    prompt, cases = _prompt_and_cases(tmp_path, n=1)
+    r = Tools(None).algorithm_spec("gepa", str(prompt), str(cases), **_FLAGS)
+    assert r["ok"] is False and "at least 4 tasks" in r["error"], r
+    assert r["spec_path"].endswith("agentdescent.gepa.spec.json")
+    assert r["next"] == (
+        "fix the written spec, then call plan with that spec and "
+        "probe=true; if that refuses, follow its next and do not start")
+    assert "agentdescent plan" not in r["next"]
+    assert "evolve" not in r["next"]
+    assert "call start" not in r["next"]
 
 
 def test_same_object_as_algorithms_run_json(tmp_path, capsys):
@@ -122,6 +141,8 @@ def test_description_is_written_for_the_model():
     # #1228: the tool itself still only builds + plans; the description must
     # require a follow-up probe and a capped start, not a bare start.
     assert "probe=true" in text and "max_calls" in text
+    # #1305: a failed plan's next is the plan tool, not a CLI command.
+    assert "not a CLI `plan` command" in text
 
 
 def test_params_object_is_passed_through_not_re_split(tmp_path):

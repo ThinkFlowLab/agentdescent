@@ -126,6 +126,12 @@ def test_a_healthy_probe_keeps_the_mcp_plan_ok(tmp_path, endpoint):
     assert out["probe"]["ok"] is True
     assert [row["state"] for row in out["probe"]["rows"]] == ["ok"]
     assert _Handler.hits == 1
+    bound = out["estimate"]["agent_calls_upper_bound"]
+    assert bound > 0
+    # #1303: after a successful probe, next is the capped start only.
+    assert out["next"] == (
+        f"call start with `spec` and max_calls={bound}")
+    assert "probe=true" not in out["next"]
 
 
 def test_omitting_the_probe_returns_exactly_the_old_payload(tmp_path):
@@ -204,6 +210,13 @@ def test_both_surfaces_publish_ok_and_ready_true_for_a_healthy_probe(tmp_path,
     assert cli_code == 0, (cli_code, cli_err)
     assert (cli_payload["ok"], cli_payload["ready"]) == (True, True)
     assert (mcp_payload["ok"], mcp_payload["ready"]) == (True, True)
+    bound = cli_payload["estimate"]["agent_calls_upper_bound"]
+    assert bound == mcp_payload["estimate"]["agent_calls_upper_bound"]
+    # Same already-probed advice, in each surface's verb: evolve vs start.
+    assert "probe" not in cli_payload["next"]
+    assert cli_payload["next"].endswith(f"--max-calls {bound}")
+    assert mcp_payload["next"] == (
+        f"call start with `spec` and max_calls={bound}")
 
 
 def test_the_mcp_plan_without_a_probe_has_no_ready_key(tmp_path):
@@ -222,3 +235,25 @@ def test_a_successful_mcp_plan_without_a_probe_names_the_preflight_and_cap(tmp_p
         "call plan with `spec` and probe=true; if that refuses, follow "
         "its next and do not start; otherwise call start with `spec` and "
         f"max_calls={bound}")
+
+
+def test_a_successful_mcp_plan_with_a_probe_names_only_the_capped_start(tmp_path,
+                                                                      endpoint):
+    """#1303: a successful probe must not ask to probe again, and must cap start."""
+    endpoint(code=200)
+    out = Tools(str(tmp_path / "runs")).plan(_spec(), probe=True)
+    assert out["ok"] is True, out
+    assert out["ready"] is True
+    bound = out["estimate"]["agent_calls_upper_bound"]
+    assert out["next"] == (
+        f"call start with `spec` and max_calls={bound}")
+    assert "probe=true" not in out["next"]
+    assert _Handler.hits == 1
+
+
+def test_the_plan_description_names_the_already_probed_start():
+    from agentdescent.mcp import TOOL_DESCRIPTIONS
+
+    text = TOOL_DESCRIPTIONS["plan"]
+    assert "probe=true" in text and "max_calls" in text
+    assert "only that capped" in text or "naming only that capped" in text

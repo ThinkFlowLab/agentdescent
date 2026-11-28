@@ -175,7 +175,10 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "usd_per_call) to cap the run at the model call; the reply's `call_limit` is "
         "what start would enforce. A successful call without probe returns "
         "`next` naming `plan(spec, probe=true)` and then `start` with "
-        "`max_calls` from the estimate (or `<N>` if none). Show the user the "
+        "`max_calls` from the estimate (or `<N>` if none). A successful "
+        "call with probe=true returns `next` naming only that capped "
+        "`start`, the same already-probed advice the CLI `plan --probe` "
+        "prints. Show the user the "
         "spec and the estimate and get a yes before calling start."),
     "start": (
         "Start an evolution run in the background and return its run_id at once. The run "
@@ -418,19 +421,26 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
-def _first_run_next(payload: Dict[str, Any], *, lead: str = "") -> str:
+def _first_run_next(payload: Dict[str, Any], *, lead: str = "",
+                    already_probed: bool = False) -> str:
     """The host-facing first-run ``next``: probe, then a capped ``start`` (#1296).
 
     MCP tools speak tool names, not CLI verbs. The bound is the plan's own
     ``estimate.agent_calls_upper_bound``; ``<N>`` is the placeholder when
     that number is not known yet (the same convention as the CLI ``<N>``).
+
+    #1303: when this invocation already probed, ``next`` is the capped
+    ``start`` only, matching how the CLI ``plan --probe`` drops the
+    preflight after a successful probe (#1217).
     """
     calls = (payload.get("estimate") or {}).get("agent_calls_upper_bound")
     cap = (str(int(calls)) if isinstance(calls, (int, float))
            and not isinstance(calls, bool) and calls > 0 else "<N>")
+    start = f"call start with `spec` and max_calls={cap}"
+    if already_probed:
+        return f"{lead}{start}"
     body = (f"call plan with `spec` and probe=true; if that refuses, follow "
-            f"its next and do not start; otherwise call start with `spec` and "
-            f"max_calls={cap}")
+            f"its next and do not start; otherwise {start}")
     return f"{lead}{body}"
 
 
@@ -442,7 +452,9 @@ def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
     implementation. A refusal prints the one contract both surfaces carry
     (#1175): ``ok: false``, ``ready: false`` and ``next`` replaced with that
     repair, so a host following ``next`` must not start a run that cannot work
-    and a host porting its check from the CLI reads the same keys. ``probe`` is
+    and a host porting its check from the CLI reads the same keys. A success
+    sets ``next`` to the capped ``start`` only (#1303), so the host is not
+    told to probe again and is not left without a cap. ``probe`` is
     added only when the caller asked for it -- plain ``plan`` stays the free
     call that sends nothing, and has no ``ready`` key.
     """
@@ -454,6 +466,8 @@ def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
     if not payload["ready"]:
         payload["ok"] = False
         payload["next"] = first_failed_next(result)
+    else:
+        payload["next"] = _first_run_next(payload, already_probed=True)
     return payload
 
 

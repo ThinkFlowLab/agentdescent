@@ -156,6 +156,8 @@ TOOL_DESCRIPTIONS: Dict[str, str] = {
         "does not probe or set a per-call cap: after it returns, call "
         "`plan(spec, probe=true)` (or `plan --probe`); if the probe refuses, "
         "give the user `next` and do not start (`ok: false`, `ready: false`). "
+        "If planning the written spec fails, `next` names a fix of that "
+        "spec and then `plan(spec, probe=true)`, not a CLI `plan` command. "
         "Show the estimate, get a yes, then `start` with `max_calls` (and "
         "`max_usd` beside `usd_per_call` when a price is known), starting at "
         "the plan's `agent_calls_upper_bound` (or smaller for a trial). "
@@ -442,6 +444,18 @@ def _first_run_next(payload: Dict[str, Any], *, lead: str = "",
     body = (f"call plan with `spec` and probe=true; if that refuses, follow "
             f"its next and do not start; otherwise {start}")
     return f"{lead}{body}"
+
+
+def _failed_plan_next() -> str:
+    """Host-facing ``next`` when ``algorithm_spec`` wrote a spec that plan refused (#1305).
+
+    The CLI retry is ``agentdescent plan <path> --probe``. Hosts should
+    call the ``plan`` tool, not a CLI verb, and must not start.
+    """
+    return (
+        "fix the written spec, then call plan with that spec and "
+        "probe=true; if that refuses, follow its next and do not start"
+    )
 
 
 def _with_probe(payload: Dict[str, Any], spec: EvolveSpec) -> Dict[str, Any]:
@@ -972,6 +986,12 @@ class Tools:
         if isinstance(result.get("spec"), str):
             # The CLI's legacy `spec` (a path) would read as the dict for start.
             result.pop("spec")
+        # #1305: a failed plan inherits the CLI retry (`agentdescent plan
+        # … --probe`). Hosts need the plan tool, not a CLI verb.
+        if not result.get("ok", True):
+            nxt = result.get("next")
+            if isinstance(nxt, str) and nxt.startswith("agentdescent plan "):
+                result["next"] = _failed_plan_next()
         if result.get("ok", True) and obj.get("_stage") == "done":
             from .evolvespec import load_spec
 

@@ -196,19 +196,25 @@ def page_offsets(limit: int, page: int = PAGE_MAX) -> List[Tuple[int, int]]:
 
 
 def _cache_root() -> str:
-    """The dataset cache root, resolved at call time (#1261).
+    """The dataset cache root, resolved at call time (#1261, #1280).
 
     A host with a read-only home cannot create anything under ``~/.cache``, so
     the two standard knobs move the root: ``AGENTDESCENT_CACHE`` names it
     directly and ``XDG_CACHE_HOME`` puts it under ``<XDG_CACHE_HOME>/agentdescent``.
     With neither set the root is :data:`CACHE_ROOT`, exactly as before.
+
+    A moved root is made absolute once, here (#1280), with the normalisation
+    :func:`runstore._normalise` already applies to the run store (#402/#403):
+    a run is written by one process and executed by another, and the detached
+    child starts in the run directory, so a relative knob must not be handed
+    back bare.
     """
     explicit = os.environ.get("AGENTDESCENT_CACHE")
     if explicit:
-        return os.path.expanduser(explicit)
+        return os.path.abspath(os.path.expanduser(explicit))
     xdg = os.environ.get("XDG_CACHE_HOME")
     if xdg:
-        return os.path.join(os.path.expanduser(xdg), "agentdescent")
+        return os.path.join(os.path.abspath(os.path.expanduser(xdg)), "agentdescent")
     return CACHE_ROOT
 
 
@@ -413,10 +419,12 @@ def hf_rows_modelscope(url: str = MODELSCOPE_HOTPOTQA_URL, *,
     dict the examples read.
 
     With ``cache=True`` (default), responses live under
-    ``~/.cache/agentdescent/modelscope/`` keyed by the URL so a repeat call
-    does not re-download the ~46 MB file. With ``cache=False``, any existing
-    cache entry is ignored and the fresh response is not written back — the
-    same bypass contract as :func:`hf_rows`.
+    ``<cache root>/modelscope/`` keyed by the URL so a repeat call does not
+    re-download the ~46 MB file. The root is :func:`_cache_root`:
+    ``~/.cache/agentdescent`` unless ``AGENTDESCENT_CACHE`` names it or
+    ``XDG_CACHE_HOME`` moves it, and absolute either way. With ``cache=False``,
+    any existing cache entry is ignored and the fresh response is not written
+    back — the same bypass contract as :func:`hf_rows`.
     """
     rows = _cached_json(_raw_cache_path(url, "modelscope", None), url,
                         cache=cache, timeout=timeout)
